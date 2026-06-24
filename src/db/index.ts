@@ -173,6 +173,20 @@ export function initDb(): void {
       error TEXT,
       created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
     );
+
+    CREATE TABLE IF NOT EXISTS resource_registry (
+      id TEXT PRIMARY KEY,
+      resource_type TEXT NOT NULL,
+      resource_name TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      content_hash TEXT NOT NULL,
+      parent_version_id TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      change_description TEXT,
+      changed_by TEXT,
+      metadata TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+    );
   `);
 
   // ---------------------------------------------------------------------------
@@ -256,6 +270,9 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(type);
     CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+    CREATE INDEX IF NOT EXISTS idx_resource_registry_type_name ON resource_registry(resource_type, resource_name);
+    CREATE INDEX IF NOT EXISTS idx_resource_registry_status ON resource_registry(status);
+    CREATE INDEX IF NOT EXISTS idx_resource_registry_created_at ON resource_registry(created_at);
   `);
 
   // ---------------------------------------------------------------------------
