@@ -20,11 +20,14 @@ import {
   setReflectionSendToDiscord,
   setReflectionChannelId,
 } from "./reflection/daemon.js";
+import { snapshotAllResources } from "./registry/index.js";
 import { initVoice, setVoiceDiscordClient, destroyVoice } from "./voice/index.js";
 import { enableAutoJoin, disableAutoJoin, excludeFromAutoJoin } from "./voice/autoJoin.js";
 import { initVoiceCoach, setVoiceCoachClient, destroyVoiceCoach } from "./voice-coach/index.js";
 import { registerBotThread } from "./bot/messages.js";
 import { ensureThread, sendChunked } from "./shared/discord-utils.js";
+import { SKILLS_DIR, DATA_DIR } from "./shared/paths.js";
+import { join } from "node:path";
 
 // Admin user ID for DM fallback delivery
 const ADMIN_USER_ID = "152801068663832576";
@@ -56,6 +59,13 @@ async function main(): Promise<void> {
   const skillService = new SkillService();
   await skillService.init();
   setCommandsSkillService(skillService);
+
+  // 3.6 Snapshot evolvable resources (resource registry)
+  console.log("[discordclaw] Snapshotting resource registry...");
+  snapshotAllResources({
+    skillsDir: SKILLS_DIR,
+    soulPath: join(DATA_DIR, "SOUL.md"),
+  });
 
   // 3.7 Check gh CLI availability
   const ghAvailable = await checkGhCli();
