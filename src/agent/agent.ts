@@ -297,6 +297,23 @@ function buildSystemPrompt(opts: {
 // History converter
 // ---------------------------------------------------------------------------
 
+/**
+ * Regex to match usage/cost footer line(s) appended to assistant messages.
+ * Matches lines like: -# 📊 claude-opus-4 · 13.5k in / 429 out · $0.0462 · 12.3s
+ * This footer is added by the bot for display but should NOT be included in
+ * conversation history sent to the model (otherwise the model mimics it).
+ */
+const USAGE_FOOTER_RE = /(\n-# 📊 .+)+$/;
+
+/**
+ * Strip the usage/cost footer from an assistant message's content.
+ * The footer is appended by the bot for Discord display but pollutes
+ * history — the model sees it and mimics it, causing duplicate footers.
+ */
+function stripUsageFooter(content: string): string {
+  return content.replace(USAGE_FOOTER_RE, "");
+}
+
 function buildMessageHistory(
   history: Message[],
 ): Anthropic.Messages.MessageParam[] {
@@ -304,12 +321,14 @@ function buildMessageHistory(
 
   for (const msg of history) {
     const role = msg.role === "assistant" ? "assistant" : "user";
+    // Strip usage footer from assistant messages to prevent the model from mimicking it
+    const content = role === "assistant" ? stripUsageFooter(msg.content) : msg.content;
     // Merge consecutive same-role messages (Anthropic API requires alternation)
     const last = messages[messages.length - 1];
     if (last && last.role === role && typeof last.content === "string") {
-      last.content += `\n${msg.content}`;
+      last.content += `\n${content}`;
     } else {
-      messages.push({ role, content: msg.content });
+      messages.push({ role, content });
     }
   }
 
