@@ -65,7 +65,7 @@ export type OnToolCallProgress = (progress: ToolCallProgress) => void | Promise<
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MODEL = "bedrock-claude-opus-4-7-1m";
+const DEFAULT_MODEL = "bedrock-claude-opus-5-1m";
 const MAX_TOKENS = 16384;
 const MAX_CONSECUTIVE_DUPES = 2; // Break loop after this many identical consecutive tool calls
 
