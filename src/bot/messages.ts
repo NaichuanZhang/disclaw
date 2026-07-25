@@ -165,14 +165,6 @@ function getModelPricing(model: string) {
   return PRICING.default;
 }
 
-/** Shorten model name: strip "bedrock-" prefix and date suffixes like "-20250514" or "-6-1m" */
-function shortModelName(model: string): string {
-  return model
-    .replace(/^bedrock-/, "")
-    .replace(/-\d{8}$/, "")
-    .replace(/-\d+-\d+[a-z]?$/, "");
-}
-
 /** Format token count: 1234 → "1.2k", 123456 → "123.5k" */
 function fmtTokens(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
@@ -198,9 +190,8 @@ function formatUsageLine(usage: TokenUsage, durationMs?: number): string {
       usage.cacheCreationTokens * pricing.cacheCreate) /
     1e6;
 
-  const model = shortModelName(usage.model);
   const durationPart = durationMs != null ? ` · ${fmtDuration(durationMs)}` : "";
-  return `-# 📊 ${model} · ${fmtTokens(usage.inputTokens)} in / ${fmtTokens(usage.outputTokens)} out · $${cost.toFixed(4)}${durationPart}`;
+  return `-# 📊 ${usage.model} · ${fmtTokens(usage.inputTokens)} in / ${fmtTokens(usage.outputTokens)} out · $${cost.toFixed(4)}${durationPart}`;
 }
 
 // ---------------------------------------------------------------------------
