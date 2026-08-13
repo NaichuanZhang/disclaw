@@ -27,6 +27,7 @@ import { initVoiceCoach, setVoiceCoachClient, destroyVoiceCoach } from "./voice-
 import { registerBotThread } from "./bot/messages.js";
 import { ensureThread, sendChunked } from "./shared/discord-utils.js";
 import { SKILLS_DIR, DATA_DIR } from "./shared/paths.js";
+import { warmModelCache } from "./shared/models.js";
 import { join } from "node:path";
 
 // Admin user ID for DM fallback delivery
@@ -45,6 +46,11 @@ async function main(): Promise<void> {
   // 1. Initialize database
   console.log("[discordclaw] Initializing database...");
   initDb();
+
+  // Warm the model catalog in the background so the first /model autocomplete
+  // has real data. Never awaited — must not delay or fail boot.
+  console.log("[discordclaw] Warming model catalog...");
+  warmModelCache();
 
   // 2. Load soul + start file watcher
   console.log("[discordclaw] Loading soul...");

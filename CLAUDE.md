@@ -41,7 +41,7 @@ This is a Discord bot that uses Claude as its AI backend. The system has major s
 
 Discord messages flow through `bot/messages.ts` (filter, session resolve, thread creation, voice transcription, artifact registration, context build) → `agent/agent.ts` (system prompt assembly, tool loop with duplicate detection) → Anthropic SDK. The agent accepts an optional `onToolCallProgress` callback that fires for each tool invocation (start + result phases); `messages.ts` uses this to send real-time tool call status messages to Discord as the agentic loop runs. The agent returns an `AgentResponse` with text, extracted images (from markdown `![](url)` syntax), and aggregated token usage. `messages.ts` renders images as Discord embeds (URLs) or attachments (local files), and stores usage data alongside the assistant message in SQLite. Tool progress messages are rate-limited (max 4 per 5s window) and batched to respect Discord limits.
 
-Key constants in `agent/agent.ts`: `DEFAULT_MODEL = "bedrock-claude-opus-4-7-1m"`, `MAX_TOKENS = 16384`, `MAX_CONSECUTIVE_DUPES = 2` (breaks infinite tool loops).
+Key constants in `agent/agent.ts`: `MAX_TOKENS = 16384`, `MAX_CONSECUTIVE_DUPES = 2` (breaks infinite tool loops). Model selection lives in `shared/models.ts` — see **Model Selection** below.
 
 ### Agent Tools
 
@@ -58,6 +58,20 @@ Tools are defined across multiple files and registered in `agent/agent.ts`:
 | `evolution/tools.ts` | evolve_start, evolve_read, evolve_write, evolve_bash, evolve_propose, evolve_suggest, evolve_cancel, evolve_review, evolve_merge | Self-modification via PRs |
 
 **mem9 tools** (`mem9_store`, `mem9_update`, `mem9_delete`) are only registered when mem9 is configured via `data/skills/mem9/auth.json`. The `memory_search` tool always queries both local FTS5 and mem9 cloud in parallel (graceful fallback if mem9 is unavailable).
+
+### Model Selection
+
+`src/shared/models.ts` owns the model catalog, the persisted selection, and the resolution order. Everything that calls the Anthropic API goes through `resolveModel(override?)`.
+
+**Precedence**: per-cron-job override → persisted `/model` selection (`config.selected_model`) → `ANTHROPIC_MODEL` env → `DEFAULT_MODEL` (`bedrock-claude-opus-5-1m`). The DB deliberately outranks the env var so a runtime `/model` choice isn't defeated by a stale deploy-time value.
+
+The catalog comes from `GET {ANTHROPIC_BASE_URL}/v1/models` (LiteLLM/OpenAI-shaped), TTL-cached for 5 minutes, with `FALLBACK_MODEL_IDS` used when the proxy is unreachable so selection never presents an empty list. `warmModelCache()` runs (unawaited) at boot. `resolveModel()` is synchronous, never throws, and self-heals a model the proxy no longer advertises — but only against an already-warm cache, so it never blocks a message.
+
+**Discord surface**: `/model` shows the active model and its source; `/model name:<id>` persists a bot-wide selection (validated against the catalog); `/model reset:true` (or `name:default`) clears it; `/model refresh:true` busts the cache. `/cron add model:<id>` and `/cron set-model <id> <model>` set a per-job override stored in `CronPayload.model`.
+
+Autocomplete for these options is **cache-only** (`getCachedSelectableModelIds()`) and never awaits the network — Discord allows one response within ~3s and has no defer equivalent, while the catalog fetch timeout alone is 5s. A cold cache serves the fallback list and fires a background warm.
+
+Voice (`VOICE_MODEL`) and the cycling coach (`COACH_MODEL`) are configured separately and are not affected by `/model`.
 
 ### Thread-Based Replies
 

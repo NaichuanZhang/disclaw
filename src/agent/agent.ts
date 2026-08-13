@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { anthropicClient } from "../shared/anthropic.js";
+import { resolveModel } from "../shared/models.js";
 import { conversationHistoryTools, handleConversationHistoryTool } from "../shared/conversation-history.js";
 import { getSoul } from "../soul/soul.js";
 import { getMemoryTools, handleMemoryTool } from "../memory/tools.js";
@@ -65,19 +66,8 @@ export type OnToolCallProgress = (progress: ToolCallProgress) => void | Promise<
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MODEL = "bedrock-claude-opus-5-1m";
 const MAX_TOKENS = 16384;
 const MAX_CONSECUTIVE_DUPES = 2; // Break loop after this many identical consecutive tool calls
-
-/** Strip ANSI escape artifacts from env values (e.g. trailing [1m] from shell). */
-function cleanModelName(s: string): string {
-  return s.replace(/\x1b\[[\d;]*m/g, "").replace(/\[[\d;]*m\]?$/g, "").trim();
-}
-
-function getModel(override?: string): string {
-  const raw = override || process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
-  return cleanModelName(raw);
-}
 
 // ---------------------------------------------------------------------------
 // Token usage aggregation
@@ -548,7 +538,7 @@ export async function processMessage(opts: {
   const collectedText: string[] = [];
   let turns = 0;
   let totalUsage: TokenUsage | undefined;
-  const model = getModel();
+  const model = resolveModel();
 
   // Build tool list dynamically (includes mem9 tools when configured)
   const allTools = getAllTools();
@@ -772,7 +762,7 @@ export async function processAgentTurn(opts: {
     turns++;
 
     const response = await anthropicClient.messages.create({
-      model: getModel(opts.model),
+      model: resolveModel(opts.model),
       max_tokens: MAX_TOKENS,
       system: systemPrompt,
       messages,
@@ -819,7 +809,7 @@ export async function processAgentTurn(opts: {
           "[System: You have called the same tools with identical inputs multiple times. Stop calling tools and produce your final response now.]",
       });
       const final = await anthropicClient.messages.create({
-        model: getModel(opts.model),
+        model: resolveModel(opts.model),
         max_tokens: MAX_TOKENS,
         system: systemPrompt,
         messages,

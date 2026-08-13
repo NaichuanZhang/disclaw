@@ -1,6 +1,7 @@
 import {
   type Interaction,
   type ApplicationCommandData,
+  type AutocompleteInteraction,
   ApplicationCommandOptionType,
   EmbedBuilder,
   ChannelType,
@@ -11,6 +12,21 @@ import { getSoul } from "../soul/soul.js";
 import { triggerRestart } from "../restart.js";
 import { startVoice, stopVoice, isConnected } from "../voice/index.js";
 import { abortAllSessions, getActiveSessionInfo } from "../agent/session-lock.js";
+import {
+  AUTOCOMPLETE_LIMIT,
+  FALLBACK_MODEL_IDS,
+  cleanModelName,
+  clearSelectedModel,
+  describeModelResolution,
+  getCachedSelectableModelIds,
+  invalidateModelCache,
+  listModels,
+  rankModelIds,
+  resolveModel,
+  selectableModelIds,
+  setSelectedModel,
+  warmModelCache,
+} from "../shared/models.js";
 import type { SkillService } from "../skills/service.js";
 import type { CronService } from "../cron/service.js";
 import type { CronJob, CronSchedule, CronPayload, CronDelivery } from "../cron/types.js";
@@ -89,6 +105,31 @@ export const slashCommands: ApplicationCommandData[] = [
   {
     name: "soul",
     description: "Show the current soul (personality) content",
+  },
+  {
+    name: "model",
+    description: "Show or set the model used for all conversations and cron jobs",
+    options: [
+      {
+        name: "name",
+        description: "Model to use (leave empty to show the current selection)",
+        type: ApplicationCommandOptionType.String,
+        required: false,
+        autocomplete: true,
+      },
+      {
+        name: "reset",
+        description: "Clear the saved selection and fall back to the default",
+        type: ApplicationCommandOptionType.Boolean,
+        required: false,
+      },
+      {
+        name: "refresh",
+        description: "Re-fetch the model list from the proxy",
+        type: ApplicationCommandOptionType.Boolean,
+        required: false,
+      },
+    ],
   },
   {
     name: "restart",
@@ -221,6 +262,33 @@ export const slashCommands: ApplicationCommandData[] = [
             type: ApplicationCommandOptionType.String,
             required: false,
           },
+          {
+            name: "model",
+            description: "Model for this job only (defaults to the global selection)",
+            type: ApplicationCommandOptionType.String,
+            required: false,
+            autocomplete: true,
+          },
+        ],
+      },
+      {
+        name: "set-model",
+        description: "Set or clear the model override for an existing job",
+        type: ApplicationCommandOptionType.Subcommand,
+        options: [
+          {
+            name: "id",
+            description: "Job ID",
+            type: ApplicationCommandOptionType.String,
+            required: true,
+          },
+          {
+            name: "model",
+            description: "Model to use, or 'default' to inherit the global selection",
+            type: ApplicationCommandOptionType.String,
+            required: true,
+            autocomplete: true,
+          },
         ],
       },
       {
@@ -303,6 +371,13 @@ export const slashCommands: ApplicationCommandData[] = [
 // ---------------------------------------------------------------------------
 
 export async function handleInteraction(interaction: Interaction): Promise<void> {
+  // Autocomplete first — it is the only latency-bound interaction type
+  // (Discord allows a single response within ~3s and has no defer equivalent).
+  if (interaction.isAutocomplete()) {
+    await handleAutocomplete(interaction);
+    return;
+  }
+
   // Handle button / select menu interactions (placeholder — extend as needed)
   if (interaction.isButton() || interaction.isStringSelectMenu()) {
     await interaction.reply({ content: "Interaction received.", ephemeral: true });
@@ -333,6 +408,9 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
         break;
       case "soul":
         await handleSoul(interaction);
+        break;
+      case "model":
+        await handleModel(interaction);
         break;
       case "skills":
         await handleSkills(interaction);
@@ -365,6 +443,236 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
       await interaction.reply({ content, ephemeral: true });
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Autocomplete
+// ---------------------------------------------------------------------------
+
+/**
+ * Route autocomplete requests. Always responds — Discord leaves the dropdown
+ * stuck on "loading options" if a request goes unanswered.
+ */
+async function handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
+  try {
+    const focused = interaction.options.getFocused(true);
+    const wantsModel =
+      (interaction.commandName === "model" && focused.name === "name") ||
+      (interaction.commandName === "cron" && focused.name === "model");
+
+    if (wantsModel) {
+      await respondWithModelChoices(interaction, focused.value);
+      return;
+    }
+
+    await interaction.respond([]);
+  } catch (err) {
+    console.error("[bot] Autocomplete failed:", err);
+    if (!interaction.responded) {
+      await interaction.respond([]).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Offer model choices from the cached catalog only.
+ *
+ * This path never awaits the network: autocomplete must answer within ~3s and
+ * the catalog fetch timeout alone is 5s. A cold cache falls back to the
+ * built-in list and triggers a background warm so the next keystroke is live.
+ */
+async function respondWithModelChoices(
+  interaction: AutocompleteInteraction,
+  query: string,
+): Promise<void> {
+  const cached = getCachedSelectableModelIds();
+  if (!cached) warmModelCache();
+
+  const current = resolveModel();
+  const choices = rankModelIds(cached ?? FALLBACK_MODEL_IDS, query);
+
+  await interaction.respond(
+    choices.map((id) => ({
+      name: id === current ? `● ${id}` : id,
+      value: id,
+    })),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// /model
+// ---------------------------------------------------------------------------
+
+/** Option values meaning "no explicit model — inherit whatever is configured". */
+const INHERIT_MODEL_VALUES = new Set([
+  "default",
+  "auto",
+  "inherit",
+  "global",
+  "none",
+  "clear",
+  "reset",
+]);
+
+type ModelOptionResult =
+  | { ok: true; model?: string; warning?: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate a user-supplied model id against the proxy catalog.
+ *
+ * `model: undefined` means the sentinel was used and the caller should clear
+ * whatever override it manages. Awaits the catalog, so callers must already
+ * have deferred the interaction.
+ */
+async function validateModelOption(raw: string): Promise<ModelOptionResult> {
+  const cleaned = cleanModelName(raw);
+  if (!cleaned || INHERIT_MODEL_VALUES.has(cleaned.toLowerCase())) {
+    return { ok: true, model: undefined };
+  }
+
+  const list = await listModels();
+  if (list.models.some((m) => m.id === cleaned)) {
+    return { ok: true, model: cleaned };
+  }
+
+  // Proxy unreachable — accept rather than block a legitimate id, but say so.
+  if (list.source === "fallback") {
+    return {
+      ok: true,
+      model: cleaned,
+      warning: "the proxy was unreachable so this could not be verified",
+    };
+  }
+
+  const suggestions = rankModelIds(selectableModelIds(list), cleaned).slice(0, 8);
+  const hint = suggestions.length
+    ? `\n\nClosest matches:\n${suggestions.map((s) => `• \`${s}\``).join("\n")}`
+    : "\n\nRun `/model` to see what is available.";
+  return { ok: false, error: `❌ \`${cleaned}\` is not a model this proxy offers.${hint}` };
+}
+
+function describeSource(source: string): string {
+  switch (source) {
+    case "override":
+      return "Per-job override";
+    case "config":
+      return "Saved selection";
+    case "env":
+      return "`ANTHROPIC_MODEL` env";
+    default:
+      return "Built-in default";
+  }
+}
+
+async function handleModel(
+  interaction: import("discord.js").ChatInputCommandInteraction,
+): Promise<void> {
+  // The set/show paths await the catalog, which can exceed the 3s ack deadline.
+  await interaction.deferReply({ ephemeral: true });
+
+  const name = interaction.options.getString("name");
+  const reset = interaction.options.getBoolean("reset") ?? false;
+  const refresh = interaction.options.getBoolean("refresh") ?? false;
+
+  if (reset) {
+    clearSelectedModel();
+    const after = describeModelResolution();
+    await interaction.editReply({
+      content:
+        `✅ Cleared the saved selection. Now using \`${after.model}\` ` +
+        `(${describeSource(after.source).toLowerCase()}).`,
+    });
+    return;
+  }
+
+  if (refresh) invalidateModelCache();
+
+  const list = await listModels({ force: refresh });
+
+  if (name) {
+    const result = await validateModelOption(name);
+    if (!result.ok) {
+      await interaction.editReply({ content: result.error });
+      return;
+    }
+
+    // Sentinel value (`default`, `auto`, …) — same effect as reset:true.
+    if (!result.model) {
+      clearSelectedModel();
+      const after = describeModelResolution();
+      await interaction.editReply({
+        content:
+          `✅ Cleared the saved selection. Now using \`${after.model}\` ` +
+          `(${describeSource(after.source).toLowerCase()}).`,
+      });
+      return;
+    }
+
+    setSelectedModel(result.model);
+    await interaction.editReply({
+      content:
+        `${result.warning ? "⚠️" : "✅"} Model set to \`${result.model}\` for all channels, ` +
+        `threads, and DMs${result.warning ? ` — ${result.warning}` : ""}.\n` +
+        `-# Takes effect on the next message — replies already in flight keep the previous model. ` +
+        `Voice and the cycling coach are configured separately.`,
+    });
+    return;
+  }
+
+  // No arguments — report the current resolution.
+  const resolution = describeModelResolution();
+  const selectable = selectableModelIds(list);
+  const active = list.models.find((m) => m.id === resolution.model);
+  const envUnknown =
+    resolution.env && list.source !== "fallback" && !list.models.some((m) => m.id === resolution.env);
+
+  const availability =
+    list.source === "fallback"
+      ? `⚠️ Proxy unreachable — showing ${selectable.length} built-in fallback models`
+      : `${selectable.length} selectable · ${list.models.length} total from proxy`;
+
+  const embed = new EmbedBuilder()
+    .setTitle("🧠 Model")
+    .addFields(
+      { name: "Active", value: `\`${resolution.model}\``, inline: true },
+      { name: "Source", value: describeSource(resolution.source), inline: true },
+      {
+        name: "Saved selection",
+        value: resolution.saved ? `\`${resolution.saved}\`` : "_Not set_",
+        inline: false,
+      },
+      {
+        name: "Env `ANTHROPIC_MODEL`",
+        value: resolution.env
+          ? `${envUnknown ? "⚠️ " : ""}\`${resolution.env}\`${envUnknown ? " — not offered by the proxy" : ""}`
+          : "_Not set_",
+        inline: false,
+      },
+      { name: "Available", value: availability, inline: false },
+    )
+    .setColor(resolution.healed || envUnknown ? 0xfee75c : 0x5865f2)
+    .setFooter({
+      text: "/model name:<model> to change · applies to every channel, thread, and DM",
+    });
+
+  if (active?.maxInputTokens) {
+    embed.addFields({
+      name: "Context window",
+      value: `${active.maxInputTokens.toLocaleString()} in / ${
+        active.maxOutputTokens?.toLocaleString() ?? "?"
+      } out`,
+      inline: false,
+    });
+  }
+
+  if (resolution.healed) {
+    embed.setDescription(
+      `⚠️ The configured model is not offered by the proxy — falling back to \`${resolution.model}\`.`,
+    );
+  }
+
+  await interaction.editReply({ embeds: [embed] });
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +855,8 @@ async function handleHelp(
           "`/clear` — Clear the current session",
           "`/stop` — Stop all active processing sessions",
           "`/soul` — Show the bot personality",
+          "`/model` — Show the active model",
+          "`/model name:<model>` — Switch models (persists across restarts)",
           "`/join` — Join your voice channel as a voice assistant",
           "`/leave` — Leave the voice channel",
           "`/skills list` — List installed skills",
@@ -560,6 +870,7 @@ async function handleHelp(
           "`/cron enable/disable <id>` — Toggle a job",
           "`/cron run <id>` — Force-run a job now",
           "`/cron history <id>` — View run history",
+          "`/cron set-model <id> <model>` — Override the model for one job",
           "`/restart` — Restart the bot process",
         ].join("\n"),
       },
@@ -882,9 +1193,18 @@ function formatPayload(payload: CronPayload): string {
     const msg = payload.message.length > 100
       ? payload.message.slice(0, 100) + "…"
       : payload.message;
-    return `Agent turn: ${msg}`;
+    const model = payload.model ? ` · model: \`${payload.model}\`` : "";
+    return `Agent turn: ${msg}${model}`;
   }
   return "Unknown";
+}
+
+/** Model a job will run on, distinguishing a per-job override from the global one. */
+function formatJobModel(job: CronJob): string {
+  if (job.payload.kind !== "agentTurn") return "—";
+  return job.payload.model
+    ? `\`${job.payload.model}\` (job override)`
+    : `\`${resolveModel()}\` (global)`;
 }
 
 /**
@@ -938,7 +1258,12 @@ async function handleCron(
         const nextRun = job.state.nextRunAtMs
           ? `<t:${Math.floor(job.state.nextRunAtMs / 1000)}:R>`
           : "—";
-        return `${status} **${job.name}** (\`${job.id}\`)\n  Schedule: ${schedule} · Next: ${nextRun}`;
+        // Only annotate overrides, so jobs on the global model render unchanged.
+        const model =
+          job.payload.kind === "agentTurn" && job.payload.model
+            ? ` · Model: \`${job.payload.model}\``
+            : "";
+        return `${status} **${job.name}** (\`${job.id}\`)\n  Schedule: ${schedule} · Next: ${nextRun}${model}`;
       });
 
       const embed = new EmbedBuilder()
@@ -974,21 +1299,37 @@ async function handleCron(
       const message = interaction.options.getString("message", true);
       const channel = interaction.options.getChannel("channel");
       const timezone = interaction.options.getString("timezone") ?? undefined;
+      const modelInput = interaction.options.getString("model");
 
       const deliveryChannelId = channel?.id ?? interaction.channelId;
+
+      // Validating the model awaits the catalog, which can outlast the 3s
+      // ack deadline, so defer before doing any of it.
+      await interaction.deferReply({ ephemeral: true });
 
       let schedule: CronSchedule;
       try {
         schedule = parseScheduleInput(scheduleInput, timezone);
       } catch {
-        await interaction.reply({
+        await interaction.editReply({
           content: `Invalid schedule: \`${scheduleInput}\`. Use a cron expression or \`every <N>m/h/d\`.`,
-          ephemeral: true,
         });
         return;
       }
 
-      const payload: CronPayload = { kind: "agentTurn", message };
+      let model: string | undefined;
+      let modelWarning: string | undefined;
+      if (modelInput) {
+        const result = await validateModelOption(modelInput);
+        if (!result.ok) {
+          await interaction.editReply({ content: result.error });
+          return;
+        }
+        model = result.model;
+        modelWarning = result.warning;
+      }
+
+      const payload: CronPayload = { kind: "agentTurn", message, model };
       const delivery: CronDelivery = {
         channelId: deliveryChannelId,
         mentionUser: interaction.user.id,
@@ -1006,11 +1347,63 @@ async function handleCron(
         ? `<t:${Math.floor(job.state.nextRunAtMs / 1000)}:R>`
         : "not scheduled";
 
-      await interaction.reply({
-        content: `✅ Cron job **${name}** created (\`${job.id}\`). Next run: ${nextRun}`,
-        ephemeral: true,
+      const modelNote = model
+        ? `\nModel: \`${model}\`${modelWarning ? ` (⚠️ ${modelWarning})` : ""}`
+        : "";
+
+      await interaction.editReply({
+        content: `✅ Cron job **${name}** created (\`${job.id}\`). Next run: ${nextRun}${modelNote}`,
       });
       console.log(`[bot] Cron job created via /cron add: "${name}" (${job.id})`);
+      break;
+    }
+
+    case "set-model": {
+      const id = interaction.options.getString("id", true);
+      const modelInput = interaction.options.getString("model", true);
+      const job = cronService.get(id);
+
+      if (!job) {
+        await interaction.reply({ content: `Job \`${id}\` not found.`, ephemeral: true });
+        return;
+      }
+
+      if (job.payload.kind !== "agentTurn") {
+        await interaction.reply({
+          content: `Job **${job.name}** is a \`${job.payload.kind}\` job — only agent-turn jobs run a model.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const result = await validateModelOption(modelInput);
+      if (!result.ok) {
+        await interaction.editReply({ content: result.error });
+        return;
+      }
+
+      // The store shallow-merges patches at the top level, so the whole
+      // payload has to be spread — patching `payload` replaces it outright.
+      const updated = cronService.update(id, {
+        payload: { ...job.payload, model: result.model },
+      });
+
+      if (!updated) {
+        await interaction.editReply({ content: `Failed to update job \`${id}\`.` });
+        return;
+      }
+
+      await interaction.editReply({
+        content: result.model
+          ? `${result.warning ? "⚠️" : "✅"} Job **${job.name}** will now run on \`${result.model}\`` +
+            `${result.warning ? ` — ${result.warning}` : ""}.`
+          : `✅ Job **${job.name}** now inherits the global model (\`${resolveModel()}\`).`,
+      });
+      console.log(
+        `[bot] Cron job model set via /cron set-model: "${job.name}" (${id}) → ${result.model ?? "inherit"}`,
+      );
       break;
     }
 
@@ -1180,6 +1573,7 @@ function buildJobDetailEmbed(job: CronJob): EmbedBuilder {
     { name: "Next Run", value: nextRun, inline: false },
     { name: "Last Run", value: lastRun, inline: false },
     { name: "Payload", value: payload, inline: false },
+    { name: "Model", value: formatJobModel(job), inline: false },
     { name: "Delivery", value: delivery, inline: false },
   ];
 
