@@ -75,6 +75,14 @@ function runCommand(
   });
 }
 
+/** Trim a command's stderr/stdout down to a short, log-friendly snippet. */
+function shortDetail(res: CommandResult, maxLen = 300): string {
+  const raw = (res.stderr || res.stdout || "").trim();
+  if (!raw) return `exit code ${res.code}, no output captured`;
+  const lastLine = raw.split("\n").filter(Boolean).pop() || raw;
+  return lastLine.length > maxLen ? `${lastLine.slice(-maxLen)}` : lastLine;
+}
+
 // ---------------------------------------------------------------------------
 // Setup / readiness check (cached, lazy install on first use)
 // ---------------------------------------------------------------------------
@@ -82,14 +90,47 @@ function runCommand(
 let setupChecked = false;
 let setupAvailable = false;
 let setupPromise: Promise<boolean> | null = null;
+/** Human-readable reason the local stack is unavailable, if applicable. */
+let setupFailureReason: string | null = null;
 
-async function checkNemoInstalled(): Promise<boolean> {
-  const res = await runCommand(
+async function checkNemoInstalled(): Promise<CommandResult> {
+  return runCommand(
     "python3",
     ["-c", "import nemo.collections.asr"],
     { timeoutMs: 15_000 },
   );
-  return res.code === 0;
+}
+
+/**
+ * Figure out which pip invocation actually works on this host. Some
+ * environments (notably minimal/embedded Python installs) don't have a
+ * `pip3` binary on PATH even though `python3 -m pip` works, or vice versa.
+ * Tries `pip3` first, then falls back to `python3 -m pip`.
+ */
+async function resolvePipCommand(): Promise<
+  { cmd: string; baseArgs: string[] } | null
+> {
+  const pip3Check = await runCommand("pip3", ["--version"], {
+    timeoutMs: 5_000,
+  });
+  if (pip3Check.code === 0) {
+    return { cmd: "pip3", baseArgs: [] };
+  }
+  console.log(
+    `[local-audio] 'pip3' unavailable (${shortDetail(pip3Check)}) — trying 'python3 -m pip' instead...`,
+  );
+
+  const pyPipCheck = await runCommand("python3", ["-m", "pip", "--version"], {
+    timeoutMs: 5_000,
+  });
+  if (pyPipCheck.code === 0) {
+    return { cmd: "python3", baseArgs: ["-m", "pip"] };
+  }
+
+  console.error(
+    `[local-audio] No usable pip found. 'pip3 --version' -> ${shortDetail(pip3Check)}; 'python3 -m pip --version' -> ${shortDetail(pyPipCheck)}`,
+  );
+  return null;
 }
 
 /**
@@ -111,36 +152,55 @@ export async function ensureLocalTranscriptionReady(
       timeoutMs: 5_000,
     });
     if (ffmpegCheck.code !== 0) {
-      console.error("[local-audio] ffmpeg not available on PATH");
+      setupFailureReason = `ffmpeg not found on PATH (${shortDetail(ffmpegCheck)}). Install it, e.g. 'apt-get install -y ffmpeg'.`;
+      console.error(`[local-audio] ${setupFailureReason}`);
       setupChecked = true;
       setupAvailable = false;
       return false;
     }
 
     const alreadyInstalled = await checkNemoInstalled();
-    if (alreadyInstalled) {
+    if (alreadyInstalled.code === 0) {
+      console.log(
+        "[local-audio] NeMo/Parakeet already installed — local transcription ready.",
+      );
+      setupFailureReason = null;
       setupChecked = true;
       setupAvailable = true;
       return true;
     }
 
     console.log(
-      "[local-audio] NeMo/Parakeet not installed yet — installing now (one-time setup)...",
+      `[local-audio] NeMo/Parakeet not installed yet (${shortDetail(alreadyInstalled)}) — attempting one-time setup...`,
+    );
+
+    const pip = await resolvePipCommand();
+    if (!pip) {
+      setupFailureReason =
+        "No usable pip installation found (checked 'pip3' and 'python3 -m pip'). Install pip to enable local voice transcription, e.g. 'apt-get install -y python3-pip', then it will retry automatically after a restart.";
+      console.error(`[local-audio] ${setupFailureReason}`);
+      setupChecked = true;
+      setupAvailable = false;
+      return false;
+    }
+
+    console.log(
+      `[local-audio] Installing nemo_toolkit via '${[pip.cmd, ...pip.baseArgs, "install"].join(" ")} ...' (one-time, can take several minutes)...`,
     );
     onStatus?.(
       "🔧 Setting up local voice transcription (NVIDIA Parakeet) for the first time — this can take a few minutes, hang tight...",
     );
 
     const install = await runCommand(
-      "pip3",
-      ["install", "-U", "nemo_toolkit[asr]", "soundfile", "librosa"],
+      pip.cmd,
+      [...pip.baseArgs, "install", "-U", "nemo_toolkit[asr]", "soundfile", "librosa"],
       { timeoutMs: 20 * 60 * 1000 }, // up to 20 minutes for first install
     );
 
     if (install.code !== 0) {
+      setupFailureReason = `pip install of nemo_toolkit failed (exit code ${install.code}): ${shortDetail(install, 1500)}`;
       console.error(
-        "[local-audio] Failed to install nemo_toolkit:",
-        install.stderr.slice(-2000),
+        `[local-audio] ${setupFailureReason}\nFull stderr tail:\n${install.stderr.slice(-2000)}`,
       );
       setupChecked = true;
       setupAvailable = false;
@@ -149,8 +209,19 @@ export async function ensureLocalTranscriptionReady(
 
     const nowInstalled = await checkNemoInstalled();
     setupChecked = true;
-    setupAvailable = nowInstalled;
-    return nowInstalled;
+    setupAvailable = nowInstalled.code === 0;
+
+    if (setupAvailable) {
+      setupFailureReason = null;
+      console.log(
+        "[local-audio] NeMo/Parakeet installed successfully — local transcription ready.",
+      );
+    } else {
+      setupFailureReason = `pip install reported success, but 'import nemo.collections.asr' still fails afterward (${shortDetail(nowInstalled)}). Possible partial/broken install.`;
+      console.error(`[local-audio] ${setupFailureReason}`);
+    }
+
+    return setupAvailable;
   })();
 
   return setupPromise;
@@ -159,6 +230,19 @@ export async function ensureLocalTranscriptionReady(
 /** Synchronous check of whether setup has already succeeded (no side effects). */
 export function isLocalTranscriptionKnownReady(): boolean {
   return setupChecked && setupAvailable;
+}
+
+/**
+ * Diagnostic snapshot of local transcription readiness, useful for logging
+ * *why* the local path is unavailable (e.g. surfaced by transcribe.ts /
+ * messages.ts when both local and OpenAI fallback fail).
+ */
+export function getLocalTranscriptionStatus(): {
+  checked: boolean;
+  ready: boolean;
+  reason: string | null;
+} {
+  return { checked: setupChecked, ready: setupAvailable, reason: setupFailureReason };
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +279,10 @@ export async function transcribeAudioLocal(
 ): Promise<string | null> {
   const ready = await ensureLocalTranscriptionReady(onStatus);
   if (!ready) {
-    console.log("[local-audio] Local transcription stack unavailable — skipping");
+    const status = getLocalTranscriptionStatus();
+    console.log(
+      `[local-audio] Local transcription stack unavailable — skipping. Reason: ${status.reason || "unknown"}`,
+    );
     return null;
   }
 
@@ -219,7 +306,7 @@ export async function transcribeAudioLocal(
 
     if (convert.code !== 0) {
       console.error(
-        "[local-audio] ffmpeg conversion failed:",
+        `[local-audio] ffmpeg conversion failed (exit code ${convert.code}):`,
         convert.stderr.slice(-1000),
       );
       return null;
@@ -237,7 +324,7 @@ export async function transcribeAudioLocal(
 
     if (result.code !== 0) {
       console.error(
-        "[local-audio] Parakeet transcription failed:",
+        `[local-audio] Parakeet transcription failed (exit code ${result.code}):`,
         result.stderr.slice(-1000),
       );
       return null;
@@ -256,13 +343,19 @@ export async function transcribeAudioLocal(
         `[local-audio] Transcription result (${text.length} chars): "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`,
       );
       return text || null;
-    } catch {
+    } catch (parseErr) {
       console.error(
-        "[local-audio] Could not parse Parakeet output:",
+        `[local-audio] Could not parse Parakeet output (${String(parseErr)}):`,
         lastLine.slice(0, 200),
       );
       return null;
     }
+  } catch (err) {
+    console.error(
+      `[local-audio] Unexpected error during local transcription of ${filename || "voice message"}:`,
+      err,
+    );
+    return null;
   } finally {
     try {
       unlinkSync(rawPath);

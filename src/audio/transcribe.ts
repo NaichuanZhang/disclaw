@@ -12,7 +12,7 @@ import { writeFileSync, unlinkSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomBytes } from "crypto";
-import { transcribeAudioLocal } from "./local-transcribe.js";
+import { transcribeAudioLocal, getLocalTranscriptionStatus } from "./local-transcribe.js";
 
 // ---------------------------------------------------------------------------
 // OpenAI client (lazy singleton) — fallback only
@@ -43,6 +43,18 @@ export function isOpenAITranscriptionAvailable(): boolean {
  */
 export function isTranscriptionAvailable(): boolean {
   return true; // local transcription is always attempted first
+}
+
+/**
+ * Human-readable summary of why the most recent `transcribeAudio()` call
+ * returned null (both local and OpenAI fallback failed or were
+ * unavailable). Useful for diagnostics / logging from callers like
+ * messages.ts without changing the friendly user-facing error message.
+ */
+let lastFailureSummary: string | null = null;
+
+export function getLastTranscriptionFailureSummary(): string | null {
+  return lastFailureSummary;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,20 +141,42 @@ export async function transcribeAudio(
   filename?: string,
   onStatus?: (msg: string) => void,
 ): Promise<string | null> {
+  let localErrorDetail: string | null = null;
+
   try {
     const localText = await transcribeAudioLocal(url, filename, onStatus);
-    if (localText) return localText;
+    if (localText) {
+      lastFailureSummary = null;
+      return localText;
+    }
   } catch (err) {
+    localErrorDetail = err instanceof Error ? err.message : String(err);
     console.error("[audio] Local transcription attempt failed:", err);
   }
 
+  const localStatus = getLocalTranscriptionStatus();
+  const localReason = localErrorDetail || localStatus.reason || "no transcript produced";
+
   if (isOpenAITranscriptionAvailable()) {
+    let openaiErrorDetail: string | null = null;
     try {
-      return await transcribeAudioOpenAI(url, filename);
+      const openaiText = await transcribeAudioOpenAI(url, filename);
+      if (openaiText) {
+        lastFailureSummary = null;
+        return openaiText;
+      }
+      openaiErrorDetail = "no transcript produced";
     } catch (err) {
+      openaiErrorDetail = err instanceof Error ? err.message : String(err);
       console.error("[audio] OpenAI fallback transcription failed:", err);
     }
+
+    lastFailureSummary = `local: ${localReason}; openai fallback: ${openaiErrorDetail}`;
+    console.error(`[audio] All transcription paths failed. ${lastFailureSummary}`);
+    return null;
   }
 
+  lastFailureSummary = `local: ${localReason}; openai fallback: not configured (OPENAI_API_KEY unset)`;
+  console.error(`[audio] All transcription paths failed. ${lastFailureSummary}`);
   return null;
 }
