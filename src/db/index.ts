@@ -675,3 +675,7 @@ export function setConfig(key: string, value: string): void {
     .prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)")
     .run(key, value);
 }
+
+export function deleteConfig(key: string): void {
+  getDb().prepare("DELETE FROM config WHERE key = ?").run(key);
+}

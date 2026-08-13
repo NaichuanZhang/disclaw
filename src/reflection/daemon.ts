@@ -19,6 +19,7 @@ import { listEvolutions, type Evolution } from "../evolution/log.js";
 import { recordSuggestion } from "../evolution/engine.js";
 import { getErrorLogs, getErrorCountsByCategory, getToolCallStats, getSlowestToolCalls, pruneLogs } from "../logging/queries.js";
 import { createLogger } from "../logging/logger.js";
+import { resolveModel } from "../shared/models.js";
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -51,7 +52,14 @@ const MIN_SIGNALS_FOR_REFLECTION = parseInt(
 /** Prune signals older than this (default: 7 days) */
 const SIGNAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
-const REFLECTION_MODEL = process.env.REFLECTION_MODEL || process.env.ANTHROPIC_MODEL || "bedrock-claude-opus-4-7-1m";
+/**
+ * Model for reflection runs. Resolved per-run rather than at module load so a
+ * `/model` selection takes effect without a restart; REFLECTION_MODEL still
+ * pins this daemon to a specific model when set.
+ */
+function getReflectionModel(): string {
+  return resolveModel(process.env.REFLECTION_MODEL);
+}
 
 // ---------------------------------------------------------------------------
 // Discord notification callback
@@ -283,7 +291,7 @@ async function runReflection(): Promise<ReflectionResult> {
     const prompt = buildReflectionPrompt(ctx);
 
     const response = await anthropicClient.messages.create({
-      model: REFLECTION_MODEL,
+      model: getReflectionModel(),
       max_tokens: 2048,
       messages: [{ role: "user", content: prompt }],
     });

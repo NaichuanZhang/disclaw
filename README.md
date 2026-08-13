@@ -66,8 +66,9 @@ Bot: [evolve_merge] Merged and restarting... ✅
 | `/config` | Toggle bot on/off per channel, set custom instructions |
 | `/clear` | Reset conversation history in current session |
 | `/soul` | View the bot's personality |
+| `/model` | Show the active model, or switch to another one from the proxy's list (persists across restarts) |
 | `/skills` | List, install (from GitHub or file upload), or remove skills |
-| `/cron` | View, add, enable/disable, force-run, or show history of cron jobs |
+| `/cron` | View, add, enable/disable, force-run, set a per-job model, or show history of cron jobs |
 | `/restart` | Restart the bot process |
 | `/stop` | Abort all active processing sessions (graceful cancellation via AbortSignal) |
 | `/join` | Join your voice channel as a voice assistant |
@@ -128,7 +129,7 @@ ELEVENLABS_API_KEY=your_elevenlabs_key  # Voice coach TTS
 ELEVENLABS_VOICE_ID=your_voice_id       # Voice coach voice
 GATEWAY_PORT=3000                        # Dashboard port
 GATEWAY_TOKEN=your_secret_token          # Dashboard auth token
-ANTHROPIC_MODEL=bedrock-claude-opus-4-7-1m # Model override (this is the default)
+ANTHROPIC_MODEL=bedrock-claude-opus-5-1m # Fallback model (/model overrides it)
 DAYTONA_API_KEY=your_daytona_key        # Sandbox CI for evolution validation
 ```
 
@@ -194,7 +195,7 @@ git merge upstream/main
 | `ANTHROPIC_API_KEY` | Yes* | Anthropic API key |
 | `ANTHROPIC_BASE_URL` | No | Proxy URL (overrides default API endpoint) |
 | `ANTHROPIC_AUTH_TOKEN` | No | Auth token for proxy (used instead of API key) |
-| `ANTHROPIC_MODEL` | No | Model name (default: `bedrock-claude-opus-4-7-1m`) |
+| `ANTHROPIC_MODEL` | No | Fallback model name (default: `bedrock-claude-opus-5-1m`). A `/model` selection is stored in the DB and takes precedence. |
 | `OPENAI_API_KEY` | No | OpenAI API key for voice message transcription (Whisper) |
 | `EIGENAI_API_KEY` | No | EigenAI API key for voice assistant STT (Whisper) and TTS (Chatterbox) |
 | `ELEVENLABS_API_KEY` | No | ElevenLabs API key for voice coach TTS |

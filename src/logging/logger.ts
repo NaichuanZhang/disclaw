@@ -28,6 +28,7 @@ export type LogCategory =
   | "evolution"
   | "gateway"
   | "memory"
+  | "models"
   | "reflection"
   | "registry"
   | "session-lock"
