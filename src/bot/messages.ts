@@ -17,7 +17,7 @@ import { getChannelConfig, addMessage } from "../db/index.js";
 import type { Message as DbMessage, TokenUsage } from "../db/index.js";
 import { broadcastLog } from "../gateway/server.js";
 import { isRestarting } from "../restart.js";
-import { transcribeAudio } from "../audio/transcribe.js";
+import { transcribeAudio, getLastTranscriptionFailureSummary } from "../audio/transcribe.js";
 import { recordSignal } from "../reflection/signals.js";
 import { splitMessage, DISCORD_MAX_LENGTH } from "../shared/discord-utils.js";
 import { acquireSessionLock, SessionAbortedError } from "../agent/session-lock.js";
@@ -1225,7 +1225,24 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
         cleanContent = transcript;
       }
     } else if (!cleanContent && !hasImages && !hasDocuments) {
-      // No transcription available and no text content and no images and no documents
+      // No transcription available and no text content and no images and no documents.
+      // Log full diagnostics (why local + fallback both failed) so this is easy to
+      // debug from server logs, even though the user only sees a friendly message.
+      const failureSummary = getLastTranscriptionFailureSummary();
+      const voiceChannelName =
+        "name" in message.channel && message.channel.name ? message.channel.name : "DM";
+      console.error(
+        `[bot] Voice transcription unavailable for ${message.author.tag} in ${voiceChannelName}. ${failureSummary || "No diagnostic details captured."}`,
+      );
+
+      recordSignal({
+        type: "error",
+        source: "messages",
+        detail: `Voice transcription failed: ${failureSummary || "no diagnostic details"}`,
+        metadata: { channelName: voiceChannelName, attachmentCount: message.attachments.size },
+        userId: message.author.id,
+      });
+
       await message.reply(
         "🎤 I couldn't transcribe your voice message — local transcription setup may still be running or failed, and no fallback is configured. Please try again shortly, or type your message instead.",
       );
