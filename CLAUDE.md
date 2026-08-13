@@ -93,7 +93,7 @@ Tool availability configurable via `VOICE_TOOLS_MODE`:
 
 Key voice constants: `SILENCE_DURATION_MS = 800` (configurable via `VOICE_SILENCE_MS`), `MIN_UTTERANCE_MS = 500` (configurable via `VOICE_MIN_UTTERANCE_MS`), `IDLE_TIMEOUT_MS = 10min` (auto-leave), `VOICE_MAX_TOKENS = 512` (configurable via `VOICE_MAX_TOKENS`), `MAX_TOOL_ROUNDS = 5`, `MAX_VOICE_HISTORY = 10` turns. Streaming TTS pipelining enabled by default (disable with `VOICE_TTS_STREAM=0`).
 
-Separate from voice chat: `audio/transcribe.ts` handles Discord voice message transcription (audio attachments) via OpenAI's Whisper API.
+Separate from voice chat: `audio/transcribe.ts` handles Discord voice message transcription (audio attachments) through a local-first backend chain — `audio/whispercpp-transcribe.ts` (whisper.cpp native binary, no Python required; set up via `scripts/setup-whispercpp.sh`), then `audio/local-transcribe.ts` (NeMo Parakeet, needs pip), then OpenAI's Whisper API if `OPENAI_API_KEY` is set. When all backends fail, `getLastTranscriptionFailureSummary()` returns a combined per-backend reason for logging.
 
 ### Voice Coach
 
