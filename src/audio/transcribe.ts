@@ -1,10 +1,17 @@
 /**
  * Audio transcription for Discord voice messages.
  *
- * Prefers fully local/offline transcription via NVIDIA's Parakeet model
- * (see ./local-transcribe.ts) — no external API, no key required, and
- * audio never leaves the machine. Falls back to OpenAI's Whisper API
- * only if the local path is unavailable/fails AND OPENAI_API_KEY is set.
+ * Backends are tried in order, and audio only leaves the machine as a last
+ * resort:
+ *
+ *   1. whisper.cpp   — local, native binary + GGML model. No Python at all,
+ *                      so it works on hosts with a broken/absent pip.
+ *   2. NeMo Parakeet — local, but requires a working Python packaging stack.
+ *   3. OpenAI Whisper API — remote fallback, only if OPENAI_API_KEY is set.
+ *
+ * If every backend is unavailable or fails, a combined diagnostic string is
+ * recorded (see `getLastTranscriptionFailureSummary`) so callers can log the
+ * real reason while still showing users a friendly message.
  */
 
 import OpenAI from "openai";
@@ -13,6 +20,10 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { randomBytes } from "crypto";
 import { transcribeAudioLocal, getLocalTranscriptionStatus } from "./local-transcribe.js";
+import {
+  transcribeAudioWhisperCpp,
+  getWhisperCppStatus,
+} from "./whispercpp-transcribe.js";
 
 // ---------------------------------------------------------------------------
 // OpenAI client (lazy singleton) — fallback only
@@ -36,20 +47,18 @@ export function isOpenAITranscriptionAvailable(): boolean {
 }
 
 /**
- * Check if any transcription path is potentially available — local Parakeet
- * (which is attempted by default whenever python3/ffmpeg are present) or
- * the OpenAI fallback. This is optimistic about local transcription since
- * readiness is only really known after attempting it (lazy install).
+ * Check if any transcription path is potentially available. Optimistic: the
+ * local backends' true readiness is only known after attempting them.
  */
 export function isTranscriptionAvailable(): boolean {
-  return true; // local transcription is always attempted first
+  return true; // local backends are always attempted first
 }
 
 /**
  * Human-readable summary of why the most recent `transcribeAudio()` call
- * returned null (both local and OpenAI fallback failed or were
- * unavailable). Useful for diagnostics / logging from callers like
- * messages.ts without changing the friendly user-facing error message.
+ * returned null (every backend failed or was unavailable). Useful for
+ * diagnostics / logging from callers like messages.ts without changing the
+ * friendly user-facing error message.
  */
 let lastFailureSummary: string | null = null;
 
@@ -121,15 +130,18 @@ async function transcribeAudioOpenAI(
 }
 
 // ---------------------------------------------------------------------------
-// Transcribe — local-first, OpenAI fallback
+// Transcribe — local-first backend chain
 // ---------------------------------------------------------------------------
 
+interface BackendAttempt {
+  name: string;
+  reason: string;
+}
+
 /**
- * Download and transcribe an audio file from a URL.
- * Tries fully local transcription (NVIDIA Parakeet) first; falls back to
- * OpenAI's Whisper API if the local path is unavailable/fails and
- * OPENAI_API_KEY is set. Returns the transcribed text, or null if all
- * available paths fail.
+ * Download and transcribe an audio file from a URL, trying whisper.cpp, then
+ * NeMo Parakeet, then the OpenAI Whisper API (if configured). Returns the
+ * transcribed text, or null if every available path fails.
  *
  * @param url - URL of the audio file (e.g., Discord attachment URL)
  * @param filename - Original filename (used to determine format)
@@ -141,42 +153,66 @@ export async function transcribeAudio(
   filename?: string,
   onStatus?: (msg: string) => void,
 ): Promise<string | null> {
-  let localErrorDetail: string | null = null;
+  const attempts: BackendAttempt[] = [];
 
+  // --- 1. whisper.cpp (local, no Python required) -------------------------
   try {
-    const localText = await transcribeAudioLocal(url, filename, onStatus);
-    if (localText) {
+    const text = await transcribeAudioWhisperCpp(url, filename);
+    if (text) {
       lastFailureSummary = null;
-      return localText;
+      return text;
     }
+    const status = getWhisperCppStatus();
+    attempts.push({
+      name: "whisper.cpp",
+      reason: status.reason || "no transcript produced (silent or non-speech audio?)",
+    });
   } catch (err) {
-    localErrorDetail = err instanceof Error ? err.message : String(err);
-    console.error("[audio] Local transcription attempt failed:", err);
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error("[audio] whisper.cpp transcription attempt failed:", err);
+    attempts.push({ name: "whisper.cpp", reason: detail });
   }
 
-  const localStatus = getLocalTranscriptionStatus();
-  const localReason = localErrorDetail || localStatus.reason || "no transcript produced";
-
-  if (isOpenAITranscriptionAvailable()) {
-    let openaiErrorDetail: string | null = null;
-    try {
-      const openaiText = await transcribeAudioOpenAI(url, filename);
-      if (openaiText) {
-        lastFailureSummary = null;
-        return openaiText;
-      }
-      openaiErrorDetail = "no transcript produced";
-    } catch (err) {
-      openaiErrorDetail = err instanceof Error ? err.message : String(err);
-      console.error("[audio] OpenAI fallback transcription failed:", err);
+  // --- 2. NeMo Parakeet (local, needs a working pip) ----------------------
+  try {
+    const text = await transcribeAudioLocal(url, filename, onStatus);
+    if (text) {
+      lastFailureSummary = null;
+      return text;
     }
-
-    lastFailureSummary = `local: ${localReason}; openai fallback: ${openaiErrorDetail}`;
-    console.error(`[audio] All transcription paths failed. ${lastFailureSummary}`);
-    return null;
+    const status = getLocalTranscriptionStatus();
+    attempts.push({
+      name: "parakeet",
+      reason: status.reason || "no transcript produced",
+    });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error("[audio] Local Parakeet transcription attempt failed:", err);
+    attempts.push({ name: "parakeet", reason: detail });
   }
 
-  lastFailureSummary = `local: ${localReason}; openai fallback: not configured (OPENAI_API_KEY unset)`;
+  // --- 3. OpenAI Whisper API (remote fallback) ----------------------------
+  if (isOpenAITranscriptionAvailable()) {
+    try {
+      const text = await transcribeAudioOpenAI(url, filename);
+      if (text) {
+        lastFailureSummary = null;
+        return text;
+      }
+      attempts.push({ name: "openai", reason: "no transcript produced" });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error("[audio] OpenAI fallback transcription failed:", err);
+      attempts.push({ name: "openai", reason: detail });
+    }
+  } else {
+    attempts.push({
+      name: "openai",
+      reason: "not configured (OPENAI_API_KEY unset)",
+    });
+  }
+
+  lastFailureSummary = attempts.map((a) => `${a.name}: ${a.reason}`).join("; ");
   console.error(`[audio] All transcription paths failed. ${lastFailureSummary}`);
   return null;
 }
