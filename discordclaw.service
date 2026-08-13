@@ -1,14 +1,34 @@
 [Unit]
 Description=Discordclaw Watchdog Daemon
-After=network.target
+After=network-online.target
+Wants=network-online.target
+# Without a start limit this unit crash-looped ~1.97M times unnoticed.
+# Five failures in five minutes now parks it in `failed` instead of spinning.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
+User=alex
+Group=alex
 WorkingDirectory=/home/alex/discordclaw
-ExecStart=/usr/bin/npx tsx src/daemon/index.ts
-Restart=always
-RestartSec=5
+
+# node/npm/npx/gh all live in ~/.local/bin, which is absent from systemd's
+# default PATH. The bot shells out to npm (rebuild) and gh (evolution PRs),
+# so the unit PATH has to carry it.
+Environment=PATH=/home/alex/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_ENV=production
 EnvironmentFile=/home/alex/discordclaw/.env
+
+# Invoke tsx through node directly rather than `npx tsx`: npx adds a resolution
+# step that can hit the registry, and /usr/bin/npx does not exist on this host.
+ExecStart=/home/alex/.local/bin/node /home/alex/discordclaw/node_modules/tsx/dist/cli.mjs src/daemon/index.ts
+
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillMode=mixed
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=discordclaw
