@@ -17,10 +17,7 @@ import { getChannelConfig, addMessage } from "../db/index.js";
 import type { Message as DbMessage, TokenUsage } from "../db/index.js";
 import { broadcastLog } from "../gateway/server.js";
 import { isRestarting } from "../restart.js";
-import {
-  transcribeAudio,
-  isTranscriptionAvailable,
-} from "../audio/transcribe.js";
+import { transcribeAudio } from "../audio/transcribe.js";
 import { recordSignal } from "../reflection/signals.js";
 import { splitMessage, DISCORD_MAX_LENGTH } from "../shared/discord-utils.js";
 import { acquireSessionLock, SessionAbortedError } from "../agent/session-lock.js";
@@ -221,15 +218,18 @@ function hasAudioAttachments(message: DiscordMessage): boolean {
 
 /**
  * Attempt to transcribe audio attachments from a message.
+ * Tries fully local transcription (NVIDIA Parakeet) first, falling back to
+ * OpenAI's Whisper API only if local transcription is unavailable/fails and
+ * OPENAI_API_KEY is set (see ../audio/transcribe.ts).
  * Returns transcribed text or null if transcription isn't possible.
+ *
+ * @param onStatus - optional callback for surfacing progress (e.g. one-time
+ *   local model setup) to the user.
  */
 async function transcribeVoiceMessage(
   message: DiscordMessage,
+  onStatus?: (msg: string) => void,
 ): Promise<string | null> {
-  if (!isTranscriptionAvailable()) {
-    return null;
-  }
-
   // Get audio attachments
   const audioAttachments = message.attachments.filter((att) =>
     AUDIO_EXTENSIONS.test(att.name || ""),
@@ -241,7 +241,7 @@ async function transcribeVoiceMessage(
 
   for (const [, attachment] of audioAttachments) {
     try {
-      const text = await transcribeAudio(attachment.url, attachment.name);
+      const text = await transcribeAudio(attachment.url, attachment.name, onStatus);
       if (text) {
         transcriptions.push(text);
       }
@@ -1202,7 +1202,16 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
       message.channel.sendTyping().catch(() => {});
     }
 
-    const transcript = await transcribeVoiceMessage(message);
+    // Surface first-time local model setup progress (one-time, can take a
+    // few minutes) directly in the channel instead of leaving the user
+    // guessing.
+    const onTranscriptionStatus = (msg: string) => {
+      if ("send" in message.channel) {
+        (message.channel as TextChannel | ThreadChannel).send(msg).catch(() => {});
+      }
+    };
+
+    const transcript = await transcribeVoiceMessage(message, onTranscriptionStatus);
 
     if (transcript) {
       console.log(
@@ -1217,15 +1226,9 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
       }
     } else if (!cleanContent && !hasImages && !hasDocuments) {
       // No transcription available and no text content and no images and no documents
-      if (!isTranscriptionAvailable()) {
-        await message.reply(
-          "🎤 I can see you sent a voice message, but voice transcription isn't configured yet. Ask an admin to set the `OPENAI_API_KEY` environment variable to enable it!",
-        );
-      } else {
-        await message.reply(
-          "🎤 I couldn't transcribe your voice message. Please try again or type your message instead.",
-        );
-      }
+      await message.reply(
+        "🎤 I couldn't transcribe your voice message — local transcription setup may still be running or failed, and no fallback is configured. Please try again shortly, or type your message instead.",
+      );
       return;
     }
   }
