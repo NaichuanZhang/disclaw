@@ -70,6 +70,32 @@ const MAX_TOKENS = 16384;
 const MAX_CONSECUTIVE_DUPES = 2; // Break loop after this many identical consecutive tool calls
 
 // ---------------------------------------------------------------------------
+// Caveman mode
+// ---------------------------------------------------------------------------
+
+/** Valid intensity levels for the caveman-speak skill, set via /caveman. */
+export const CAVEMAN_LEVELS = ["lite", "full", "ultra"] as const;
+export type CavemanLevel = (typeof CAVEMAN_LEVELS)[number];
+
+/** Read the active caveman level for a channel, if any. */
+export function getCavemanLevel(config?: ChannelConfig): CavemanLevel | undefined {
+  const raw = config?.settings?.cavemanLevel;
+  return typeof raw === "string" && (CAVEMAN_LEVELS as readonly string[]).includes(raw)
+    ? (raw as CavemanLevel)
+    : undefined;
+}
+
+function buildCavemanInstructions(level: CavemanLevel): string {
+  return (
+    `## Caveman Mode — ACTIVE (level: ${level})\n\n` +
+    `Apply the \`caveman-speak\` skill's compression rules to every reply in this channel/thread ` +
+    `at intensity **${level}**, until turned off via \`/caveman level:off\`. If you have not already ` +
+    `loaded the full rule set this conversation, call \`read_skill\` with skill_name \`caveman-speak\` once. ` +
+    `Technical accuracy, code, numbers, and negations must stay exact — only the prose gets terser.`
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Token usage aggregation
 // ---------------------------------------------------------------------------
 
@@ -259,6 +285,12 @@ function buildSystemPrompt(opts: {
     parts.push(
       `## Channel Instructions\n\n${opts.channelConfig.systemPrompt}`,
     );
+  }
+
+  // 4.5. Caveman mode, if enabled for this channel via /caveman
+  const cavemanLevel = getCavemanLevel(opts.channelConfig);
+  if (cavemanLevel) {
+    parts.push(buildCavemanInstructions(cavemanLevel));
   }
 
   // 5. Context info (including current date/time)

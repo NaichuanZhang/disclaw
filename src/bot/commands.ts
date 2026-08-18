@@ -12,6 +12,7 @@ import { getSoul } from "../soul/soul.js";
 import { triggerRestart } from "../restart.js";
 import { startVoice, stopVoice, isConnected } from "../voice/index.js";
 import { abortAllSessions, getActiveSessionInfo } from "../agent/session-lock.js";
+import { CAVEMAN_LEVELS, getCavemanLevel } from "../agent/agent.js";
 import {
   AUTOCOMPLETE_LIMIT,
   FALLBACK_MODEL_IDS,
@@ -134,6 +135,24 @@ export const slashCommands: ApplicationCommandData[] = [
   {
     name: "restart",
     description: "Restart the bot process",
+  },
+  {
+    name: "caveman",
+    description: "Toggle caveman-speak mode (terse replies) for this channel",
+    options: [
+      {
+        name: "level",
+        description: "Intensity level, or 'off' to disable (omit to show current status)",
+        type: ApplicationCommandOptionType.String,
+        required: false,
+        choices: [
+          { name: "lite", value: "lite" },
+          { name: "full", value: "full" },
+          { name: "ultra", value: "ultra" },
+          { name: "off", value: "off" },
+        ],
+      },
+    ],
   },
   {
     name: "join",
@@ -427,6 +446,9 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
       case "restart":
         await interaction.reply({ content: "Restarting...", ephemeral: true });
         triggerRestart();
+        break;
+      case "caveman":
+        await handleCaveman(interaction);
         break;
       default:
         await interaction.reply({
@@ -871,6 +893,8 @@ async function handleHelp(
           "`/cron run <id>` — Force-run a job now",
           "`/cron history <id>` — View run history",
           "`/cron set-model <id> <model>` — Override the model for one job",
+          "`/caveman` — Show caveman-speak status for this channel",
+          "`/caveman level:<lite|full|ultra|off>` — Toggle terse caveman-speak mode",
           "`/restart` — Restart the bot process",
         ].join("\n"),
       },
@@ -1599,6 +1623,66 @@ function buildJobDetailEmbed(job: CronJob): EmbedBuilder {
     .addFields(fields)
     .setColor(job.enabled ? 0x57f287 : 0xed4245)
     .setFooter({ text: `Created ${new Date(job.createdAt).toISOString()}` });
+}
+
+// ---------------------------------------------------------------------------
+// /caveman
+// ---------------------------------------------------------------------------
+
+async function handleCaveman(
+  interaction: import("discord.js").ChatInputCommandInteraction,
+): Promise<void> {
+  const channelId = interaction.channelId;
+  const level = interaction.options.getString("level");
+
+  if (!level) {
+    const config = getChannelConfig(channelId);
+    const active = getCavemanLevel(config);
+    await interaction.reply({
+      content: active
+        ? `🪨 Caveman mode **on** in this channel — level \`${active}\`. Use \`/caveman level:off\` to disable.`
+        : "Caveman mode is **off** in this channel. Use `/caveman level:<lite|full|ultra>` to enable.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const existing = getChannelConfig(channelId);
+  const settings = { ...(existing?.settings ?? {}) };
+
+  if (level === "off") {
+    delete settings.cavemanLevel;
+    setChannelConfig(channelId, {
+      guildId: interaction.guildId ?? undefined,
+      settings,
+    });
+    await interaction.reply({
+      content: "🪨 Caveman mode **off** for this channel.",
+      ephemeral: true,
+    });
+    console.log(`[bot] Caveman mode disabled for channel ${channelId} by ${interaction.user.tag}`);
+    return;
+  }
+
+  if (!(CAVEMAN_LEVELS as readonly string[]).includes(level)) {
+    await interaction.reply({
+      content: `Unknown level \`${level}\`. Use lite, full, ultra, or off.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  settings.cavemanLevel = level;
+  setChannelConfig(channelId, {
+    guildId: interaction.guildId ?? undefined,
+    settings,
+  });
+
+  await interaction.reply({
+    content: `🪨 Caveman mode **on** for this channel — level \`${level}\`. Say "stop caveman" or run \`/caveman level:off\` to disable.`,
+    ephemeral: true,
+  });
+  console.log(`[bot] Caveman mode set to "${level}" for channel ${channelId} by ${interaction.user.tag}`);
 }
 
 // ---------------------------------------------------------------------------
