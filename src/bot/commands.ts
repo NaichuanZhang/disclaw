@@ -7,6 +7,7 @@ import {
   ChannelType,
 } from "discord.js";
 import { clearSession, resolveSession } from "../agent/sessions.js";
+import { clearThreadHistoryCache } from "./thread-history.js";
 import { getChannelConfig, setChannelConfig, getDb } from "../db/index.js";
 import { getSoul } from "../soul/soul.js";
 import { triggerRestart } from "../restart.js";
@@ -1012,6 +1013,11 @@ async function handleClear(
   });
 
   clearSession(session.id);
+  if (isThread && interaction.channel) {
+    // Also forget the thread history cache, otherwise the cached/stored
+    // messages would be replayed on the next turn in this thread.
+    clearThreadHistoryCache(interaction.channel.id);
+  }
 
   await interaction.reply({
     content: "Session cleared. I have forgotten our conversation context.",
