@@ -69,6 +69,7 @@ Bot: [evolve_merge] Merged and restarting... ✅
 | `/model` | Show the active model, or switch to another one from the proxy's list (persists across restarts) |
 | `/skills` | List, install (from GitHub or file upload), or remove skills |
 | `/cron` | View, add, enable/disable, force-run, set a per-job model, or show history of cron jobs |
+| `/caveman` | Toggle terse caveman-speak mode (lite/full/ultra/off) for the current channel |
 | `/restart` | Restart the bot process |
 | `/stop` | Abort all active processing sessions (graceful cancellation via AbortSignal) |
 | `/join` | Join your voice channel as a voice assistant |
@@ -932,7 +933,7 @@ discordclaw/
 │   ├── bot/                   # Discord bot (discord.js v14)
 │   │   ├── client.ts          # Client setup, intents, event routing, DM raw fallback
 │   │   ├── messages.ts        # Message pipeline: filter → session → lock → voice transcribe → agent → thread reply
-│   │   └── commands.ts        # Slash commands: /ping /help /config /clear /soul /skills /cron /restart /stop /join /leave
+│   │   └── commands.ts        # Slash commands: /ping /help /config /clear /soul /skills /cron /caveman /restart /stop /join /leave
 │   ├── agent/                 # Claude integration
 │   │   ├── agent.ts           # Anthropic SDK wrapper, system prompt, tool loop + duplicate detection + abort signal
 │   │   ├── tools.ts           # Discord tools (send_message, send_file, add_reaction, get_channel_history, create_thread)
