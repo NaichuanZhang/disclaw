@@ -14,6 +14,11 @@ import { processMessage } from "../agent/agent.js";
 import type { AgentResponse, AgentImage, ToolCallProgress } from "../agent/agent.js";
 import { resolveSession, getSessionHistory } from "../agent/sessions.js";
 import { getChannelConfig, addMessage } from "../db/index.js";
+import {
+  buildThreadHistory,
+  appendThreadMessages,
+  clearThreadHistoryCache,
+} from "./thread-history.js";
 import type { Message as DbMessage, TokenUsage } from "../db/index.js";
 import { broadcastLog } from "../gateway/server.js";
 import { isRestarting } from "../restart.js";
@@ -1384,13 +1389,22 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
       session.id,
     );
 
-    history = discordHistory;
+    // Merge Discord's view with the cached + stored history for this thread.
+    // Discord's fetch can fail or be incomplete (rate limits, permissions,
+    // embed-only bot replies, >50 message threads) — merging guarantees the
+    // agent still receives the full conversation.
+    history = buildThreadHistory({
+      threadId: thread.id,
+      discordHistory,
+      sessionHistory: getSessionHistory(session.id),
+      currentMessageId: message.id,
+      limit: MAX_THREAD_HISTORY_MESSAGES,
+    });
 
-    if (discordHistory.length > 0) {
-      console.log(
-        `[bot] Loaded ${discordHistory.length} message(s) from Discord thread history (thread ${thread.id})`,
-      );
-    }
+    console.log(
+      `[bot] Thread ${thread.id} history: ${discordHistory.length} from Discord, ` +
+        `${history.length} after merge with cache/DB`,
+    );
   } else {
     // For DMs and non-thread channels, use the DB session history
     history = getSessionHistory(session.id);
@@ -1523,6 +1537,7 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
     // 13. Send reply — in thread if we created one, otherwise reply to original message
     const chunks = splitMessage(displayText);
     const sendInTarget = "send" in replyTarget;
+    const sentMessageIds: string[] = [];
 
     for (let i = 0; i < chunks.length; i++) {
       if (i === 0) {
@@ -1537,19 +1552,22 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
           if (files.length > 0) replyPayload.files = files;
         }
 
+        let sent: DiscordMessage | undefined;
         if (shouldCreateThread && sendInTarget) {
           // Send in thread (not as a reply — we're already in the thread context)
-          await (replyTarget as TextChannel | ThreadChannel).send(replyPayload);
+          sent = await (replyTarget as TextChannel | ThreadChannel).send(replyPayload);
         } else if (isThread && sendInTarget) {
           // In an existing thread, send directly (not as a reply to avoid clutter)
-          await (replyTarget as TextChannel | ThreadChannel).send(replyPayload);
+          sent = await (replyTarget as TextChannel | ThreadChannel).send(replyPayload);
         } else {
           // DMs or fallback: use message.reply
-          await message.reply(replyPayload);
+          sent = await message.reply(replyPayload);
         }
+        if (sent) sentMessageIds.push(sent.id);
       } else {
         if (sendInTarget) {
-          await (replyTarget as TextChannel | ThreadChannel).send(chunks[i]);
+          const sent = await (replyTarget as TextChannel | ThreadChannel).send(chunks[i]);
+          sentMessageIds.push(sent.id);
         }
       }
     }
@@ -1568,6 +1586,30 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
       } else {
         await message.reply(replyPayload);
       }
+    }
+
+    // 13b. Warm the thread history cache with this turn, so the next turn has
+    // full context even if Discord's history fetch fails or is incomplete.
+    if (sessionThreadId) {
+      const authorName = message.author.displayName ?? message.author.username;
+      appendThreadMessages(sessionThreadId, [
+        {
+          id: -1,
+          sessionId: session.id,
+          role: "user",
+          content: `${authorName}: ${logContent}`,
+          discordMessageId: message.id,
+          createdAt: message.createdTimestamp,
+        },
+        {
+          id: -2,
+          sessionId: session.id,
+          role: "assistant",
+          content: fullResponseText,
+          discordMessageId: sentMessageIds[0],
+          createdAt: Date.now(),
+        },
+      ]);
     }
 
     const imageCount = response.images.length;

@@ -463,6 +463,40 @@ export function getSessionMessages(sessionId: string, limit?: number): Message[]
   return rows.map(rowToMessage);
 }
 
+/**
+ * Get messages for a Discord conversation key (e.g. `thread:123`), across
+ * both live sessions and the archived `message_history` table.
+ *
+ * This is the durable fallback for thread context: even if the live session
+ * was expired/deleted or the process restarted, the messages that were logged
+ * for that thread are still recoverable.
+ *
+ * Returns messages in chronological order (oldest first), newest `limit` kept.
+ */
+export function getMessagesByDiscordKey(discordKey: string, limit = 50): Message[] {
+  const sql = `
+    SELECT * FROM (
+      SELECT m.id, m.session_id, m.role, m.content, m.discord_message_id, m.created_at,
+             m.model, m.input_tokens, m.output_tokens, m.cache_creation_tokens, m.cache_read_tokens
+      FROM messages m
+      JOIN sessions s ON m.session_id = s.id
+      WHERE s.discord_key = @key
+
+      UNION ALL
+
+      SELECT id, session_id, role, content, discord_message_id, created_at,
+             model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
+      FROM message_history
+      WHERE discord_key = @key
+    )
+    ORDER BY created_at DESC
+    LIMIT @limit
+  `;
+
+  const rows = getDb().prepare(sql).all({ key: discordKey, limit }) as Record<string, unknown>[];
+  return rows.map(rowToMessage).reverse();
+}
+
 export function addMessage(opts: {
   sessionId: string;
   role: string;
