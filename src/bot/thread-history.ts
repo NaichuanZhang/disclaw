@@ -143,6 +143,17 @@ export function clearThreadHistoryCache(threadId: string): void {
   clearedAt.set(threadId, Date.now());
 }
 
+/**
+ * Timestamp of the last /clear for a thread, or null if it was never cleared.
+ *
+ * Exposed so other history readers (notably the `get_channel_history` tool,
+ * which fetches straight from Discord) can honour the cutoff instead of
+ * resurrecting messages the user explicitly cleared.
+ */
+export function getThreadClearCutoff(threadId: string): number | null {
+  return clearedAt.get(threadId) ?? null;
+}
+
 /** Cache stats, for debugging. */
 export function threadHistoryCacheStats(): { threads: number; messages: number } {
   let messages = 0;
