@@ -8,6 +8,7 @@ import {
 } from "discord.js";
 import { clearSession, resolveSession } from "../agent/sessions.js";
 import { clearThreadHistoryCache } from "./thread-history.js";
+import { buildSkillListEmbedDescriptions } from "./skills-list.js";
 import { getChannelConfig, setChannelConfig, getDb } from "../db/index.js";
 import { getSoul } from "../soul/soul.js";
 import { triggerRestart } from "../restart.js";
@@ -1085,24 +1086,24 @@ async function handleSkills(
         return;
       }
 
-      const lines = skills.map((s) => {
-        const status = s.enabled ? "On" : "Off";
-        const src =
-          s.source.type === "github"
-            ? "GitHub"
-            : s.source.type === "upload"
-              ? "Upload"
-              : "Local";
-        return `**${s.name}** — ${s.description || "_no description_"} [${status}] (${src})`;
+      // Descriptions are truncated and chunked so we never exceed Discord's
+      // 4096-char embed description limit (see src/bot/skills-list.ts).
+      const descriptions = buildSkillListEmbedDescriptions(skills);
+      const embeds = descriptions.map((description, i) =>
+        new EmbedBuilder()
+          .setTitle(
+            descriptions.length > 1
+              ? `Installed Skills (${i + 1}/${descriptions.length})`
+              : "Installed Skills",
+          )
+          .setDescription(description)
+          .setColor(0x5865f2),
+      );
+      embeds[embeds.length - 1]!.setFooter({
+        text: `${skills.length} skill(s)`,
       });
 
-      const embed = new EmbedBuilder()
-        .setTitle("Installed Skills")
-        .setDescription(lines.join("\n"))
-        .setFooter({ text: `${skills.length} skill(s)` })
-        .setColor(0x5865f2);
-
-      await interaction.reply({ embeds: [embed], ephemeral: true });
+      await interaction.reply({ embeds, ephemeral: true });
       break;
     }
 
