@@ -43,6 +43,24 @@ const MERGE_CHECK_RETRY_DELAY_MS = 10_000;
 // Channel where deployment notifications are posted as threads
 const DEPLOY_NOTIFY_CHANNEL_ID = "1493291137908216080";
 
+/**
+ * Delay before the process actually restarts after a merge, so the tool result
+ * can return and in-flight Discord messages can flush.
+ */
+const RESTART_DELAY_MS = 5_000;
+
+/**
+ * Auto-merge: after a PR is created AND all quality gates pass, the evolution
+ * is merged and deployed with no human diff review. The human gate has moved
+ * earlier in the process (build-plan approval before evolve_start).
+ *
+ * Set EVOLUTION_AUTO_MERGE=false to restore the old manual behaviour
+ * (evolve_review + evolve_merge by hand).
+ */
+export function isAutoMergeEnabled(): boolean {
+  return (process.env.EVOLUTION_AUTO_MERGE ?? "true").trim().toLowerCase() !== "false";
+}
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -300,6 +318,8 @@ async function cleanupLegacyBeta(): Promise<void> {
 export async function startEvolution(opts: {
   reason: string;
   triggeredBy: string;
+  /** Human-approved build plan (the pre-work approval gate) */
+  plan?: string;
   channelId?: string;
 }): Promise<Evolution> {
   return evolutionLock.withLock(async () => {
@@ -315,6 +335,7 @@ export async function startEvolution(opts: {
     const evolution = createEvolution({
       triggeredBy: opts.triggeredBy,
       triggerMessage: opts.reason,
+      plan: opts.plan,
       branch,
       status: "proposing",
     });
@@ -376,7 +397,12 @@ export async function finalizeEvolution(opts: {
   id: string;
   summary: string;
   channelId?: string;
-}): Promise<{ prUrl: string; prNumber: number }> {
+}): Promise<{
+  prUrl: string;
+  prNumber: number;
+  merged: boolean;
+  mergeError?: string;
+}> {
   const evolution = getEvolution(opts.id);
   if (!evolution || evolution.status !== "proposing") {
     throw new Error(`No active evolution with id ${opts.id}`);
@@ -507,6 +533,9 @@ export async function finalizeEvolution(opts: {
     `**Triggered by:** <@${evolution.triggeredBy}>`,
     `**Reason:** ${evolution.triggerMessage}`,
     "",
+    ...(evolution.plan
+      ? ["### Approved build plan", evolution.plan, ""]
+      : []),
     "### Changes",
     ...filesChanged.map((f) => `- \`${f}\``),
     "",
@@ -562,12 +591,17 @@ export async function finalizeEvolution(opts: {
   // ---------------------------------------------------------------------------
   // 7. Notify Discord
   // ---------------------------------------------------------------------------
+  const autoMerge = isAutoMergeEnabled();
+
   if (_sendToDiscord && opts.channelId) {
     try {
       const ciLabel = validationMethod === "sandbox" ? "☁️ sandbox CI" : "🖥️ local CI";
+      const suffix = autoMerge
+        ? "\nAll gates green — merging and deploying automatically."
+        : "";
       await _sendToDiscord(
         opts.channelId,
-        `I've created a PR for this: ${prUrl}\n**${opts.summary}** (${filesChanged.length} files changed, validated via ${ciLabel})`,
+        `I've created a PR for this: ${prUrl}\n**${opts.summary}** (${filesChanged.length} files changed, validated via ${ciLabel})${suffix}`,
       );
     } catch (err) {
       log("Failed to send Discord notification:", err);
@@ -575,7 +609,37 @@ export async function finalizeEvolution(opts: {
   }
 
   log(`Evolution ${opts.id} proposed: ${prUrl}`);
-  return { prUrl, prNumber };
+
+  // ---------------------------------------------------------------------------
+  // 8. Auto-merge + deploy (no human diff review)
+  // ---------------------------------------------------------------------------
+  if (!autoMerge) {
+    log("Auto-merge disabled (EVOLUTION_AUTO_MERGE=false) — awaiting manual evolve_merge");
+    return { prUrl, prNumber, merged: false };
+  }
+
+  try {
+    await mergeEvolution({ id: opts.id, channelId: opts.channelId });
+    return { prUrl, prNumber, merged: true };
+  } catch (err: unknown) {
+    const mergeError = err instanceof Error ? err.message : String(err);
+    log(`Auto-merge failed for evolution ${opts.id}: ${mergeError}`);
+
+    // The PR stays open and the evolution stays in "proposed" status, so a
+    // human can inspect it with evolve_review and merge it with evolve_merge.
+    if (_sendToDiscord && opts.channelId) {
+      try {
+        await _sendToDiscord(
+          opts.channelId,
+          `⚠️ Auto-merge failed for ${prUrl}\n\`\`\`\n${mergeError.slice(0, 1200)}\n\`\`\`\nPR is still open — needs a manual \`evolve_merge\`.`,
+        );
+      } catch (notifyErr) {
+        log("Failed to send auto-merge failure notification:", notifyErr);
+      }
+    }
+
+    return { prUrl, prNumber, merged: false, mergeError };
+  }
 }
 
 /**
@@ -688,7 +752,9 @@ export async function mergeEvolution(opts: {
     }
   }
 
-  triggerRestart();
+  // Defer the restart slightly so the caller's tool result can return and any
+  // in-flight Discord messages can flush before the process exits.
+  setTimeout(() => triggerRestart(), RESTART_DELAY_MS);
 }
 
 /**

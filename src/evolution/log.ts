@@ -22,6 +22,8 @@ export interface Evolution {
   id: string;
   triggeredBy: string | null;
   triggerMessage: string | null;
+  /** Human-approved build plan captured at evolve_start time */
+  plan: string | null;
   branch: string | null;
   worktreeDir: string | null;
   prUrl: string | null;
@@ -44,6 +46,7 @@ function rowToEvolution(row: Record<string, unknown>): Evolution {
     id: row.id as string,
     triggeredBy: (row.triggered_by as string) ?? null,
     triggerMessage: (row.trigger_message as string) ?? null,
+    plan: (row.plan as string) ?? null,
     branch: (row.branch as string) ?? null,
     worktreeDir: (row.worktree_dir as string) ?? null,
     prUrl: (row.pr_url as string) ?? null,
@@ -67,6 +70,7 @@ function rowToEvolution(row: Record<string, unknown>): Evolution {
 export function createEvolution(opts: {
   triggeredBy: string;
   triggerMessage?: string;
+  plan?: string;
   branch?: string;
   worktreeDir?: string;
   status?: EvolutionStatus;
@@ -77,15 +81,16 @@ export function createEvolution(opts: {
 
   getDb()
     .prepare(
-      `INSERT INTO evolutions (id, triggered_by, trigger_message, branch, worktree_dir, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO evolutions (id, triggered_by, trigger_message, plan, branch, worktree_dir, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(id, opts.triggeredBy, opts.triggerMessage ?? null, opts.branch ?? null, opts.worktreeDir ?? null, status, now);
+    .run(id, opts.triggeredBy, opts.triggerMessage ?? null, opts.plan ?? null, opts.branch ?? null, opts.worktreeDir ?? null, status, now);
 
   return {
     id,
     triggeredBy: opts.triggeredBy,
     triggerMessage: opts.triggerMessage ?? null,
+    plan: opts.plan ?? null,
     branch: opts.branch ?? null,
     worktreeDir: opts.worktreeDir ?? null,
     prUrl: null,
@@ -208,6 +213,7 @@ export function updateEvolution(
   id: string,
   fields: Partial<{
     status: EvolutionStatus;
+    plan: string;
     branch: string;
     worktreeDir: string;
     prUrl: string;
@@ -225,6 +231,10 @@ export function updateEvolution(
   if (fields.status !== undefined) {
     setClauses.push("status = ?");
     params.push(fields.status);
+  }
+  if (fields.plan !== undefined) {
+    setClauses.push("plan = ?");
+    params.push(fields.plan);
   }
   if (fields.branch !== undefined) {
     setClauses.push("branch = ?");
