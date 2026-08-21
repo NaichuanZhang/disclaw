@@ -1,6 +1,7 @@
 import "dotenv/config";
 
 import { initDb } from "./db/index.js";
+import { expireStalePendingQuestions } from "./agent/questions.js";
 import { initSoul, stopSoulWatcher } from "./soul/soul.js";
 import { initMemory, stopMemoryWatcher } from "./memory/memory.js";
 import { isMem9Enabled } from "./memory/mem9.js";
@@ -46,6 +47,15 @@ async function main(): Promise<void> {
   // 1. Initialize database
   console.log("[discordclaw] Initializing database...");
   initDb();
+
+  // Any question left pending by the previous process can never be answered
+  // into a live agent turn — retire them so stale clicks report cleanly.
+  const expiredQuestions = expireStalePendingQuestions();
+  if (expiredQuestions > 0) {
+    console.log(
+      `[discordclaw] Expired ${expiredQuestions} pending ask_user question(s) from previous run`,
+    );
+  }
 
   // Warm the model catalog in the background so the first /model autocomplete
   // has real data. Never awaited — must not delay or fail boot.

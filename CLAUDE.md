@@ -49,7 +49,8 @@ Tools are defined across multiple files and registered in `agent/agent.ts`:
 
 | File | Tools | Purpose |
 |------|-------|---------|
-| `agent/tools.ts` | send_message, send_file, add_reaction, get_channel_history, create_thread | Discord channel operations |
+| `agent/tools.ts` | send_message, send_file, add_reaction, get_channel_history, create_thread, ask_user | Discord channel operations |
+| `agent/questions.ts` | ask_user question registry | Creates pending questions, blocks the agent turn until a button/select/free-text answer arrives or it times out (max 300s). Pending questions are expired at boot. |
 | `agent/dangerous-tools.ts` | bash, read_file, write_file | System access |
 | `shared/conversation-history.ts` | get_conversation_history, get_conversation_stats | Cross-session conversation replay |
 | `memory/tools.ts` | memory_search, memory_get, mem9_store, mem9_update, mem9_delete | Hybrid search: local BM25 FTS5 + mem9 cloud memory |

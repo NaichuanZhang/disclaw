@@ -349,7 +349,7 @@ graph TB
     PM --> TL
     TL <-->|messages + tools| CLAUDE
     TL -->|memory_search, memory_get| MEM
-    TL -->|send_message, send_file, add_reaction, create_thread| CL
+    TL -->|send_message, send_file, add_reaction, create_thread, ask_user| CL
     TL -->|evolve_start, evolve_write, evolve_propose auto-merge| EVO
     TL -->|tool call logging| LOG
     EVO -->|git worktree, gh pr create| GH[GitHub]
@@ -940,7 +940,8 @@ discordclaw/
 │   │   └── commands.ts        # Slash commands: /ping /help /config /clear /soul /skills /cron /caveman /restart /stop /join /leave
 │   ├── agent/                 # Claude integration
 │   │   ├── agent.ts           # Anthropic SDK wrapper, system prompt, tool loop + duplicate detection + abort signal
-│   │   ├── tools.ts           # Discord tools (send_message, send_file, add_reaction, get_channel_history, create_thread)
+│   │   ├── tools.ts           # Discord tools (send_message, send_file, add_reaction, get_channel_history, create_thread, ask_user)
+│   │   ├── questions.ts       # Pending ask_user questions (embed + buttons, answer routing)
 │   │   ├── dangerous-tools.ts # Powerful tools: bash, read_file, write_file
 │   │   ├── session-lock.ts    # Per-session mutex lock with AbortSignal for /stop cancellation
 │   │   └── sessions.ts        # Per-thread/DM session tracking + TTL + message archiving

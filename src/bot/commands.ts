@@ -1,5 +1,7 @@
 import {
   type Interaction,
+  type ButtonInteraction,
+  type StringSelectMenuInteraction,
   type ApplicationCommandData,
   type AutocompleteInteraction,
   ApplicationCommandOptionType,
@@ -15,6 +17,11 @@ import { triggerRestart } from "../restart.js";
 import { startVoice, stopVoice, isConnected } from "../voice/index.js";
 import { abortAllSessions, getActiveSessionInfo } from "../agent/session-lock.js";
 import { CAVEMAN_LEVELS, getCavemanLevel } from "../agent/agent.js";
+import {
+  parseQuestionCustomId,
+  resolveQuestionByIndex,
+  getLiveQuestionOptions,
+} from "../agent/questions.js";
 import {
   AUTOCOMPLETE_LIMIT,
   FALLBACK_MODEL_IDS,
@@ -399,8 +406,14 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
     return;
   }
 
-  // Handle button / select menu interactions (placeholder — extend as needed)
+  // Handle button / select menu interactions
   if (interaction.isButton() || interaction.isStringSelectMenu()) {
+    // ask_user answers: customId is `q:<questionId>:<optionIndex|select>`
+    const parsed = parseQuestionCustomId(interaction.customId);
+    if (parsed) {
+      await handleQuestionAnswer(interaction, parsed.questionId, parsed.optionIndex);
+      return;
+    }
     await interaction.reply({ content: "Interaction received.", ephemeral: true });
     return;
   }
@@ -1720,4 +1733,55 @@ async function handleSoul(
     .setColor(0x5865f2);
 
   await interaction.reply({ embeds: [embed], ephemeral: true });
+}
+
+// ---------------------------------------------------------------------------
+// ask_user answers (button / select menu)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a pending ask_user question from a component interaction.
+ * Must ack within 3s, so we update the message in a single call.
+ */
+async function handleQuestionAnswer(
+  interaction: ButtonInteraction | StringSelectMenuInteraction,
+  questionId: string,
+  buttonIndex: number | null,
+): Promise<void> {
+  const options = getLiveQuestionOptions(questionId);
+  if (!options) {
+    // No live waiter: answered already, timed out, or lost to a restart.
+    await interaction.reply({
+      content:
+        "That question is no longer waiting for an answer (already answered, timed out, or the bot restarted).",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const index =
+    buttonIndex !== null
+      ? buttonIndex
+      : Number.parseInt(interaction.isStringSelectMenu() ? interaction.values[0] ?? "" : "", 10);
+
+  const answer = Number.isInteger(index)
+    ? resolveQuestionByIndex(questionId, index, interaction.isButton() ? "button" : "select")
+    : null;
+
+  if (answer === null) {
+    await interaction.reply({
+      content: "Could not record that answer — please reply with text instead.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const baseEmbed = interaction.message.embeds[0];
+  const updated = baseEmbed
+    ? EmbedBuilder.from(baseEmbed).setFooter({
+        text: `✅ Answered: ${answer}`.slice(0, 2048),
+      })
+    : new EmbedBuilder().setDescription(`✅ Answered: ${answer}`);
+
+  await interaction.update({ embeds: [updated], components: [] });
 }
