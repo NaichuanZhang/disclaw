@@ -265,6 +265,15 @@ export function initDb(): void {
     d.exec(`ALTER TABLE evolutions ADD COLUMN worktree_dir TEXT`);
   }
 
+  // Migration — add plan column: the human-approved build plan captured at
+  // evolve_start time. Required because deploys are auto-merged, so the plan
+  // approval is the primary human gate and must be auditable.
+  const hasPlan = evolutionColumns.some((c) => c.name === "plan");
+
+  if (!hasPlan) {
+    d.exec(`ALTER TABLE evolutions ADD COLUMN plan TEXT`);
+  }
+
   // Create indexes (idempotent — CREATE INDEX IF NOT EXISTS)
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(type);

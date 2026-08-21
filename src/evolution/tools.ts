@@ -35,6 +35,9 @@ const execFileAsync = promisify(execFile);
 const MAX_OUTPUT = 8192;
 const BASH_TIMEOUT = 30_000;
 
+/** Minimum length of an approved build plan required by evolve_start */
+const MIN_PLAN_LENGTH = 80;
+
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -43,7 +46,7 @@ export const evolutionTools = [
   {
     name: "evolve_start",
     description:
-      "Start a new evolution session. Creates an isolated git worktree for making source code changes. All changes will be submitted as a GitHub PR. Each user can have multiple active evolutions at a time, but multiple users can evolve concurrently.",
+      "Start a new evolution session. Creates an isolated git worktree for making source code changes. Changes are submitted as a GitHub PR and, once all quality gates pass, merged and deployed AUTOMATICALLY — there is no human diff review afterwards. Therefore you MUST post the build plan in the channel and get the user's explicit approval FIRST, then pass that plan here with plan_approved=true. Each user can have multiple active evolutions at a time, and multiple users can evolve concurrently.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -51,8 +54,18 @@ export const evolutionTools = [
           type: "string",
           description: "Why this evolution is needed — what capability to add or change",
         },
+        plan: {
+          type: "string",
+          description:
+            "The build plan you posted to the user and they approved: which files change, what each change does, and any risks/tradeoffs. Minimum 80 characters. Stored in the DB and embedded in the PR body.",
+        },
+        plan_approved: {
+          type: "boolean",
+          description:
+            "Must be true. Set this ONLY after the user has explicitly approved the plan in the conversation (e.g. 'yes', 'go ahead', 'lgtm'). Never assume approval.",
+        },
       },
-      required: ["reason"],
+      required: ["reason", "plan", "plan_approved"],
     },
   },
   {
@@ -123,7 +136,7 @@ export const evolutionTools = [
   {
     name: "evolve_propose",
     description:
-      "Finalize the current evolution: runs typecheck, commits all changes, pushes branch, and creates a GitHub PR. Fails if typecheck doesn't pass.",
+      "Finalize the current evolution: runs typecheck, commits all changes, pushes the branch, runs full validation (sandbox or local CI), creates a GitHub PR, then automatically merges it and restarts to deploy. Fails without merging if typecheck, the boot test, or the test suite don't pass. Auto-merge can be disabled with EVOLUTION_AUTO_MERGE=false.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -191,7 +204,7 @@ export const evolutionTools = [
   {
     name: "evolve_merge",
     description:
-      "Merge a proposed evolution PR and restart the bot to deploy the changes. The user must have reviewed the PR first via evolve_review.",
+      "Manually merge a proposed evolution PR and restart the bot to deploy. Normally unnecessary — evolve_propose auto-merges. Use this as the fallback when auto-merge failed (merge conflict, transient CI/GitHub error) or when EVOLUTION_AUTO_MERGE=false.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -369,8 +382,29 @@ export async function handleEvolutionTool(
     switch (name) {
       case "evolve_start": {
         const reason = input.reason as string;
+        const plan = typeof input.plan === "string" ? input.plan.trim() : "";
+        const planApproved = input.plan_approved === true;
+
+        // Plan-approval gate. Deploys are automatic, so this is the only place
+        // a human signs off — refuse to start without an approved plan.
+        if (!plan || plan.length < MIN_PLAN_LENGTH) {
+          return JSON.stringify({
+            error:
+              `A build plan of at least ${MIN_PLAN_LENGTH} characters is required before starting an evolution. ` +
+              `Post the plan (files to change, what each change does, risks) in the channel, wait for the user to approve it, then call evolve_start again with 'plan' and plan_approved=true.`,
+          });
+        }
+        if (!planApproved) {
+          return JSON.stringify({
+            error:
+              "plan_approved must be true. Post the build plan in the channel and wait for the user's explicit approval before starting the evolution. " +
+              "Evolutions merge and deploy automatically, so there is no diff review later — this approval is the only human gate.",
+          });
+        }
+
         const evolution = await startEvolution({
           reason,
+          plan,
           triggeredBy: _currentUserId ?? "unknown",
           channelId: _currentChannelId,
         });
@@ -386,7 +420,7 @@ export async function handleEvolutionTool(
           evolution_id: evolution.id,
           branch: evolution.branch,
           worktree: evolution.worktreeDir,
-          message: `Evolution started. Make changes using evolve_write/evolve_read/evolve_bash, then call evolve_propose to submit the PR.`,
+          message: `Evolution started (plan approved). Make changes using evolve_write/evolve_read/evolve_bash, then call evolve_propose — it validates, opens the PR, merges, and deploys automatically.`,
         };
 
         if (otherActive.length > 0) {
@@ -503,7 +537,13 @@ export async function handleEvolutionTool(
           pr_url: result.prUrl,
           pr_number: result.prNumber,
           evolution_id: active.id,
-          message: `PR created: ${result.prUrl}`,
+          merged: result.merged,
+          merge_error: result.mergeError,
+          message: result.merged
+            ? `PR #${result.prNumber} validated, merged, and deploying now (restart in progress): ${result.prUrl}`
+            : result.mergeError
+              ? `PR created but auto-merge failed: ${result.mergeError}. PR is still open: ${result.prUrl} — needs a manual evolve_merge.`
+              : `PR created (auto-merge disabled): ${result.prUrl}`,
         });
       }
 

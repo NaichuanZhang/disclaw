@@ -141,7 +141,9 @@ Scheduled tasks in `data/cron/jobs.json` (gitignored; seed file tracked). Three 
 
 ### Evolution Engine
 
-Self-modification via GitHub PRs. `src/evolution/engine.ts` manages git worktrees at `worktrees/<evolution-id>/`, runs validation, pushes branches, creates PRs via `gh` CLI. A single user can have multiple active evolutions concurrently, each on its own isolated worktree. Evolution status flow: `idea` → `proposing` → `proposed` (PR open) → `deployed` (merged). Also: `cancelled`, `rejected`, `rolled_back`. On startup, `syncDeployedEvolutions()` checks if proposed PRs were merged. `evolve_merge` merges the PR, posts a deployment notification thread to a configured channel, and triggers restart.
+Self-modification via GitHub PRs. `src/evolution/engine.ts` manages git worktrees at `worktrees/<evolution-id>/`, runs validation, pushes branches, creates PRs via `gh` CLI. A single user can have multiple active evolutions concurrently, each on its own isolated worktree. Evolution status flow: `idea` → `proposing` → `proposed` (PR open) → `deployed` (merged). Also: `cancelled`, `rejected`, `rolled_back`. On startup, `syncDeployedEvolutions()` checks if proposed PRs were merged.
+
+**Human-in-the-loop moved to plan time (no diff review):** `evolve_start` requires `plan` (min 80 chars, stored in the `evolutions.plan` column and embedded in the PR body) and `plan_approved: true`. The agent must post the build plan and get explicit user approval before any code is written. `finalizeEvolution()` then auto-calls `mergeEvolution()` once all gates pass — squash merge, deployment thread, restart (deferred 5s so tool results/messages flush). `isAutoMergeEnabled()` reads `EVOLUTION_AUTO_MERGE` (default `true`; set to `false` for the legacy manual `evolve_review` + `evolve_merge` flow). If auto-merge throws, the PR stays open, the evolution stays `proposed`, the failure is reported to Discord, and `evolve_merge` is the manual fallback.
 
 **Quality gates in `finalizeEvolution()`:**
 1. Local pre-flight `tsc --noEmit` (fast, catches syntax errors before pushing)
@@ -149,6 +151,7 @@ Self-modification via GitHub PRs. `src/evolution/engine.ts` manages git worktree
 3. **Daytona Sandbox CI** (preferred): Spins up an ephemeral sandbox via `@daytona/sdk`, clones the branch, runs `npm ci`, `tsc --noEmit`, and `vitest run` in full isolation. See `src/evolution/sandbox.ts`.
 4. **Local fallback**: If `DAYTONA_API_KEY` is not set or sandbox infrastructure fails, falls back to running typecheck + tests in the local worktree (symlinked `node_modules`).
 5. Both typecheck and tests must pass before the PR is created.
+6. PR created → auto-merge + deploy (unless `EVOLUTION_AUTO_MERGE=false`).
 
 The sandbox approach provides true CI isolation — clean `npm ci` install, no symlinked `node_modules`, no interference with the running bot.
 
