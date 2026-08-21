@@ -12,6 +12,7 @@ import {
   StringSelectMenuBuilder,
 } from "discord.js";
 import { registerBotThread } from "../bot/messages.js";
+import { getThreadClearCutoff } from "../bot/thread-history.js";
 import {
   isGuildTextChannel,
   ensureThread,
@@ -98,7 +99,13 @@ export const discordTools = [
   },
   {
     name: "get_channel_history",
-    description: "Get recent messages from a Discord channel",
+    description:
+      "FALLBACK for Discord scrollback that is NOT already in your context. " +
+      "Thread/DM history is loaded into your conversation automatically — see " +
+      "'Messages already in context' in Current Context. Only call this when " +
+      "that count is 0/unknown, when you need messages older than the loaded " +
+      "window, or when reading a DIFFERENT channel than the current one. " +
+      "Calling it on the current conversation duplicates history you already have.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -478,13 +485,79 @@ export async function handleDiscordTool(
           });
         }
         const messages = await channel.messages.fetch({ limit });
-        const formatted = Array.from(messages.values()).map((msg: any) => ({
-          id: msg.id,
-          author: msg.author?.tag ?? "unknown",
-          content: msg.content,
-          timestamp: msg.createdTimestamp,
-        }));
-        return JSON.stringify({ messages: formatted });
+
+        // Honour /clear: messages at or before the cutoff were explicitly
+        // forgotten for this thread and must not be resurrected here.
+        const cutoff = getThreadClearCutoff(channelId);
+        const all = Array.from(messages.values()) as any[];
+        const visible = cutoff
+          ? all.filter((msg: any) => msg.createdTimestamp > cutoff)
+          : all;
+
+        const formatted: {
+          id: string;
+          author: string;
+          content: string;
+          timestamp: number;
+        }[] = [];
+
+        for (const msg of visible) {
+          // Mirror the thread-history reader: messages with no text still
+          // carry meaning via embeds/attachments (the bot sends replies that
+          // way), so describe them instead of returning an empty content
+          // string that reads as "said nothing".
+          let content: string = msg.content || "";
+
+          const attachmentNames = msg.attachments?.size
+            ? msg.attachments
+                .map((att: any) => att.name)
+                .filter(Boolean)
+                .join(", ")
+            : "";
+          if (attachmentNames) {
+            content = content
+              ? `${content}\n\n[Attachments: ${attachmentNames}]`
+              : `[Attachments: ${attachmentNames}]`;
+          }
+
+          if (!content && msg.embeds?.length) {
+            const embedText = msg.embeds
+              .map((e: any) =>
+                [e.title, e.description].filter(Boolean).join(" — "),
+              )
+              .filter(Boolean)
+              .join("\n");
+            content = embedText || `[Embed x${msg.embeds.length}]`;
+          }
+
+          // Truly empty (system messages, joins) — nothing to report.
+          if (!content) continue;
+
+          formatted.push({
+            id: msg.id,
+            author: msg.author?.tag ?? "unknown",
+            content,
+            timestamp: msg.createdTimestamp,
+          });
+        }
+
+        const notes: string[] = [];
+        if (cutoff && visible.length < all.length) {
+          notes.push(
+            `${all.length - visible.length} message(s) hidden by /clear`,
+          );
+        }
+        const emptySkipped = visible.length - formatted.length;
+        if (emptySkipped > 0) {
+          notes.push(`${emptySkipped} empty message(s) skipped`);
+        }
+
+        return JSON.stringify({
+          fetched: all.length,
+          returned: formatted.length,
+          ...(notes.length > 0 ? { note: notes.join("; ") } : {}),
+          messages: formatted,
+        });
       }
 
       case "create_thread": {

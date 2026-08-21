@@ -268,6 +268,12 @@ function buildSystemPrompt(opts: {
     userId: string;
   };
   channelConfig?: ChannelConfig;
+  /**
+   * How many prior messages were loaded into this turn's conversation history.
+   * Surfaced in the prompt so the agent can tell that scrollback is already in
+   * context and treat `get_channel_history` as a fallback rather than a reflex.
+   */
+  historyCount?: number;
 }): string {
   const parts: string[] = [];
 
@@ -313,15 +319,29 @@ function buildSystemPrompt(opts: {
     contextLines.push(`- Server: ${ctx.guildName}`);
   }
   contextLines.push(`- Channel: #${ctx.channelName}`);
-  // Include channel/thread IDs so tools like get_channel_history use the
-  // correct IDs instead of hallucinating them.
+  // Include channel/thread IDs so tools that take a channel_id (send_message,
+  // add_reaction, create_thread) use the correct IDs instead of hallucinating
+  // them. Deliberately does NOT point at get_channel_history — see below.
   if (ctx.threadId) {
-    contextLines.push(`- Thread ID: ${ctx.threadId} (use this as channel_id for get_channel_history in the current conversation)`);
+    contextLines.push(`- Thread ID: ${ctx.threadId}`);
   }
   if (ctx.channelId) {
     contextLines.push(`- Channel ID: ${ctx.channelId}`);
   }
   contextLines.push(`- Speaking with: ${ctx.userName} (ID: ${ctx.userId})`);
+
+  // History visibility: the bot loads thread/DM scrollback into the
+  // conversation before the model sees it, but the model has no way to know
+  // how much. State it explicitly so get_channel_history stays a fallback.
+  if (opts.historyCount !== undefined && opts.historyCount > 0) {
+    contextLines.push(
+      `- Messages already in context: ${opts.historyCount} (loaded automatically — do NOT call get_channel_history for this conversation unless you need messages older than these)`,
+    );
+  } else {
+    contextLines.push(
+      `- Messages already in context: 0 (no history loaded — if you need prior context here, get_channel_history is your fallback)`,
+    );
+  }
   parts.push(contextLines.join("\n"));
 
   return parts.join("\n\n");
@@ -565,6 +585,7 @@ export async function processMessage(opts: {
   const systemPrompt = buildSystemPrompt({
     context: opts.context,
     channelConfig: opts.channelConfig,
+    historyCount: opts.history.length,
   });
 
   // Set evolution context so tools know the triggering user
