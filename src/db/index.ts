@@ -187,6 +187,23 @@ export function initDb(): void {
       metadata TEXT,
       created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
     );
+
+    CREATE TABLE IF NOT EXISTS agent_questions (
+      id TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      message_id TEXT,
+      user_id TEXT,
+      question TEXT NOT NULL,
+      options_json TEXT,
+      answer TEXT,
+      answer_source TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      answered_at INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_agent_questions_status ON agent_questions(status);
+    CREATE INDEX IF NOT EXISTS idx_agent_questions_channel ON agent_questions(channel_id);
   `);
 
   // ---------------------------------------------------------------------------

@@ -15,6 +15,10 @@ import type { AgentResponse, AgentImage, ToolCallProgress } from "../agent/agent
 import { resolveSession, getSessionHistory } from "../agent/sessions.js";
 import { getChannelConfig, addMessage } from "../db/index.js";
 import {
+  findLiveQuestionForMessage,
+  resolveQuestion,
+} from "../agent/questions.js";
+import {
   buildThreadHistory,
   appendThreadMessages,
   clearThreadHistoryCache,
@@ -1179,6 +1183,27 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
     : message.channelId;
   const channelConfig = getChannelConfig(configChannelId);
   if (channelConfig?.enabled === false) return;
+
+  // 3b. If a pending ask_user question is waiting in this channel, this
+  // message IS the answer — hand it to the blocked agent turn instead of
+  // starting a new one.
+  const liveQuestion = findLiveQuestionForMessage(
+    message.channelId,
+    message.author.id,
+  );
+  if (liveQuestion) {
+    const answerText = message.content.replace(/<@!?\d+>/g, "").trim();
+    if (answerText) {
+      const recorded = resolveQuestion(liveQuestion.id, answerText, "message");
+      if (recorded !== null) {
+        console.log(
+          `[bot] Routed message as answer to question ${liveQuestion.id}`,
+        );
+        await message.react("✅").catch(() => {});
+        return;
+      }
+    }
+  }
 
   // 4. Determine if we need to create a thread
   // Create thread for guild text channel messages (not DMs, not already in threads)

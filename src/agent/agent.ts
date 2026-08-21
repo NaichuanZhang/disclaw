@@ -404,7 +404,7 @@ async function executeTool(
     result = await handleMemoryTool(name, input);
   }
   // Discord tools are async
-  else if (name === "send_message" || name === "send_file" || name === "add_reaction" || name === "get_channel_history" || name === "create_thread") {
+  else if (name === "send_message" || name === "send_file" || name === "add_reaction" || name === "get_channel_history" || name === "create_thread" || name === "ask_user") {
     result = await handleDiscordTool(name, input);
   }
   // Skill tools are synchronous
@@ -571,7 +571,7 @@ export async function processMessage(opts: {
   setEvolutionContext(undefined, opts.context.userId);
 
   // Set session context so Discord tools (send_file) can register artifacts
-  setToolSessionContext(opts.sessionId, opts.threadId);
+  setToolSessionContext(opts.sessionId, opts.threadId, opts.context.userId);
 
   // Build conversation history and append the current message
   const messages: Anthropic.Messages.MessageParam[] = [

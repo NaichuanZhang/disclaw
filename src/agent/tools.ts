@@ -4,6 +4,13 @@
 
 import { existsSync, statSync } from "fs";
 import { basename } from "path";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  StringSelectMenuBuilder,
+} from "discord.js";
 import { registerBotThread } from "../bot/messages.js";
 import {
   isGuildTextChannel,
@@ -12,6 +19,17 @@ import {
   sendChunked,
   MAX_THREAD_NAME_LENGTH,
 } from "../shared/discord-utils.js";
+import {
+  createQuestion,
+  setQuestionMessageId,
+  waitForAnswer,
+  encodeQuestionCustomId,
+  encodeQuestionSelectCustomId,
+  MAX_BUTTON_OPTIONS,
+  MAX_SELECT_OPTIONS,
+  MAX_WAIT_SECONDS,
+  DEFAULT_WAIT_SECONDS,
+} from "./questions.js";
 import {
   registerArtifactFromFile,
   getArtifactDownloadUrl,
@@ -118,6 +136,52 @@ export const discordTools = [
       required: ["channel_id", "name"],
     },
   },
+  {
+    name: "ask_user",
+    description:
+      "Ask the user a question with a proper Discord interface (embed + clickable buttons) and @mention them so they get a real notification. Blocks until they answer, they reply with text, or the wait times out. Use this whenever you need a decision, a clarification, or an approval instead of guessing. With `options`, the user clicks a choice (or a dropdown if more than 5). Without `options`, they answer by replying in the channel.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        question: {
+          type: "string",
+          description: "The question to ask. Keep it short and specific.",
+        },
+        options: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            `Optional answer choices (max ${MAX_SELECT_OPTIONS}). 1-${MAX_BUTTON_OPTIONS} render as buttons, more render as a dropdown. Omit for a free-text answer.`,
+        },
+        channel_id: {
+          type: "string",
+          description:
+            "Channel or thread ID to ask in. Defaults to the current conversation.",
+        },
+        user_id: {
+          type: "string",
+          description:
+            "User ID to @mention. Defaults to the user in the current conversation.",
+        },
+        mention: {
+          type: "boolean",
+          description:
+            "Whether to @mention the user so they get a notification (default true).",
+        },
+        wait_seconds: {
+          type: "number",
+          description:
+            `How long to wait for an answer (default ${DEFAULT_WAIT_SECONDS}, max ${MAX_WAIT_SECONDS}).`,
+        },
+        context: {
+          type: "string",
+          description:
+            "Optional extra context shown under the question (why you're asking, tradeoffs).",
+        },
+      },
+      required: ["question"],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -149,12 +213,17 @@ let currentSessionId: string | null = null;
  */
 let currentThreadId: string | null = null;
 
+/** Current user ID, used by ask_user to @mention the right person. */
+let currentUserId: string | null = null;
+
 export function setToolSessionContext(
   sessionId: string | null,
   threadId?: string | null,
+  userId?: string | null,
 ): void {
   currentSessionId = sessionId;
   currentThreadId = threadId ?? null;
+  currentUserId = userId ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +525,140 @@ export async function handleDiscordTool(
           thread_id: thread.id,
           thread_name: thread.name,
           parent_channel_id: channelId,
+        });
+      }
+
+      case "ask_user": {
+        const question = (input.question as string)?.trim();
+        if (!question) {
+          return JSON.stringify({ error: "question is required" });
+        }
+        const channelId =
+          (input.channel_id as string) || currentThreadId || "";
+        if (!channelId) {
+          return JSON.stringify({
+            error: "channel_id is required (no current conversation context)",
+          });
+        }
+        const userId = (input.user_id as string) || currentUserId || null;
+        const mention = input.mention !== false;
+        const extraContext = (input.context as string) || undefined;
+
+        const rawOptions = Array.isArray(input.options)
+          ? (input.options as unknown[])
+              .map((o) => String(o).trim())
+              .filter((o) => o.length > 0)
+          : [];
+        if (rawOptions.length > MAX_SELECT_OPTIONS) {
+          return JSON.stringify({
+            error: `Too many options (${rawOptions.length}). Max is ${MAX_SELECT_OPTIONS}.`,
+          });
+        }
+        const options = rawOptions.slice(0, MAX_SELECT_OPTIONS);
+
+        const waitSeconds = Math.max(
+          1,
+          Math.min(
+            Math.round((input.wait_seconds as number) || DEFAULT_WAIT_SECONDS),
+            MAX_WAIT_SECONDS,
+          ),
+        );
+
+        const channel: any = await discordClient.channels.fetch(channelId);
+        if (!channel || !channel.send) {
+          return JSON.stringify({
+            error: `Channel ${channelId} not found or not a text channel`,
+          });
+        }
+
+        const record = createQuestion({
+          channelId,
+          userId,
+          question,
+          options,
+        });
+
+        console.log(
+          `[agent] ask_user -> channel ${channelId}, question ${record.id}, options ${options.length}, wait ${waitSeconds}s`,
+        );
+
+        const embed = new EmbedBuilder()
+          .setColor(0x5865f2)
+          .setTitle("❓ Question")
+          .setDescription(question);
+        if (extraContext) {
+          embed.addFields({ name: "Context", value: extraContext.slice(0, 1024) });
+        }
+        embed.setFooter({
+          text: options.length
+            ? `Pick an option or just reply · waiting up to ${waitSeconds}s`
+            : `Reply in this channel to answer · waiting up to ${waitSeconds}s`,
+        });
+
+        const components: any[] = [];
+        if (options.length > 0 && options.length <= MAX_BUTTON_OPTIONS) {
+          const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            options.map((opt, i) =>
+              new ButtonBuilder()
+                .setCustomId(encodeQuestionCustomId(record.id, i))
+                .setLabel(opt.slice(0, 80))
+                .setStyle(i === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+            ),
+          );
+          components.push(row);
+        } else if (options.length > MAX_BUTTON_OPTIONS) {
+          const menu = new StringSelectMenuBuilder()
+            .setCustomId(encodeQuestionSelectCustomId(record.id))
+            .setPlaceholder("Choose an answer")
+            .addOptions(
+              options.map((opt, i) => ({
+                label: opt.slice(0, 100),
+                value: String(i),
+              })),
+            );
+          components.push(
+            new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu),
+          );
+        }
+
+        const sent = await channel.send({
+          // Plain-text mention is what actually triggers a Discord
+          // notification — mentions inside embeds do not ping.
+          content: mention && userId ? `<@${userId}>` : undefined,
+          embeds: [embed],
+          components,
+          allowedMentions: { users: userId ? [userId] : [] },
+        });
+        setQuestionMessageId(record.id, sent.id);
+
+        const result = await waitForAnswer(record, waitSeconds);
+
+        if (result) {
+          return JSON.stringify({
+            answered: true,
+            question_id: record.id,
+            answer: result.answer,
+            answer_source: result.source,
+            channel_id: channelId,
+          });
+        }
+
+        // Timed out — disable the controls so a stale click can't confuse the user.
+        try {
+          const timedOutEmbed = EmbedBuilder.from(embed).setFooter({
+            text: "⏳ Timed out — no answer received",
+          });
+          await sent.edit({ embeds: [timedOutEmbed], components: [] });
+        } catch {
+          // Non-fatal: the message may have been deleted.
+        }
+
+        return JSON.stringify({
+          answered: false,
+          status: "timeout",
+          question_id: record.id,
+          channel_id: channelId,
+          note: `No answer within ${waitSeconds}s. Do NOT keep waiting — either proceed with a stated default assumption or tell the user you'll wait for their reply.`,
         });
       }
 
