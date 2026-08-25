@@ -1,6 +1,7 @@
 import "dotenv/config";
 
 import { initDb } from "./db/index.js";
+import { initPilot } from "./pilot/index.js";
 import { expireStalePendingQuestions } from "./agent/questions.js";
 import { initSoul, stopSoulWatcher } from "./soul/soul.js";
 import { initMemory, stopMemoryWatcher } from "./memory/memory.js";
@@ -82,6 +83,13 @@ async function main(): Promise<void> {
     skillsDir: SKILLS_DIR,
     soulPath: join(DATA_DIR, "SOUL.md"),
   });
+
+  // 3.65 Initialize pilot mode (Claude Agent SDK sessions for pilot channels)
+  try {
+    initPilot();
+  } catch (err) {
+    console.warn("[discordclaw] Pilot mode init failed (non-fatal):", err);
+  }
 
   // 3.7 Check gh CLI availability
   const ghAvailable = await checkGhCli();

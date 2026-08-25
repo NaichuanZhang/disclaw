@@ -30,6 +30,11 @@ import { transcribeAudio, getLastTranscriptionFailureSummary } from "../audio/tr
 import { recordSignal } from "../reflection/signals.js";
 import { splitMessage, DISCORD_MAX_LENGTH } from "../shared/discord-utils.js";
 import { acquireSessionLock, SessionAbortedError } from "../agent/session-lock.js";
+import {
+  isPilotChannelId,
+  submitToPilotSession,
+  type PilotChannelTarget,
+} from "../pilot/index.js";
 import { registerArtifactFromBuffer } from "../artifacts/index.js";
 import type Anthropic from "@anthropic-ai/sdk";
 
@@ -812,6 +817,20 @@ function isMonitoredChannel(message: DiscordMessage): boolean {
   return config?.settings?.monitor === true;
 }
 
+/**
+ * True when this message belongs to a channel running in pilot mode
+ * (Claude Agent SDK sessions instead of our own agent loop).
+ *
+ * Pilot mode is a per-channel data flag: channel_configs.settings.pilot.
+ * Threads under a pilot channel are NOT pilot — they fall back to the normal
+ * agent path, so pilot stays a single-channel experiment.
+ */
+function isPilotChannel(message: DiscordMessage): boolean {
+  if (message.channel.isDMBased()) return false;
+  if (isThreadChannel(message)) return false;
+  return isPilotChannelId(message.channelId);
+}
+
 // ---------------------------------------------------------------------------
 // Discord thread history fetching
 // ---------------------------------------------------------------------------
@@ -1156,6 +1175,7 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
   const hasDocuments = hasTextFiles || hasPdfs;
   const inBotThread = isBotCreatedThread(message);
   const inMonitoredChannel = !isDM && isMonitoredChannel(message);
+  const inPilotChannel = isPilotChannel(message);
 
   console.log(
     `[bot] Message from ${message.author.tag} isDM=${isDM} isVoice=${isVoice} hasAudio=${hasAudio} hasImages=${hasImages} hasTextFiles=${hasTextFiles} hasPdfs=${hasPdfs} inBotThread=${inBotThread} monitored=${inMonitoredChannel} content="${message.content.slice(0, 80)}"`,
@@ -1170,7 +1190,12 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
     }
     // In bot-created threads, monitored channels (and their threads), respond to all messages (no mention needed)
     // In other channels/threads, require a mention
-    if (!inBotThread && !inMonitoredChannel && !message.mentions.has(botUser)) {
+    if (
+      !inBotThread &&
+      !inMonitoredChannel &&
+      !inPilotChannel &&
+      !message.mentions.has(botUser)
+    ) {
       console.log("[bot] Skipping — bot not mentioned and not in bot thread or monitored channel");
       return;
     }
@@ -1278,6 +1303,34 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
       );
       return;
     }
+  }
+
+  // 6e. Pilot mode — hand the channel over to a Claude Agent SDK session
+  // instead of our own agent loop. Placed after transcription so voice still
+  // works, and before thread creation so pilot stays in-channel (a persistent
+  // session per channel is what allows mid-turn message injection).
+  if (inPilotChannel) {
+    if (!cleanContent) {
+      if (hasImages || hasDocuments) {
+        await message
+          .reply(
+            "🧪 Pilot mode doesn't handle image/document attachments yet — send text (or a path to the file) instead.",
+          )
+          .catch(() => {});
+      }
+      return;
+    }
+
+    const target = message.channel as unknown as PilotChannelTarget;
+    submitToPilotSession(target, {
+      text: cleanContent,
+      userId: message.author.id,
+      userName: message.author.displayName ?? message.author.username,
+    });
+    console.log(
+      `[bot] Routed message to pilot session for channel ${message.channelId}`,
+    );
+    return;
   }
 
   // 7. Create thread if needed (before resolving session so session uses thread ID)
