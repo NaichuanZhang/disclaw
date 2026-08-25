@@ -1353,6 +1353,7 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
       text: cleanContent,
       userId: message.author.id,
       userName: message.author.displayName ?? message.author.username,
+      react: (emoji) => message.react(emoji),
     });
     console.log(
       `[bot] Routed message to pilot session ${target.id} (channel ${message.channelId})`,

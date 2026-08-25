@@ -1111,9 +1111,11 @@ async function handleInterrupt(
     return;
   }
 
+  const was = result.lastTool ? ` (was **${result.lastTool}**)` : "";
+
   if (!result.ok) {
     await interaction.reply({
-      content: `⚠️ Interrupt failed. Dropped **${result.dropped}** queued message(s).`,
+      content: `⚠️ Interrupt failed${was}. Dropped **${result.dropped}** queued message(s).`,
       ephemeral: true,
     });
     return;
@@ -1124,7 +1126,7 @@ async function handleInterrupt(
       ? ` **${result.stillQueued.length}** message(s) already handed to the CLI will still run.`
       : "";
   await interaction.reply({
-    content: `⏹️ Interrupted. Dropped **${result.dropped}** queued message(s).${extra}`,
+    content: `⏹️ Interrupted mid-run${was}. Dropped **${result.dropped}** queued message(s).${extra}`,
   });
   console.log(
     `[bot] pilot turn in ${channelId} interrupted by ${interaction.user.tag}`,

@@ -52,6 +52,9 @@ const IDLE_SWEEP_INTERVAL_MS = 60_000;
 /** Max characters of a tool input we echo into the channel. */
 const TOOL_PREVIEW_CHARS = 160;
 
+/** Reaction dropped on a message that steered a turn already in flight. */
+const STEER_EMOJI = "↩️";
+
 // ---------------------------------------------------------------------------
 // Channel config helpers — pilot mode is data, not code
 // ---------------------------------------------------------------------------
@@ -105,6 +108,12 @@ export interface PilotIncomingMessage {
   text: string;
   userId: string;
   userName: string;
+  /**
+   * Best-effort reaction hook on the Discord message this came from. Used to
+   * mark a message that landed mid-turn; absent when the caller has no message
+   * to react to.
+   */
+  react?: (emoji: string) => Promise<unknown>;
 }
 
 /** Outcome of interrupting a pilot session's current turn. */
@@ -113,6 +122,8 @@ export interface PilotInterruptResult {
   ok: boolean;
   /** How many of our own queued messages were discarded. */
   dropped: number;
+  /** Short name of the tool that was in flight, when there was one. */
+  lastTool: string | null;
   /**
    * Uuids the CLI says will still run despite the interrupt. Always empty when
    * the CLI does not advertise the `interrupt_receipt_v1` capability.
@@ -141,6 +152,13 @@ export class PilotSession {
   private lastUserId: string | undefined;
   private sdkSessionId: string | undefined;
   private loop: Promise<void> | null = null;
+
+  /** Short name of the most recent tool call, for steer/interrupt markers. */
+  private lastToolName: string | null = null;
+  /** True once the running turn has relayed anything to the channel. */
+  private sawTurnOutput = false;
+  /** How many times the running turn has been steered mid-flight. */
+  private steerCount = 0;
 
   /** Live SDK query handle — needed for native interrupt(). */
   private stream: Query | null = null;
@@ -175,6 +193,11 @@ export class PilotSession {
     this.lastActivityAt = Date.now();
     this.lastUserId = message.userId;
 
+    // A steer is a message that lands after the turn already started talking.
+    // Messages fired back-to-back before any output are just batched input, so
+    // they are deliberately not marked.
+    const steered = this.turnActive && this.sawTurnOutput;
+
     const prefixed = `[${message.userName}]: ${message.text}`;
     this.queue.push({
       type: "user",
@@ -190,12 +213,33 @@ export class PilotSession {
     this.wake = null;
     wake?.();
 
+    if (steered) {
+      this.steerCount += 1;
+      void this.markSteer(message);
+    }
+
     if (!this.started) {
       this.started = true;
       this.loop = this.run().catch((err) => {
         console.error("[pilot] session loop crashed:", err);
       });
     }
+  }
+
+  /**
+   * Visualise a mid-turn steer: react on the message that cut in, then drop a
+   * subtle marker line so the transcript shows where the course changed and
+   * what was in flight at the time.
+   */
+  private async markSteer(message: PilotIncomingMessage): Promise<void> {
+    try {
+      await message.react?.(STEER_EMOJI);
+    } catch {
+      // Reactions are cosmetic — a missing permission must not break the turn.
+    }
+    const nth = this.steerCount > 1 ? ` ${this.steerCount}×` : "";
+    const was = this.lastToolName ? ` · was **${this.lastToolName}**` : "";
+    await this.say(`-# ${STEER_EMOJI} **steered mid-run**${nth}${was}`);
   }
 
   /**
@@ -211,14 +255,14 @@ export class PilotSession {
    */
   async interrupt(): Promise<PilotInterruptResult> {
     const dropped = this.queue.length;
+    const lastTool = this.lastToolName;
     this.queue = [];
     this.lastActivityAt = Date.now();
 
     const stream = this.stream;
     if (this.closed || !stream) {
-      this.turnActive = false;
-      this.stopTyping();
-      return { ok: false, dropped, stillQueued: [] };
+      this.endTurn();
+      return { ok: false, dropped, stillQueued: [], lastTool };
     }
 
     try {
@@ -228,16 +272,23 @@ export class PilotSession {
         Array.isArray(receipt?.still_queued)
           ? receipt.still_queued
           : [];
-      this.turnActive = false;
-      this.stopTyping();
-      return { ok: true, dropped, stillQueued };
+      this.endTurn();
+      return { ok: true, dropped, stillQueued, lastTool };
     } catch (err) {
       console.error(
         `[pilot] interrupt failed for ${this.channelId}:`,
         err instanceof Error ? err.message : err,
       );
-      return { ok: false, dropped, stillQueued: [] };
+      return { ok: false, dropped, stillQueued: [], lastTool };
     }
+  }
+
+  /** Turn is over: stop the typing indicator and reset per-turn markers. */
+  private endTurn(): void {
+    this.turnActive = false;
+    this.sawTurnOutput = false;
+    this.steerCount = 0;
+    this.stopTyping();
   }
 
   /** Stop the session and kill its child process. */
@@ -396,8 +447,7 @@ export class PilotSession {
       await this.say(`⚠️ Pilot session error: ${detail.slice(0, 500)}`);
     } finally {
       this.stream = null;
-      this.stopTyping();
-      this.turnActive = false;
+      this.endTurn();
       removeSession(this.channelId, this);
     }
   }
@@ -434,8 +484,16 @@ export class PilotSession {
         const b = block as Record<string, unknown>;
         if (b.type === "text" && typeof b.text === "string") {
           const text = b.text.trim();
-          if (text) await this.say(text);
+          if (text) {
+            this.sawTurnOutput = true;
+            await this.say(text);
+          }
         } else if (b.type === "tool_use") {
+          this.sawTurnOutput = true;
+          this.lastToolName =
+            typeof b.name === "string"
+              ? b.name.replace(/^mcp__discordclaw__/, "")
+              : "tool";
           await this.say(this.formatToolUse(b));
         }
       }
@@ -443,8 +501,7 @@ export class PilotSession {
     }
 
     if (message.type === "result") {
-      this.turnActive = false;
-      this.stopTyping();
+      this.endTurn();
       const result = message as {
         subtype?: string;
         is_error?: boolean;
