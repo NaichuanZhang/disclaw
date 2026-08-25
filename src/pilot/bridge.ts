@@ -16,6 +16,7 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { handleDiscordTool } from "../agent/tools.js";
 import { handleMemoryTool } from "../memory/tools.js";
+import { handleSkillTool } from "../skills/tools.js";
 
 export interface PilotBridgeOptions {
   /** Channel the pilot session lives in — used as the default target. */
@@ -63,6 +64,21 @@ async function runMemoryTool(
   }
 }
 
+function runSkillTool(
+  name: string,
+  input: Record<string, unknown>,
+): { content: Array<{ type: "text"; text: string }> } {
+  try {
+    return textResult(handleSkillTool(name, input));
+  } catch (err) {
+    return textResult(
+      JSON.stringify({
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
+}
+
 /**
  * Build the in-process MCP server exposing our Discord + memory tools to a
  * pilot session.
@@ -76,7 +92,8 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
     instructions:
       "Tools from the host Discord bot. Use send_message to post to a channel, " +
       "ask_user to ask the human a question with buttons, and the memory tools " +
-      "to recall or store durable facts. Evolution/self-modification tools are " +
+      "to recall or store durable facts. read_skill/list_skill_files load the " +
+      "host bot's skill library on demand. Evolution/self-modification tools are " +
       "intentionally unavailable here.",
     alwaysLoad: true,
     tools: [
@@ -242,6 +259,37 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
             memory_id: args.memory_id,
             content: args.content,
           }),
+      ),
+
+      tool(
+        "read_skill",
+        "Read the full content of an installed skill's SKILL.md or any companion file within the skill directory. Use this when a task matches a skill's description from the available skills list.",
+        {
+          skill_name: z
+            .string()
+            .describe("Name of the skill (from <available_skills>)"),
+          file: z
+            .string()
+            .optional()
+            .describe(
+              "Relative path within the skill directory (default: SKILL.md)",
+            ),
+        },
+        async (args) =>
+          runSkillTool("read_skill", {
+            skill_name: args.skill_name,
+            file: args.file,
+          }),
+      ),
+
+      tool(
+        "list_skill_files",
+        "List all files in an installed skill's directory to discover companion scripts, references, and resources.",
+        {
+          skill_name: z.string().describe("Name of the skill"),
+        },
+        async (args) =>
+          runSkillTool("list_skill_files", { skill_name: args.skill_name }),
       ),
 
       tool(
