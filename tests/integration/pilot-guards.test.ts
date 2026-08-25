@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   PilotSession,
   interruptPilotSession,
@@ -362,5 +363,56 @@ describe("pilot interrupt", () => {
     };
     const result = await session.interrupt();
     expect(result.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Evolution tools are bridged into pilot sessions
+// ---------------------------------------------------------------------------
+
+describe("pilot evolution access", () => {
+  const bridgeSrc = readFileSync(
+    new URL("../../src/pilot/bridge.ts", import.meta.url),
+    "utf8",
+  );
+  const sessionSrc = readFileSync(
+    new URL("../../src/pilot/session.ts", import.meta.url),
+    "utf8",
+  );
+
+  const EVOLVE_TOOLS = [
+    "evolve_start",
+    "evolve_read",
+    "evolve_write",
+    "evolve_bash",
+    "evolve_propose",
+    "evolve_suggest",
+    "evolve_cancel",
+    "evolve_review",
+    "evolve_merge",
+  ];
+
+  it("exposes every evolve_* tool through the MCP bridge", () => {
+    for (const name of EVOLVE_TOOLS) {
+      expect(bridgeSrc).toContain(`tool(\n        "${name}"`);
+    }
+  });
+
+  it("sets the evolution context before dispatching", () => {
+    expect(bridgeSrc).toContain("setEvolutionContext(ctx.channelId, ctx.userId)");
+  });
+
+  it("appends the shared evolution instructions to the pilot system prompt", () => {
+    expect(sessionSrc).toContain("EVOLUTION_INSTRUCTIONS");
+    expect(sessionSrc).toContain("this.buildEvolutionPrompt()");
+  });
+
+  it("keeps the plan-approval gate enforced in the evolution tool handler", () => {
+    const toolsSrc = readFileSync(
+      new URL("../../src/evolution/tools.ts", import.meta.url),
+      "utf8",
+    );
+    expect(toolsSrc).toContain("MIN_PLAN_LENGTH");
+    expect(toolsSrc).toContain("input.plan_approved === true");
   });
 });
