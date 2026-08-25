@@ -31,6 +31,7 @@ import { sendChunked } from "../shared/discord-utils.js";
 import { buildPilotEnv } from "./env.js";
 import { createPilotMcpServer } from "./bridge.js";
 import { getSkillService } from "../skills/service.js";
+import { EVOLUTION_INSTRUCTIONS } from "../evolution/instructions.js";
 
 // ---------------------------------------------------------------------------
 // Paths & constants
@@ -303,6 +304,32 @@ export class PilotSession {
     ].join("\n");
   }
 
+  /**
+   * Self-evolution rules, shared verbatim with the main agent, plus the pilot
+   * tool-name mapping. The plan-approval gate applies identically here.
+   */
+  private buildEvolutionPrompt(): string {
+    return [
+      "",
+      "",
+      EVOLUTION_INSTRUCTIONS,
+      "",
+      "In pilot mode these tools are named `mcp__discordclaw__evolve_start`,",
+      "`mcp__discordclaw__evolve_read`, `mcp__discordclaw__evolve_write`,",
+      "`mcp__discordclaw__evolve_bash`, `mcp__discordclaw__evolve_propose`,",
+      "`mcp__discordclaw__evolve_suggest`, `mcp__discordclaw__evolve_cancel`,",
+      "`mcp__discordclaw__evolve_review` and `mcp__discordclaw__evolve_merge`.",
+      "The plan-approval gate applies exactly the same way: post the build plan to",
+      "the channel, end your turn, and wait for the user to explicitly approve",
+      "before calling evolve_start.",
+      "",
+      "Your native Bash/Read/Write tools can reach the bot's source checkout, but",
+      "you must NOT edit `src/`, TypeScript files, `start.sh` or `migrations/`",
+      "with them. All source changes go through the evolve_* worktree tools so",
+      "they are validated and shipped as a PR.",
+    ].join("\n");
+  }
+
   private buildOptions(): Options {
     const resume = loadPilotSessionId(this.channelId);
     return {
@@ -337,7 +364,7 @@ export class PilotSession {
           "",
           "New user messages can arrive while you are still working. Treat them as",
           "additional instructions from the same person and adapt mid-task.",
-        ].join("\n") + this.buildSkillsPrompt(),
+        ].join("\n") + this.buildSkillsPrompt() + this.buildEvolutionPrompt(),
       },
       ...(resume ? { resume } : {}),
       stderr: (data: string) => {
