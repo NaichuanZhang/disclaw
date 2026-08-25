@@ -15,6 +15,7 @@ import { getChannelConfig, setChannelConfig, getDb } from "../db/index.js";
 import { getSoul } from "../soul/soul.js";
 import { triggerRestart } from "../restart.js";
 import { startVoice, stopVoice, isConnected } from "../voice/index.js";
+import { activePilotChannelIds, stopAllPilotSessions } from "../pilot/index.js";
 import { abortAllSessions, getActiveSessionInfo } from "../agent/session-lock.js";
 import { CAVEMAN_LEVELS, getCavemanLevel } from "../agent/agent.js";
 import {
@@ -1048,8 +1049,9 @@ async function handleStop(
   interaction: import("discord.js").ChatInputCommandInteraction,
 ): Promise<void> {
   const activeSessions = getActiveSessionInfo();
+  const pilotChannels = activePilotChannelIds();
 
-  if (activeSessions.length === 0) {
+  if (activeSessions.length === 0 && pilotChannels.length === 0) {
     await interaction.reply({
       content: "No active sessions to stop.",
       ephemeral: true,
@@ -1058,13 +1060,19 @@ async function handleStop(
   }
 
   const count = abortAllSessions();
+  // Pilot sessions are SDK child processes — aborting kills the child and,
+  // with it, any shell commands it spawned.
+  const pilotCount = await stopAllPilotSessions();
 
-  const sessionList = activeSessions
-    .map((s) => `\`${s.sessionId}\`${s.queueLength > 0 ? ` (+${s.queueLength} queued)` : ""}`)
-    .join("\n");
+  const lines = activeSessions.map(
+    (s) => `\`${s.sessionId}\`${s.queueLength > 0 ? ` (+${s.queueLength} queued)` : ""}`,
+  );
+  for (const channelId of pilotChannels) {
+    lines.push(`\`pilot:${channelId}\``);
+  }
 
   await interaction.reply({
-    content: `🛑 Stopped **${count}** active session(s):\n${sessionList}`,
+    content: `🛑 Stopped **${count + pilotCount}** active session(s):\n${lines.join("\n")}`,
     ephemeral: true,
   });
   console.log(`[bot] ${count} session(s) stopped by ${interaction.user.tag}`);
