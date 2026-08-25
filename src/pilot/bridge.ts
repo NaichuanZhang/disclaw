@@ -8,8 +8,8 @@
 // Deliberately NOT exposed: every `evolve_*` tool. Pilot sessions must not be
 // able to open/merge a self-modifying PR, since that would route around the
 // plan-approval gate. Also not exposed: bash/read_file/write_file — the SDK
-// session already has its own native Bash/Read/Write, which go through our
-// `canUseTool` policy.
+// session already has its own native Bash/Read/Write (ungated — pilot runs with
+// bypassPermissions).
 // ---------------------------------------------------------------------------
 
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";

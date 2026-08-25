@@ -1,12 +1,14 @@
 // ---------------------------------------------------------------------------
-// Pilot mode — programmatic permission gate
+// Pilot mode — tool-call policy rules (CURRENTLY NOT ENFORCED)
 //
-// Every tool call the SDK session wants to make that would normally prompt a
-// human is routed through `canUseTool`, which runs here in our process. This
-// is the security boundary for pilot mode: we never use
-// `permissionMode: 'bypassPermissions'`.
+// These pure functions used to back pilot mode's `canUseTool` gate. Pilot
+// sessions now run with `permissionMode: 'bypassPermissions'` (see
+// session.ts), so nothing in this file is consulted at runtime — tool calls
+// are unguarded by operator choice. The module is kept (and unit-tested) so
+// the gate can be re-wired by restoring `canUseTool` or adding a `PreToolUse`
+// hook.
 //
-// The rules are intentionally conservative:
+// The rules, if re-enabled, are intentionally conservative:
 //   - our own source tree, git metadata and secrets are off limits
 //   - shell commands that push code, escalate privileges or exfiltrate
 //     credentials are refused

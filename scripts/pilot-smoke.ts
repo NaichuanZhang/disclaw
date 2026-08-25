@@ -4,32 +4,25 @@
 //   npx tsx scripts/pilot-smoke.ts
 //
 // Boots a real Claude Agent SDK session with the exact options pilot mode uses
-// (sandboxed cwd, env allowlist, canUseTool policy) and asks it one question,
-// then asks it to do something the policy must refuse. Prints what happened.
+// (sandboxed cwd, env allowlist, bypassPermissions) and asks it one question,
+// then asks it to run a shell command. Nothing is gated: pilot mode runs with
+// allowDangerouslySkipPermissions, so this only proves the session works.
 //
 // Requires working credentials in ~/.claude (or PILOT_ANTHROPIC_API_KEY).
 // ---------------------------------------------------------------------------
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import { PROJECT_ROOT } from "../src/shared/paths.js";
 import { buildPilotEnv } from "../src/pilot/env.js";
-import {
-  defaultPilotPolicyContext,
-  evaluatePilotToolCall,
-} from "../src/pilot/policy.js";
 import { PILOT_WORKSPACE_DIR, ensurePilotDirs } from "../src/pilot/session.js";
 
 const prompts = [
   "Reply with exactly: pilot-ok",
-  "Run this shell command with Bash and tell me what happened: cat " +
-    PROJECT_ROOT +
-    "/.env",
+  "Run this shell command with Bash and tell me what happened: echo pilot-bash-ok",
 ];
 
 // Mirror the real session: an open-ended generator, fed one prompt per
-// completed turn. A finite generator would close the stream before the
-// canUseTool round-trip finishes, which is exactly what we want to test.
+// completed turn.
 let queue: string[] = [...prompts];
 let wake: (() => void) | null = null;
 let closed = false;
@@ -65,8 +58,6 @@ async function* promptStream(): AsyncGenerator<SDKUserMessage> {
 
 async function main(): Promise<void> {
   ensurePilotDirs();
-  const ctx = defaultPilotPolicyContext(PILOT_WORKSPACE_DIR, PROJECT_ROOT);
-  let denials = 0;
   let turns = 0;
 
   const stream = query({
@@ -74,16 +65,10 @@ async function main(): Promise<void> {
     options: {
       cwd: PILOT_WORKSPACE_DIR,
       env: buildPilotEnv(),
-      permissionMode: "default",
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
       settingSources: [],
       includePartialMessages: false,
-      canUseTool: async (toolName, input) => {
-        const decision = evaluatePilotToolCall(ctx, toolName, input);
-        if (decision.allow) return { behavior: "allow", updatedInput: input };
-        denials += 1;
-        console.log(`[smoke] DENIED ${toolName}: ${decision.reason}`);
-        return { behavior: "deny", message: `Pilot policy: ${decision.reason}` };
-      },
       stderr: (data) => {
         const t = data.trim();
         if (t) console.error(`[smoke:cli] ${t.slice(0, 300)}`);
@@ -120,7 +105,7 @@ async function main(): Promise<void> {
     }
   }
 
-  console.log(`[smoke] done — ${denials} policy denial(s)`);
+  console.log(`[smoke] done — ${turns} turn(s), no permission gating`);
   process.exit(0);
 }
 

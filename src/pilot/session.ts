@@ -9,30 +9,26 @@
 // Boundaries:
 //   - cwd is data/pilot/workspace/, never the repo root
 //   - the child env is an explicit allowlist (see env.ts)
-//   - every prompting tool call passes through canUseTool (see policy.ts)
-//   - permissionMode is 'default'; bypassPermissions is never used
+//   - permissionMode is 'bypassPermissions' (allowDangerouslySkipPermissions):
+//     tool calls are NOT gated by our own policy or by permission prompts, so
+//     a pilot session can reach the repo, git and credential files. This is a
+//     deliberate operator choice; revert to permissionMode 'default' plus a
+//     canUseTool gate (see policy.ts) to restore the guard rails.
 // ---------------------------------------------------------------------------
 
 import { existsSync, mkdirSync, readlinkSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type {
-  CanUseTool,
   Options,
-  PermissionResult,
   Query,
   SDKMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { DATA_DIR, PROJECT_ROOT } from "../shared/paths.js";
+import { DATA_DIR } from "../shared/paths.js";
 import { getChannelConfig, setChannelConfig } from "../db/index.js";
 import { sendChunked } from "../shared/discord-utils.js";
 import { buildPilotEnv } from "./env.js";
-import {
-  defaultPilotPolicyContext,
-  evaluatePilotToolCall,
-  type PilotPolicyContext,
-} from "./policy.js";
 import { createPilotMcpServer } from "./bridge.js";
 import { getSkillService } from "../skills/service.js";
 
@@ -131,7 +127,6 @@ export class PilotSession {
   readonly channelId: string;
 
   private target: PilotChannelTarget;
-  private policyCtx: PilotPolicyContext;
   private abortController = new AbortController();
 
   private queue: SDKUserMessage[] = [];
@@ -154,10 +149,6 @@ export class PilotSession {
   constructor(target: PilotChannelTarget) {
     this.channelId = target.id;
     this.target = target;
-    this.policyCtx = defaultPilotPolicyContext(
-      PILOT_WORKSPACE_DIR,
-      PROJECT_ROOT,
-    );
   }
 
   /** Wall-clock ms since the last message in either direction. */
@@ -288,25 +279,6 @@ export class PilotSession {
   }
 
   // -------------------------------------------------------------------------
-  // Permission gate
-  // -------------------------------------------------------------------------
-
-  private buildCanUseTool(): CanUseTool {
-    return async (
-      toolName: string,
-      input: Record<string, unknown>,
-    ): Promise<PermissionResult> => {
-      const decision = evaluatePilotToolCall(this.policyCtx, toolName, input);
-      if (decision.allow) return { behavior: "allow", updatedInput: input };
-
-      const reason = decision.reason ?? "blocked by pilot policy";
-      console.warn(`[pilot] denied ${toolName}: ${reason}`);
-      await this.say(`🚫 Blocked \`${toolName}\` — ${reason}`);
-      return { behavior: "deny", message: `Pilot policy: ${reason}` };
-    };
-  }
-
-  // -------------------------------------------------------------------------
   // Main loop
   // -------------------------------------------------------------------------
 
@@ -336,8 +308,9 @@ export class PilotSession {
     return {
       cwd: PILOT_WORKSPACE_DIR,
       env: buildPilotEnv(),
-      permissionMode: "default",
-      canUseTool: this.buildCanUseTool(),
+      // Unguarded by operator choice: no permission prompts, no canUseTool.
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
       abortController: this.abortController,
       includePartialMessages: false,
       // Isolation: don't inherit the operator's own ~/.claude settings.
@@ -357,10 +330,10 @@ export class PilotSession {
           "is relayed to that channel, so answer conversationally and concisely, with",
           "Discord markdown. Keep replies short unless asked for depth.",
           "",
-          `Your working directory is ${PILOT_WORKSPACE_DIR}. The bot's own source tree,`,
-          "git metadata and credential files are blocked by policy — don't try to edit",
-          "them, and don't attempt to self-modify. Use the mcp__discordclaw__ tools for",
-          "Discord actions (send_message, send_file, ask_user) and memory.",
+          `Your default working directory is ${PILOT_WORKSPACE_DIR}. Tool calls are not`,
+          "gated: prefer the workspace, and be careful with anything outside it. Use the",
+          "mcp__discordclaw__ tools for Discord actions (send_message, send_file,",
+          "ask_user) and memory.",
           "",
           "New user messages can arrive while you are still working. Treat them as",
           "additional instructions from the same person and adapt mid-task.",

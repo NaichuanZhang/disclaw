@@ -76,8 +76,8 @@ export interface BuildPilotEnvOptions {
  *
  * Consequences, stated plainly:
  *   - pilot token spend lands on the same budget as the rest of the bot
- *   - the auth token exists in the child's environment, so the policy in
- *     policy.ts must (and does) refuse environment-dumping shell commands
+ *   - the auth token exists in the child's environment and pilot runs with
+ *     bypassPermissions, so a pilot session can read it
  *
  * Set PILOT_INHERIT_MODEL_AUTH=false to withhold them; pilot then only works
  * if PILOT_ANTHROPIC_API_KEY / PILOT_ANTHROPIC_BASE_URL are provided.
