@@ -34,6 +34,7 @@ import {
   type PilotPolicyContext,
 } from "./policy.js";
 import { createPilotMcpServer } from "./bridge.js";
+import { getSkillService } from "../skills/service.js";
 
 // ---------------------------------------------------------------------------
 // Paths & constants
@@ -309,6 +310,27 @@ export class PilotSession {
   // Main loop
   // -------------------------------------------------------------------------
 
+  /**
+   * Skills are shared with the main agent: the same metadata listing, loaded
+   * on demand through the bridged read_skill / list_skill_files tools. The SDK
+   * prefixes MCP tool names, so the prompt points at the prefixed forms.
+   */
+  private buildSkillsPrompt(): string {
+    const section = getSkillService()?.buildSkillsPromptSection();
+    if (!section) return "";
+    return [
+      "",
+      "",
+      section,
+      "",
+      "In pilot mode these skill tools are named `mcp__discordclaw__read_skill`",
+      "and `mcp__discordclaw__list_skill_files`. Skill instructions may refer to",
+      "the host bot's tool names (e.g. `bash`, `write_file`, `send_message`) —",
+      "use the closest equivalent available to you: the native Bash/Read/Write",
+      "tools for local work, and the mcp__discordclaw__ tools for Discord.",
+    ].join("\n");
+  }
+
   private buildOptions(): Options {
     const resume = loadPilotSessionId(this.channelId);
     return {
@@ -342,7 +364,7 @@ export class PilotSession {
           "",
           "New user messages can arrive while you are still working. Treat them as",
           "additional instructions from the same person and adapt mid-task.",
-        ].join("\n"),
+        ].join("\n") + this.buildSkillsPrompt(),
       },
       ...(resume ? { resume } : {}),
       stderr: (data: string) => {
