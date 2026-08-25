@@ -20,6 +20,7 @@ import type {
   CanUseTool,
   Options,
   PermissionResult,
+  Query,
   SDKMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -108,6 +109,19 @@ export interface PilotIncomingMessage {
   userName: string;
 }
 
+/** Outcome of interrupting a pilot session's current turn. */
+export interface PilotInterruptResult {
+  /** True when the SDK accepted the interrupt. */
+  ok: boolean;
+  /** How many of our own queued messages were discarded. */
+  dropped: number;
+  /**
+   * Uuids the CLI says will still run despite the interrupt. Always empty when
+   * the CLI does not advertise the `interrupt_receipt_v1` capability.
+   */
+  stillQueued: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -130,6 +144,11 @@ export class PilotSession {
   private lastUserId: string | undefined;
   private sdkSessionId: string | undefined;
   private loop: Promise<void> | null = null;
+
+  /** Live SDK query handle — needed for native interrupt(). */
+  private stream: Query | null = null;
+  /** Capabilities advertised by the CLI in the system/init message. */
+  private capabilities: string[] = [];
 
   constructor(target: PilotChannelTarget) {
     this.channelId = target.id;
@@ -183,6 +202,48 @@ export class PilotSession {
       this.loop = this.run().catch((err) => {
         console.error("[pilot] session loop crashed:", err);
       });
+    }
+  }
+
+  /**
+   * Interrupt the turn that is currently running, without killing the session.
+   *
+   * Uses the SDK's native `Query.interrupt()` (streaming-input mode only,
+   * which is what we always use). The child process and its context survive —
+   * the session simply returns control and waits for the next message.
+   *
+   * Our own pending queue is dropped here, on our side: the shipped CLI does
+   * not implement `cancel_queued`, so anything we already handed over may
+   * still run and is reported back via `stillQueued`.
+   */
+  async interrupt(): Promise<PilotInterruptResult> {
+    const dropped = this.queue.length;
+    this.queue = [];
+    this.lastActivityAt = Date.now();
+
+    const stream = this.stream;
+    if (this.closed || !stream) {
+      this.turnActive = false;
+      this.stopTyping();
+      return { ok: false, dropped, stillQueued: [] };
+    }
+
+    try {
+      const receipt = await stream.interrupt();
+      const stillQueued =
+        this.capabilities.includes("interrupt_receipt_v1") &&
+        Array.isArray(receipt?.still_queued)
+          ? receipt.still_queued
+          : [];
+      this.turnActive = false;
+      this.stopTyping();
+      return { ok: true, dropped, stillQueued };
+    } catch (err) {
+      console.error(
+        `[pilot] interrupt failed for ${this.channelId}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return { ok: false, dropped, stillQueued: [] };
     }
   }
 
@@ -301,6 +362,7 @@ export class PilotSession {
 
     try {
       const stream = query({ prompt: this.prompt(), options });
+      this.stream = stream;
       for await (const message of stream) {
         this.lastActivityAt = Date.now();
         await this.relay(message);
@@ -311,6 +373,7 @@ export class PilotSession {
       console.error(`[pilot] session error for ${this.channelId}: ${detail}`);
       await this.say(`⚠️ Pilot session error: ${detail.slice(0, 500)}`);
     } finally {
+      this.stream = null;
       this.stopTyping();
       this.turnActive = false;
       removeSession(this.channelId, this);
@@ -325,10 +388,17 @@ export class PilotSession {
     if (message.type === "system") {
       const subtype = (message as { subtype?: string }).subtype;
       const sessionId = (message as { session_id?: string }).session_id;
-      if (subtype === "init" && sessionId) {
-        this.sdkSessionId = sessionId;
-        savePilotSessionId(this.channelId, sessionId);
-        console.log(`[pilot] session id ${sessionId} for ${this.channelId}`);
+      if (subtype === "init") {
+        // Feature-detect from the init handshake rather than sniffing versions.
+        const caps = (message as { capabilities?: unknown }).capabilities;
+        this.capabilities = Array.isArray(caps)
+          ? caps.filter((c): c is string => typeof c === "string")
+          : [];
+        if (sessionId) {
+          this.sdkSessionId = sessionId;
+          savePilotSessionId(this.channelId, sessionId);
+          console.log(`[pilot] session id ${sessionId} for ${this.channelId}`);
+        }
       }
       return;
     }
@@ -471,6 +541,18 @@ export function activePilotSessionCount(): number {
 /** Channel ids with a live pilot session. */
 export function activePilotChannelIds(): string[] {
   return [...sessions.keys()];
+}
+
+/**
+ * Interrupt the current turn of one channel's pilot session, keeping the
+ * session (and its context) alive. Returns null when no session is running.
+ */
+export async function interruptPilotSession(
+  channelId: string,
+): Promise<PilotInterruptResult | null> {
+  const session = sessions.get(channelId);
+  if (!session || session.isClosed) return null;
+  return session.interrupt();
 }
 
 /** Stop the pilot session for one channel. Returns true if one was running. */

@@ -15,7 +15,11 @@ import { getChannelConfig, setChannelConfig, getDb } from "../db/index.js";
 import { getSoul } from "../soul/soul.js";
 import { triggerRestart } from "../restart.js";
 import { startVoice, stopVoice, isConnected } from "../voice/index.js";
-import { activePilotChannelIds, stopAllPilotSessions } from "../pilot/index.js";
+import {
+  activePilotChannelIds,
+  interruptPilotSession,
+  stopAllPilotSessions,
+} from "../pilot/index.js";
 import { abortAllSessions, getActiveSessionInfo } from "../agent/session-lock.js";
 import { CAVEMAN_LEVELS, getCavemanLevel } from "../agent/agent.js";
 import {
@@ -112,6 +116,10 @@ export const slashCommands: ApplicationCommandData[] = [
   {
     name: "stop",
     description: "Stop all active processing sessions",
+  },
+  {
+    name: "interrupt",
+    description: "Stop the pilot session's current turn, keep its context",
   },
   {
     name: "soul",
@@ -440,6 +448,9 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
         break;
       case "stop":
         await handleStop(interaction);
+        break;
+      case "interrupt":
+        await handleInterrupt(interaction);
         break;
       case "soul":
         await handleSoul(interaction);
@@ -892,6 +903,7 @@ async function handleHelp(
           "`/config toggle` — Enable/disable bot in this channel",
           "`/clear` — Clear the current session",
           "`/stop` — Stop all active processing sessions",
+          "`/interrupt` — Interrupt this channel's pilot turn (keeps context)",
           "`/soul` — Show the bot personality",
           "`/model` — Show the active model",
           "`/model name:<model>` — Switch models (persists across restarts)",
@@ -1076,6 +1088,47 @@ async function handleStop(
     ephemeral: true,
   });
   console.log(`[bot] ${count} session(s) stopped by ${interaction.user.tag}`);
+}
+
+// ---------------------------------------------------------------------------
+// /interrupt
+//
+// Unlike /stop (global, kills sessions) this is scoped to the channel or
+// thread it is used in, and keeps the pilot session and its context alive.
+// ---------------------------------------------------------------------------
+
+async function handleInterrupt(
+  interaction: import("discord.js").ChatInputCommandInteraction,
+): Promise<void> {
+  const channelId = interaction.channelId;
+  const result = await interruptPilotSession(channelId);
+
+  if (!result) {
+    await interaction.reply({
+      content: "No active pilot session here.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (!result.ok) {
+    await interaction.reply({
+      content: `⚠️ Interrupt failed. Dropped **${result.dropped}** queued message(s).`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const extra =
+    result.stillQueued.length > 0
+      ? ` **${result.stillQueued.length}** message(s) already handed to the CLI will still run.`
+      : "";
+  await interaction.reply({
+    content: `⏹️ Interrupted. Dropped **${result.dropped}** queued message(s).${extra}`,
+  });
+  console.log(
+    `[bot] pilot turn in ${channelId} interrupted by ${interaction.user.tag}`,
+  );
 }
 
 // ---------------------------------------------------------------------------

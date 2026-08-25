@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { pilotConfigChannelId } from "../../src/pilot/session.js";
+import {
+  PilotSession,
+  interruptPilotSession,
+  pilotConfigChannelId,
+} from "../../src/pilot/session.js";
 import {
   buildPilotEnv,
   isSecretEnvVar,
@@ -285,5 +289,76 @@ describe("pilotConfigChannelId", () => {
     expect(b).toBe("chan-1");
     // ...but sessions are keyed by the thread id, not this value.
     expect("thread-a").not.toBe("thread-b");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// interrupt
+// ---------------------------------------------------------------------------
+
+function makeTarget(id: string) {
+  return { id, send: async () => undefined };
+}
+
+describe("pilot interrupt", () => {
+  it("returns null when no session is running for the channel", async () => {
+    await expect(interruptPilotSession("no-such-channel")).resolves.toBeNull();
+  });
+
+  it("does not throw when there is no live SDK stream yet", async () => {
+    const session = new PilotSession(makeTarget("chan-int-1"));
+    const result = await session.interrupt();
+    expect(result.ok).toBe(false);
+    expect(result.dropped).toBe(0);
+    expect(result.stillQueued).toEqual([]);
+  });
+
+  it("drops our own queued messages and reports the count", async () => {
+    const session = new PilotSession(makeTarget("chan-int-2"));
+    // Reach into the queue directly: submit() would spawn a real SDK session.
+    const internals = session as unknown as { queue: unknown[] };
+    internals.queue.push({}, {}, {});
+
+    const result = await session.interrupt();
+    expect(result.dropped).toBe(3);
+    // interrupt() replaces the queue, so re-read it rather than holding a ref.
+    expect(internals.queue.length).toBe(0);
+  });
+
+  it("reports stillQueued from the receipt only when the CLI advertises it", async () => {
+    const session = new PilotSession(makeTarget("chan-int-3"));
+    const internals = session as unknown as {
+      stream: { interrupt: () => Promise<{ still_queued: string[] }> } | null;
+      capabilities: string[];
+    };
+    internals.stream = {
+      interrupt: async () => ({ still_queued: ["uuid-a", "uuid-b"] }),
+    };
+
+    // Unknown capability set -> we ignore the receipt contents.
+    internals.capabilities = [];
+    let result = await session.interrupt();
+    expect(result.ok).toBe(true);
+    expect(result.stillQueued).toEqual([]);
+
+    // Capability advertised -> pass the uuids through.
+    internals.capabilities = ["interrupt_receipt_v1"];
+    result = await session.interrupt();
+    expect(result.ok).toBe(true);
+    expect(result.stillQueued).toEqual(["uuid-a", "uuid-b"]);
+  });
+
+  it("surfaces ok:false when the SDK interrupt rejects", async () => {
+    const session = new PilotSession(makeTarget("chan-int-4"));
+    const internals = session as unknown as {
+      stream: { interrupt: () => Promise<never> } | null;
+    };
+    internals.stream = {
+      interrupt: async () => {
+        throw new Error("control channel closed");
+      },
+    };
+    const result = await session.interrupt();
+    expect(result.ok).toBe(false);
   });
 });
