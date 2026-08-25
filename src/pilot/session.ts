@@ -63,6 +63,22 @@ export function isPilotChannelId(channelId: string): boolean {
   return config?.settings?.pilot === true;
 }
 
+/**
+ * Which channel id decides pilot mode for a message, or null if pilot can
+ * never apply. Threads inherit the flag from their parent channel; DMs never
+ * run in pilot mode. Pure so the routing rule is testable without Discord.
+ */
+export function pilotConfigChannelId(input: {
+  channelId: string;
+  isDM: boolean;
+  isThread: boolean;
+  parentId?: string | null;
+}): string | null {
+  if (input.isDM) return null;
+  if (input.isThread) return input.parentId ?? null;
+  return input.channelId;
+}
+
 /** Persist the SDK session id so we can `resume` after a restart. */
 function savePilotSessionId(channelId: string, sdkSessionId: string): void {
   const config = getChannelConfig(channelId);
