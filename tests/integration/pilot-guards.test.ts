@@ -100,7 +100,9 @@ describe("buildPilotEnv", () => {
 });
 
 // ---------------------------------------------------------------------------
-// path policy
+// path policy — NOTE: these rules are currently NOT enforced at runtime.
+// Pilot sessions run with permissionMode 'bypassPermissions', so canUseTool
+// never fires. The rules are kept tested so the gate can be re-wired later.
 // ---------------------------------------------------------------------------
 
 describe("checkPilotPath", () => {

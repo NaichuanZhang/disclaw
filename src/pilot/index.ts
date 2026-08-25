@@ -6,8 +6,8 @@
 //   channel_configs.settings.pilot = true
 //
 // See src/pilot/session.ts for the session lifecycle, policy.ts for the
-// permission gate, bridge.ts for the in-process MCP tools and env.ts for the
-// child-process environment allowlist.
+// currently-unenforced permission rules, bridge.ts for the in-process MCP
+// tools and env.ts for the child-process environment allowlist.
 // ---------------------------------------------------------------------------
 
 export {
