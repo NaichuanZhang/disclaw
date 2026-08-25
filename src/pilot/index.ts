@@ -19,6 +19,7 @@ export {
   ensurePilotDirs,
   initPilot,
   isPilotChannelId,
+  pilotConfigChannelId,
   stopAllPilotSessions,
   stopPilotSession,
   submitToPilotSession,

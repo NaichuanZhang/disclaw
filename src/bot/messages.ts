@@ -32,6 +32,7 @@ import { splitMessage, DISCORD_MAX_LENGTH } from "../shared/discord-utils.js";
 import { acquireSessionLock, SessionAbortedError } from "../agent/session-lock.js";
 import {
   isPilotChannelId,
+  pilotConfigChannelId,
   submitToPilotSession,
   type PilotChannelTarget,
 } from "../pilot/index.js";
@@ -822,13 +823,21 @@ function isMonitoredChannel(message: DiscordMessage): boolean {
  * (Claude Agent SDK sessions instead of our own agent loop).
  *
  * Pilot mode is a per-channel data flag: channel_configs.settings.pilot.
- * Threads under a pilot channel are NOT pilot — they fall back to the normal
- * agent path, so pilot stays a single-channel experiment.
+ * Threads inherit pilot mode from their parent channel — same semantics as
+ * isMonitoredChannel — so pilot conversations get the normal Discord threading
+ * behaviour with one isolated SDK session per thread.
  */
 function isPilotChannel(message: DiscordMessage): boolean {
-  if (message.channel.isDMBased()) return false;
-  if (isThreadChannel(message)) return false;
-  return isPilotChannelId(message.channelId);
+  const configChannelId = pilotConfigChannelId({
+    channelId: message.channelId,
+    isDM: message.channel.isDMBased(),
+    isThread: isThreadChannel(message),
+    parentId: isThreadChannel(message)
+      ? (message.channel as ThreadChannel).parentId
+      : null,
+  });
+  if (!configChannelId) return false;
+  return isPilotChannelId(configChannelId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,31 +1314,17 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
     }
   }
 
-  // 6e. Pilot mode — hand the channel over to a Claude Agent SDK session
-  // instead of our own agent loop. Placed after transcription so voice still
-  // works, and before thread creation so pilot stays in-channel (a persistent
-  // session per channel is what allows mid-turn message injection).
-  if (inPilotChannel) {
-    if (!cleanContent) {
-      if (hasImages || hasDocuments) {
-        await message
-          .reply(
-            "🧪 Pilot mode doesn't handle image/document attachments yet — send text (or a path to the file) instead.",
-          )
-          .catch(() => {});
-      }
-      return;
+  // 6e. Pilot mode pre-check — bail out before thread creation when there is
+  // nothing a pilot session could act on, so we never leave an empty thread
+  // behind. Placed after transcription so voice messages still work.
+  if (inPilotChannel && !cleanContent) {
+    if (hasImages || hasDocuments) {
+      await message
+        .reply(
+          "🧪 Pilot mode doesn't handle image/document attachments yet — send text (or a path to the file) instead.",
+        )
+        .catch(() => {});
     }
-
-    const target = message.channel as unknown as PilotChannelTarget;
-    submitToPilotSession(target, {
-      text: cleanContent,
-      userId: message.author.id,
-      userName: message.author.displayName ?? message.author.username,
-    });
-    console.log(
-      `[bot] Routed message to pilot session for channel ${message.channelId}`,
-    );
     return;
   }
 
@@ -1343,6 +1338,26 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
       sessionThreadId = thread.id;
     }
     // If thread creation fails, fall back to replying in channel directly
+  }
+
+  // 7b. Pilot mode — hand the conversation over to a Claude Agent SDK session
+  // instead of our own agent loop. Runs *after* thread creation so pilot uses
+  // exactly the same threading behaviour as every other channel: a top-level
+  // message spawns a thread via createThreadForReply, and the pilot session is
+  // keyed to that thread id. One isolated SDK session per thread; mid-turn
+  // message injection still works inside a thread. If thread creation failed,
+  // replyTarget is still the channel, so we degrade to an in-channel session.
+  if (inPilotChannel) {
+    const target = replyTarget as unknown as PilotChannelTarget;
+    submitToPilotSession(target, {
+      text: cleanContent,
+      userId: message.author.id,
+      userName: message.author.displayName ?? message.author.username,
+    });
+    console.log(
+      `[bot] Routed message to pilot session ${target.id} (channel ${message.channelId})`,
+    );
+    return;
   }
 
   // 8. Now resolve session with the correct thread ID
