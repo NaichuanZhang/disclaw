@@ -18,6 +18,7 @@ export {
   activePilotSessionCount,
   ensurePilotDirs,
   initPilot,
+  interruptPilotSession,
   isPilotChannelId,
   pilotConfigChannelId,
   stopAllPilotSessions,
@@ -26,6 +27,7 @@ export {
   sweepOrphanPilotProcesses,
   type PilotChannelTarget,
   type PilotIncomingMessage,
+  type PilotInterruptResult,
 } from "./session.js";
 
 export { buildPilotEnv, isSecretEnvVar, PILOT_ENV_ALLOWLIST } from "./env.js";
