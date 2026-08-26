@@ -398,8 +398,10 @@ describe("pilot evolution access", () => {
     }
   });
 
-  it("sets the evolution context before dispatching", () => {
-    expect(bridgeSrc).toContain("setEvolutionContext(ctx.channelId, ctx.userId)");
+  it("sets the evolution context before dispatching, from the live user getter", () => {
+    // A captured userId string would freeze attribution on whoever opened the
+    // session, so the bridge must read it through the getter on every call.
+    expect(bridgeSrc).toContain("setEvolutionContext(ctx.channelId, ctx.getUserId?.())");
   });
 
   it("appends the shared evolution instructions to the pilot system prompt", () => {
