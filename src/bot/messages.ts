@@ -1331,6 +1331,10 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
   // message injection still works inside a thread. If thread creation failed,
   // replyTarget is still the channel, so we degrade to an in-channel session.
   if (inPilotChannel) {
+    // A Discord thread already carries `parentId`, and PilotChannelTarget now
+    // declares it — the session needs that link because it is keyed to the
+    // thread while channel settings and channel-level commands live on the
+    // parent. Cast, don't clone: cloning would drop the channel's own methods.
     const target = replyTarget as unknown as PilotChannelTarget;
 
     // A pilot session takes plain text, not content blocks, but it has its own

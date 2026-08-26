@@ -85,7 +85,9 @@ describe("pilot system prompt", () => {
 
   it("honours the channel's caveman level", () => {
     expect(sessionSrc).toContain("this.buildCavemanPrompt()");
-    expect(sessionSrc).toContain("getCavemanLevel(getChannelConfig(this.channelId))");
+    // Read through channelSettings() so a thread session picks up the level set
+    // on its parent channel, which is where /caveman writes it.
+    expect(sessionSrc).toMatch(/channelSettings\(\(config\) => getCavemanLevel\(config\)\)/);
   });
 
   it("records pilot turn failures as reflection signals", () => {

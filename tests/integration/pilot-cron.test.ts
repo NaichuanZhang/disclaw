@@ -102,8 +102,11 @@ describe("cron agent-turn router", () => {
     expect(indexSrc).toMatch(/setExecuteAgentTurn\(\(message, model, context\) =>\s*\n?\s*runCronAgentTurn\(message, model, context\)/);
   });
 
-  it("warns rather than silently dropping a per-job model override", () => {
+  it("forwards a per-job model override to the pilot session", () => {
+    // It used to warn that the override was ignored; the session now starts its
+    // child on that model, so the job's model is honoured either way it routes.
     const fn = indexSrc.slice(indexSrc.indexOf("async function runCronAgentTurn"));
-    expect(fn.slice(0, 3000)).toMatch(/ignored for pilot sessions/);
+    expect(fn.slice(0, 3000)).toContain("modelOverride: model");
+    expect(fn.slice(0, 3000)).not.toMatch(/ignored for pilot sessions/);
   });
 });

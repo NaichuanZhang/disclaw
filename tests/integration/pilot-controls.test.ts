@@ -63,7 +63,7 @@ describe("pilot turn watchdog", () => {
 
 describe("resetPilotSession", () => {
   it("stops the session and drops the stored resume id", () => {
-    const fn = sessionSrc.slice(sessionSrc.indexOf("export async function resetPilotSession"));
+    const fn = sessionSrc.slice(sessionSrc.indexOf("export async function resetPilotSession("));
     expect(fn.slice(0, 400)).toContain("stopPilotSession(channelId)");
     expect(fn.slice(0, 400)).toContain("clearPilotSessionId(channelId)");
   });
@@ -77,9 +77,12 @@ describe("/clear in a pilot channel", () => {
   it("resets the pilot session instead of clearing unread conversation rows", () => {
     const handler = commandsSrc.slice(commandsSrc.indexOf("async function handleClear"));
     const body = handler.slice(0, 2200);
-    expect(body).toContain("resetPilotSession(interaction.channelId)");
+    // Scope, not one channel: thread sessions under the channel reset too.
+    expect(body).toContain("resetPilotSessionScope(interaction.channelId)");
     // The pilot branch must return before the normal clearSession path runs.
-    expect(body.indexOf("resetPilotSession")).toBeLessThan(body.indexOf("clearSession(session.id)"));
+    expect(body.indexOf("resetPilotSessionScope")).toBeLessThan(
+      body.indexOf("clearSession(session.id)"),
+    );
   });
 
   it("resolves threads to the channel that owns the pilot flag", () => {

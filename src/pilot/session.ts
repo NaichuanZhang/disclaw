@@ -27,6 +27,8 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { DATA_DIR } from "../shared/paths.js";
 import { getChannelConfig, setChannelConfig, addMessage } from "../db/index.js";
+import type { ChannelConfig } from "../db/index.js";
+import { resolveModel } from "../shared/models.js";
 import { broadcastLog } from "../gateway/server.js";
 import { sendChunked } from "../shared/discord-utils.js";
 import { fmtDuration, fmtTokens } from "../shared/format.js";
@@ -151,6 +153,13 @@ export interface PilotChannelTarget {
   id: string;
   send: (content: string) => Promise<unknown>;
   sendTyping?: () => Promise<void>;
+  /**
+   * Parent channel when this target is a thread. A session is keyed to the
+   * thread, but every channel-level command (`/clear`, `/interrupt`, `/pilot
+   * off`) and every channel-level setting lives on the parent — without this
+   * link those commands could only find a session when typed inside the thread.
+   */
+  parentId?: string | null;
 }
 
 export interface PilotIncomingMessage {
@@ -171,6 +180,12 @@ export interface PilotIncomingMessage {
    * to react to.
    */
   react?: (emoji: string) => Promise<unknown>;
+  /**
+   * Model for this session, used only when the session is created (the child's
+   * model is fixed once it spawns). Cron jobs carry a per-job override; without
+   * this the override was logged and thrown away.
+   */
+  modelOverride?: string;
 }
 
 /** Outcome of interrupting a pilot session's current turn. */
@@ -239,6 +254,10 @@ function summariseToolResult(content: unknown): string {
 
 export class PilotSession {
   readonly channelId: string;
+  /** Parent channel when this session is keyed to a thread. */
+  parentId: string | null;
+  /** Model for the child, captured from the first message (see submit()). */
+  private modelOverride: string | undefined;
 
   private target: PilotChannelTarget;
   private abortController = new AbortController();
@@ -288,6 +307,7 @@ export class PilotSession {
 
   constructor(target: PilotChannelTarget) {
     this.channelId = target.id;
+    this.parentId = target.parentId ?? null;
     this.target = target;
     // Reads this.target on every send, so a re-fetched channel object is picked
     // up without rebuilding the queue.
@@ -320,6 +340,7 @@ export class PilotSession {
   /** Refresh the channel object (it can be re-fetched between messages). */
   setTarget(target: PilotChannelTarget): void {
     this.target = target;
+    if (target.parentId !== undefined) this.parentId = target.parentId;
   }
 
   /**
@@ -330,6 +351,10 @@ export class PilotSession {
     if (this.closed) return;
     this.lastActivityAt = Date.now();
     this.lastUserId = message.userId;
+    // Only meaningful before the child spawns — its model is fixed after that.
+    if (!this.started && message.modelOverride) {
+      this.modelOverride = message.modelOverride;
+    }
     if (message.logSessionId) this.logSessionId = message.logSessionId;
     if (message.channelName) this.logChannelName = message.channelName;
 
@@ -529,6 +554,21 @@ export class PilotSession {
   // -------------------------------------------------------------------------
 
   /**
+   * Model for the child process.
+   *
+   * The child used to take whatever `ANTHROPIC_MODEL` the bot happened to have,
+   * so `/model` (and a cron job's per-job model) applied to every runtime
+   * except this one. `PILOT_ANTHROPIC_MODEL` still wins — it is the explicit
+   * "pin pilot to its own model" escape hatch — so we only override when it is
+   * unset.
+   */
+  private modelEnvOverrides(): Record<string, string> {
+    if (process.env.PILOT_ANTHROPIC_MODEL) return {};
+    const model = resolveModel(this.modelOverride);
+    return model ? { ANTHROPIC_MODEL: model } : {};
+  }
+
+  /**
    * SOUL.md and the memory-recall rules — the bot's identity and habits, shared
    * verbatim with the main agent. Without them a pilot channel answered as a
    * generic Claude Code session and never searched memory unasked.
@@ -542,14 +582,40 @@ export class PilotSession {
   }
 
   /**
+   * Channel settings for this session, thread row first and then the parent.
+   *
+   * A session is keyed to a thread, but `/caveman` and `/config set-prompt` are
+   * usually typed in the parent channel — and that is also the row the main
+   * agent reads. Checking the thread first keeps a per-thread override working
+   * while making the channel-level setting actually land.
+   */
+  private channelSettings<T>(read: (config: ChannelConfig | undefined) => T): T {
+    const own = read(getChannelConfig(this.channelId));
+    if (own !== undefined && own !== null && own !== "") return own;
+    if (!this.parentId) return own;
+    return read(getChannelConfig(this.parentId));
+  }
+
+  /**
    * Caveman mode, if /caveman is on for this channel. Read when the session
    * starts: the system prompt is fixed for the life of the SDK child, so a
    * level changed mid-session applies from the next session (idle reap, /stop).
    */
   private buildCavemanPrompt(): string {
-    const level = getCavemanLevel(getChannelConfig(this.channelId));
+    const level = this.channelSettings((config) => getCavemanLevel(config));
     if (!level) return "";
     return `\n\n${buildCavemanInstructions(level)}`;
+  }
+
+  /**
+   * The channel's own system prompt from `/config set-prompt`. The main agent
+   * has always injected this; pilot ignored it, so the command replied
+   * "updated" and changed nothing in a pilot channel.
+   */
+  private buildChannelPrompt(): string {
+    const prompt = this.channelSettings((config) => config?.systemPrompt);
+    if (!prompt || !prompt.trim()) return "";
+    return `\n\n## Channel Instructions\n\n${prompt.trim()}`;
   }
 
   /**
@@ -603,7 +669,7 @@ export class PilotSession {
     const resume = loadPilotSessionId(this.channelId);
     return {
       cwd: PILOT_WORKSPACE_DIR,
-      env: buildPilotEnv(),
+      env: buildPilotEnv({ overrides: this.modelEnvOverrides() }),
       // Unguarded by operator choice: no permission prompts, no canUseTool.
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
@@ -637,6 +703,7 @@ export class PilotSession {
           "additional instructions from the same person and adapt mid-task.",
         ].join("\n") +
           this.buildIdentityPrompt() +
+          this.buildChannelPrompt() +
           this.buildSkillsPrompt() +
           this.buildEvolutionPrompt() +
           this.buildCavemanPrompt(),
@@ -1020,6 +1087,46 @@ export function activePilotChannelIds(): string[] {
 }
 
 /**
+ * Live session ids a channel owns: itself, plus every thread under it.
+ *
+ * Sessions are keyed to threads while `/clear`, `/interrupt` and `/pilot off`
+ * are usually typed in the parent channel. Without this lookup those commands
+ * reported "no active session here" while a turn was streaming one level down.
+ */
+export function pilotSessionChannelIdsUnder(channelId: string): string[] {
+  const ids: string[] = [];
+  for (const [id, session] of sessions) {
+    if (session.isClosed) continue;
+    if (id === channelId || session.parentId === channelId) ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * Interrupt every live session a channel owns (see
+ * `pilotSessionChannelIdsUnder`). Returns one entry per session interrupted.
+ */
+export async function interruptPilotSessionsUnder(
+  channelId: string,
+): Promise<Array<{ channelId: string; result: PilotInterruptResult }>> {
+  const out: Array<{ channelId: string; result: PilotInterruptResult }> = [];
+  for (const id of pilotSessionChannelIdsUnder(channelId)) {
+    const result = await interruptPilotSession(id);
+    if (result) out.push({ channelId: id, result });
+  }
+  return out;
+}
+
+/** Stop every live session a channel owns. Returns how many were stopped. */
+export async function stopPilotSessionsUnder(channelId: string): Promise<number> {
+  let stopped = 0;
+  for (const id of pilotSessionChannelIdsUnder(channelId)) {
+    if (await stopPilotSession(id)) stopped += 1;
+  }
+  return stopped;
+}
+
+/**
  * Interrupt the current turn of one channel's pilot session, keeping the
  * session (and its context) alive. Returns null when no session is running.
  */
@@ -1053,6 +1160,25 @@ export async function resetPilotSession(channelId: string): Promise<boolean> {
   const stopped = await stopPilotSession(channelId);
   clearPilotSessionId(channelId);
   return stopped;
+}
+
+/**
+ * `/clear` semantics for a whole channel: reset the sessions it owns (itself and
+ * its threads) and drop their stored resume ids, plus the channel's own stored
+ * id even when nothing is running there. Returns how many live sessions were
+ * stopped and how many stored ids were dropped.
+ */
+export async function resetPilotSessionScope(
+  channelId: string,
+): Promise<{ stopped: number; cleared: number }> {
+  const ids = pilotSessionChannelIdsUnder(channelId);
+  let stopped = 0;
+  for (const id of ids) {
+    if (await stopPilotSession(id)) stopped += 1;
+    clearPilotSessionId(id);
+  }
+  if (!ids.includes(channelId)) clearPilotSessionId(channelId);
+  return { stopped, cleared: ids.includes(channelId) ? ids.length : ids.length + 1 };
 }
 
 /** Stop every pilot session. Returns how many were stopped. */
