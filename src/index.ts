@@ -1,12 +1,17 @@
 import "dotenv/config";
 
 import { initDb } from "./db/index.js";
-import { initPilot } from "./pilot/index.js";
+import {
+  initPilot,
+  isPilotChannelId,
+  planPilotCronRoute,
+  submitToPilotSession,
+} from "./pilot/index.js";
 import { expireStalePendingQuestions } from "./agent/questions.js";
 import { initSoul, stopSoulWatcher } from "./soul/soul.js";
 import { initMemory, stopMemoryWatcher } from "./memory/memory.js";
 import { isMem9Enabled } from "./memory/mem9.js";
-import { CronService } from "./cron/service.js";
+import { CronService, type CronAgentTurnContext } from "./cron/service.js";
 import { SkillService } from "./skills/service.js";
 import { processAgentTurn } from "./agent/agent.js";
 import { createClient, startBot, stopBot } from "./bot/client.js";
@@ -37,6 +42,94 @@ const ADMIN_USER_ID = "152801068663832576";
 
 // Voice coach channel ID
 const VOICE_COACH_CHANNEL_ID = "1495515183463006431";
+
+// Set once the Discord client exists (step 5). The cron agent-turn router
+// needs it, and cron is started before the client connects.
+let discordClient: any = null;
+
+// ---------------------------------------------------------------------------
+// Cron agent turns
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a cron `agentTurn` job on the runtime its channel is configured for.
+ *
+ * A pilot-flagged channel is served by a Claude Agent SDK session everywhere
+ * else (normal messages, threads), so a scheduled job landing there used to be
+ * the one place that silently fell back to the main agent loop — different
+ * tools, different workspace, none of the session context. Now the delivery
+ * channel decides.
+ *
+ * Pilot submission is fire-and-forget: the session relays its own output to the
+ * channel and the run record just says where it went. That also means the cron
+ * per-job timeout does not bound the work — the pilot turn watchdog
+ * (`PILOT_TURN_TIMEOUT_MS`) does. A per-job `model` override does not apply to
+ * pilot sessions, whose model comes from the pilot environment.
+ */
+async function runCronAgentTurn(
+  message: string,
+  model?: string,
+  context?: CronAgentTurnContext,
+): Promise<string> {
+  // Read the delivery channel from the client cache (no API call) so a job
+  // pointed at a thread inherits its parent's pilot flag, the same rule normal
+  // messages follow. An uncached channel is treated as a plain channel, which
+  // is what a configured cron delivery target almost always is.
+  const cached: any = context?.channelId
+    ? discordClient?.channels?.cache?.get(context.channelId)
+    : null;
+  const cachedIsThread =
+    cached && typeof cached.isThread === "function" ? cached.isThread() : false;
+  const route = planPilotCronRoute({
+    channelId: context?.channelId,
+    isThread: cachedIsThread,
+    parentId: cachedIsThread ? cached.parentId : null,
+    isDM: cached ? cached.isDMBased?.() === true : false,
+  });
+
+  if (route && discordClient && isPilotChannelId(route.configChannelId)) {
+    try {
+      const channel: any =
+        cached ?? (await discordClient.channels.fetch(route.sessionChannelId));
+      if (!channel) throw new Error(`channel ${route.sessionChannelId} not found`);
+
+      // Cron output is thread-only by policy, and each thread is its own pilot
+      // session — so a scheduled job gets a clean session per run.
+      const target = route.needsThread
+        ? await ensureThread(
+            channel,
+            context?.jobName ? `cron: ${context.jobName}` : "cron job",
+            "cron",
+          )
+        : channel;
+
+      if (model) {
+        console.warn(
+          `[cron] Job "${context?.jobName}" sets model "${model}", ignored for pilot sessions`,
+        );
+      }
+
+      submitToPilotSession(target, {
+        text: message,
+        userId: ADMIN_USER_ID,
+        userName: "cron",
+        channelName: context?.jobName ? `cron:${context.jobName}` : "cron",
+      });
+      console.log(
+        `[cron] Routed agentTurn "${context?.jobName}" to pilot session ${target.id}`,
+      );
+      return `Routed to pilot session ${target.id}`;
+    } catch (err) {
+      // A broken pilot route must not stop a scheduled job from running at all.
+      console.error(
+        `[cron] Pilot routing failed for "${context?.jobName}", falling back to the main agent:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  return processAgentTurn({ message, model });
+}
 
 // ---------------------------------------------------------------------------
 // Startup
@@ -131,8 +224,8 @@ async function main(): Promise<void> {
   // 4. Start cron service
   console.log("[discordclaw] Starting cron service...");
   const cronService = new CronService();
-  cronService.setExecuteAgentTurn(
-    (message, model) => processAgentTurn({ message, model }),
+  cronService.setExecuteAgentTurn((message, model, context) =>
+    runCronAgentTurn(message, model, context),
   );
   cronService.start();
   setCommandsCronService(cronService);
@@ -140,6 +233,9 @@ async function main(): Promise<void> {
   // 5. Start Discord bot
   console.log("[discordclaw] Connecting to Discord...");
   const client = createClient();
+  // Published for the cron agent-turn router, which is registered before the
+  // client exists but only ever called once jobs start firing.
+  discordClient = client;
   await startBot(client);
 
   // Wire voice → Discord client (for user display name resolution)

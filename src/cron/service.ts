@@ -31,6 +31,17 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
+/**
+ * Identity and delivery target of the job being run, handed to the agent-turn
+ * callback so it can pick a runtime (main agent vs pilot session) and name the
+ * thread it posts into.
+ */
+export interface CronAgentTurnContext {
+  channelId?: string;
+  jobId: string;
+  jobName: string;
+}
+
 export class CronService {
   private store: CronStore;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -39,7 +50,11 @@ export class CronService {
     | ((channelId: string, text: string, mentionUser?: string) => Promise<void>)
     | null = null;
   private executeAgentTurn:
-    | ((message: string, model?: string) => Promise<string>)
+    | ((
+        message: string,
+        model?: string,
+        context?: CronAgentTurnContext,
+      ) => Promise<string>)
     | null = null;
   private adminDmChannelId: string | null = null;
 
@@ -94,7 +109,11 @@ export class CronService {
   }
 
   setExecuteAgentTurn(
-    fn: (message: string, model?: string) => Promise<string>,
+    fn: (
+      message: string,
+      model?: string,
+      context?: CronAgentTurnContext,
+    ) => Promise<string>,
   ): void {
     this.executeAgentTurn = fn;
     log("Agent turn callback registered");
@@ -319,6 +338,15 @@ export class CronService {
           this.executeAgentTurn(
             job.payload.message,
             job.payload.model,
+            {
+              // The delivery channel decides which runtime runs this job: a
+              // pilot-flagged channel is served by the SDK session, not the
+              // main agent loop. Resolving it here keeps that decision with
+              // the caller, which is the only place that has a Discord client.
+              channelId: this.resolveDelivery(job)?.channelId,
+              jobId: job.id,
+              jobName: job.name,
+            },
           ),
           timeoutMs,
           `job "${job.name}"`,
