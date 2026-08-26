@@ -43,3 +43,8 @@ export {
 } from "./policy.js";
 
 export { createPilotMcpServer, PILOT_MCP_SERVER_NAME } from "./bridge.js";
+export {
+  planPilotCronRoute,
+  type CronPilotRoute,
+  type CronPilotRouteInput,
+} from "./cron-route.js";
