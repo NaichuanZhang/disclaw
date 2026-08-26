@@ -20,6 +20,7 @@ import { z } from "zod";
 import { handleDiscordTool } from "../agent/tools.js";
 import { handleMemoryTool } from "../memory/tools.js";
 import { handleSkillTool } from "../skills/tools.js";
+import { handleConversationHistoryTool } from "../shared/conversation-history.js";
 import { handleEvolutionTool, setEvolutionContext } from "../evolution/tools.js";
 
 export interface PilotBridgeOptions {
@@ -88,6 +89,13 @@ function runSkillTool(
   }
 }
 
+function runHistoryTool(
+  name: string,
+  input: Record<string, unknown>,
+): { content: Array<{ type: "text"; text: string }> } {
+  return textResult(handleConversationHistoryTool(name, input));
+}
+
 /**
  * Evolution tools mutate module-global context (triggering channel/user) before
  * dispatching, so set it immediately before every call.
@@ -124,7 +132,9 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
       "Tools from the host Discord bot. Use send_message to post to a channel, " +
       "ask_user to ask the human a question with buttons, and the memory tools " +
       "to recall or store durable facts. read_skill/list_skill_files load the " +
-      "host bot's skill library on demand. The evolve_* tools modify this bot's own " +
+      "host bot's skill library on demand. get_channel_history / " +
+      "get_conversation_history / get_conversation_stats read Discord scrollback and " +
+      "cross-session history. The evolve_* tools modify this bot's own " +
       "source code through an isolated worktree and an auto-merged PR — they " +
       "require an explicitly approved build plan first.",
     alwaysLoad: true,
@@ -331,6 +341,91 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
           memory_id: z.string().describe("ID of the memory to delete"),
         },
         async (args) => runMemoryTool("mem9_delete", { memory_id: args.memory_id }),
+      ),
+
+      // ---------------------------------------------------------------------
+      // Read-only context tools — same handlers the main agent uses, so a pilot
+      // session can look past its own SDK transcript (older scrollback, other
+      // channels, cross-session history) instead of guessing.
+      // ---------------------------------------------------------------------
+
+      tool(
+        "get_channel_history",
+        "Read recent Discord messages from a channel. Use for scrollback that is not already in this session's context: messages older than what you have seen, or a different channel. Defaults to the current pilot channel.",
+        {
+          channel_id: z
+            .string()
+            .optional()
+            .describe("Discord channel ID (defaults to the pilot channel)"),
+          limit: z
+            .number()
+            .optional()
+            .describe("Number of messages (default 20, max 100)"),
+        },
+        async (args) =>
+          runDiscordTool("get_channel_history", {
+            channel_id: args.channel_id ?? channelId,
+            limit: args.limit,
+          }),
+      ),
+
+      tool(
+        "create_thread",
+        "Create a new thread in a Discord channel. Returns the thread's channel ID, which you can pass to send_message to post inside it.",
+        {
+          name: z.string().describe("Thread name (max 100 characters)"),
+          channel_id: z
+            .string()
+            .optional()
+            .describe("Parent channel ID (defaults to the pilot channel)"),
+          message: z
+            .string()
+            .optional()
+            .describe("Optional initial message to send in the thread"),
+        },
+        async (args) =>
+          runDiscordTool("create_thread", {
+            name: args.name,
+            channel_id: args.channel_id ?? channelId,
+            message: args.message,
+          }),
+      ),
+
+      tool(
+        "get_conversation_history",
+        "Get recent conversation messages from the bot's database, spanning all sessions and channels (including archived ones). Returns messages newest-first.",
+        {
+          hours: z
+            .number()
+            .optional()
+            .describe("How many hours back to look (default 24)"),
+          limit: z
+            .number()
+            .optional()
+            .describe("Max messages to return (default 100, max 500)"),
+          role: z
+            .string()
+            .optional()
+            .describe("Filter by role: 'user' or 'assistant' (default both)"),
+        },
+        async (args) =>
+          runHistoryTool("get_conversation_history", {
+            hours: args.hours,
+            limit: args.limit,
+            role: args.role,
+          }),
+      ),
+
+      tool(
+        "get_conversation_stats",
+        "Get statistics about recent conversations: total sessions, messages, unique users.",
+        {
+          hours: z
+            .number()
+            .optional()
+            .describe("How many hours back to look (default 24)"),
+        },
+        async (args) => runHistoryTool("get_conversation_stats", { hours: args.hours }),
       ),
 
       // ---------------------------------------------------------------------

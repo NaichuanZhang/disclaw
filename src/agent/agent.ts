@@ -11,6 +11,13 @@ import { evolutionTools, handleEvolutionTool, setEvolutionContext } from "../evo
 import { EVOLUTION_INSTRUCTIONS } from "../evolution/instructions.js";
 import type { Message, ChannelConfig, TokenUsage } from "../db/index.js";
 import { recordSignal } from "../reflection/signals.js";
+import {
+  MEMORY_RECALL_INSTRUCTIONS,
+  CAVEMAN_LEVELS,
+  buildCavemanInstructions,
+  getCavemanLevel,
+  type CavemanLevel,
+} from "../shared/prompt-fragments.js";
 import { getSkillService } from "../skills/service.js";
 import { createLogger, toolCallLog } from "../logging/logger.js";
 
@@ -71,30 +78,12 @@ const MAX_TOKENS = 16384;
 const MAX_CONSECUTIVE_DUPES = 2; // Break loop after this many identical consecutive tool calls
 
 // ---------------------------------------------------------------------------
-// Caveman mode
+// Caveman mode — definitions live in shared/prompt-fragments.ts so pilot mode
+// honours /caveman too. Re-exported here for existing importers (commands.ts).
 // ---------------------------------------------------------------------------
 
-/** Valid intensity levels for the caveman-speak skill, set via /caveman. */
-export const CAVEMAN_LEVELS = ["lite", "full", "ultra"] as const;
-export type CavemanLevel = (typeof CAVEMAN_LEVELS)[number];
-
-/** Read the active caveman level for a channel, if any. */
-export function getCavemanLevel(config?: ChannelConfig): CavemanLevel | undefined {
-  const raw = config?.settings?.cavemanLevel;
-  return typeof raw === "string" && (CAVEMAN_LEVELS as readonly string[]).includes(raw)
-    ? (raw as CavemanLevel)
-    : undefined;
-}
-
-function buildCavemanInstructions(level: CavemanLevel): string {
-  return (
-    `## Caveman Mode — ACTIVE (level: ${level})\n\n` +
-    `Apply the \`caveman-speak\` skill's compression rules to every reply in this channel/thread ` +
-    `at intensity **${level}**, until turned off via \`/caveman level:off\`. If you have not already ` +
-    `loaded the full rule set this conversation, call \`read_skill\` with skill_name \`caveman-speak\` once. ` +
-    `Technical accuracy, code, numbers, and negations must stay exact — only the prose gets terser.`
-  );
-}
+export { CAVEMAN_LEVELS, getCavemanLevel };
+export type { CavemanLevel };
 
 // ---------------------------------------------------------------------------
 // Token usage aggregation
@@ -147,16 +136,7 @@ Guidelines:
 - If you don't know something, say so rather than guessing.
 - When users reference past conversations, search your memory first.`;
 
-const MEMORY_RECALL_INSTRUCTIONS = `## Memory
-
-You have access to a persistent memory system. Use it proactively:
-- **memory_search**: Search for prior context before answering questions about people, preferences, past decisions, or facts you may have stored. When in doubt, search.
-- **memory_get**: Read full context around a search result when you need more detail.
-
-Search memory when:
-- A user asks "do you remember…" or references something from the past
-- You need context about a user, project, or ongoing topic
-- You want to check if you've discussed something before`;
+// MEMORY_RECALL_INSTRUCTIONS lives in shared/prompt-fragments.ts (shared with pilot).
 
 
 // ---------------------------------------------------------------------------
