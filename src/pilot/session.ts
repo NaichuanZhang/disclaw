@@ -1076,6 +1076,19 @@ export function submitToPilotSession(
   return session;
 }
 
+/**
+ * True when a live (non-closed) pilot session is keyed to this exact channel id.
+ *
+ * Message routing needs this because a session can now exist in a channel that
+ * was never pilot-flagged: cron runs every agent turn on the SDK, so a reply to
+ * a cron report inside its own thread has to reach the session that wrote it
+ * rather than the main agent loop, which has none of its context.
+ */
+export function hasLivePilotSession(channelId: string): boolean {
+  const session = sessions.get(channelId);
+  return session !== undefined && !session.isClosed;
+}
+
 /** Number of live pilot sessions. */
 export function activePilotSessionCount(): number {
   return sessions.size;

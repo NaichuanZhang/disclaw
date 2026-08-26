@@ -19,6 +19,7 @@ import {
   activePilotChannelIds,
   interruptPilotSession,
   isPilotChannelId,
+  cronAgentRuntime,
   pilotConfigChannelId,
   activePilotSessionCount,
   interruptPilotSessionsUnder,
@@ -1532,17 +1533,14 @@ function formatJobModel(job: CronJob): string {
 }
 
 /**
- * True when an agent-turn job delivers into a pilot channel, so its run is
- * routed to a pilot session (in a per-run thread) rather than the main agent.
- *
- * Only the delivery channel is checked — a job delivering into a thread whose
- * parent is the pilot channel still routes to pilot at run time, but resolving
- * that here would need a channel fetch, so the annotation is conservative.
+ * True when this job's run is handed to a Claude Agent SDK session (in a per-run
+ * thread) rather than the main agent loop. Every `agentTurn` job is, whatever
+ * the delivery channel's pilot flag says, unless the `CRON_RUNTIME=main` escape
+ * hatch is set. `systemEvent` jobs never run an agent at all.
  */
 function isPilotRoutedJob(job: CronJob): boolean {
   if (job.payload.kind !== "agentTurn") return false;
-  const channelId = job.delivery?.channelId;
-  return channelId ? isPilotChannelId(channelId) : false;
+  return cronAgentRuntime() === "sdk";
 }
 
 /**
@@ -1690,8 +1688,8 @@ async function handleCron(
         ? `\nModel: \`${model}\`${modelWarning ? ` (⚠️ ${modelWarning})` : ""}`
         : "";
 
-      const pilotNote = isPilotChannelId(deliveryChannelId)
-        ? "\n-# 🧪 Delivers into a pilot channel — each run gets its own thread and pilot session."
+      const pilotNote = isPilotRoutedJob(job)
+        ? "\n-# 🧪 Runs on a Claude Agent SDK session — each run gets its own thread and session."
         : "";
 
       await interaction.editReply({

@@ -1,16 +1,27 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
-import { planPilotCronRoute } from "../../src/pilot/cron-route.js";
+import {
+  cronAgentRuntime,
+  planPilotCronRoute,
+} from "../../src/pilot/cron-route.js";
 
 const serviceSrc = readFileSync("src/cron/service.ts", "utf-8");
 const indexSrc = readFileSync("src/index.ts", "utf-8");
+const messagesSrc = readFileSync("src/bot/messages.ts", "utf-8");
+const commandsSrc = readFileSync("src/bot/commands.ts", "utf-8");
+
+/** The router function body, which is what most of the wiring assertions read. */
+const routerBody = (() => {
+  const from = indexSrc.slice(indexSrc.indexOf("async function runCronAgentTurn"));
+  return from.slice(0, 4000);
+})();
 
 // ---------------------------------------------------------------------------
 // Route planning (pure)
 // ---------------------------------------------------------------------------
 
 describe("planPilotCronRoute", () => {
-  it("returns null when the job has no delivery channel", () => {
+  it("returns null only when the job has no delivery channel", () => {
     expect(planPilotCronRoute({})).toBeNull();
     expect(planPilotCronRoute({ channelId: null })).toBeNull();
     expect(planPilotCronRoute({ channelId: "   " })).toBeNull();
@@ -24,7 +35,7 @@ describe("planPilotCronRoute", () => {
     });
   });
 
-  it("reads the flag from a thread's parent but keeps the session in the thread", () => {
+  it("keeps a thread's session in the thread and names its parent as the config owner", () => {
     expect(
       planPilotCronRoute({
         channelId: "thread-9",
@@ -39,16 +50,69 @@ describe("planPilotCronRoute", () => {
     });
   });
 
-  it("gives up on a thread with no known parent rather than guessing", () => {
-    expect(planPilotCronRoute({ channelId: "thread-9", isThread: true })).toBeNull();
+  it("still routes a thread with no known parent — the session keys to the thread", () => {
+    // The parent is only needed to find channel config, and routing no longer
+    // depends on it, so an unresolvable parent must not cost the job its run.
+    expect(planPilotCronRoute({ channelId: "thread-9", isThread: true })).toEqual({
+      configChannelId: null,
+      sessionChannelId: "thread-9",
+      needsThread: false,
+    });
   });
 
-  it("never routes a DM — pilot mode is per guild channel", () => {
-    expect(planPilotCronRoute({ channelId: "dm-1", isDM: true })).toBeNull();
+  it("routes a DM to a session in the DM, without a thread", () => {
+    // Pilot mode as a channel flag is guild-only, but cron runs every agent turn
+    // on the SDK — so the admin-DM fallback target gets a session too. A DM has
+    // no channel config to own the flag and cannot hold a thread.
+    expect(planPilotCronRoute({ channelId: "dm-1", isDM: true })).toEqual({
+      configChannelId: null,
+      sessionChannelId: "dm-1",
+      needsThread: false,
+    });
   });
 
   it("trims a padded channel id instead of building a bad route", () => {
-    expect(planPilotCronRoute({ channelId: " chan-1 " })?.configChannelId).toBe("chan-1");
+    expect(planPilotCronRoute({ channelId: " chan-1 " })?.sessionChannelId).toBe("chan-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runtime escape hatch
+// ---------------------------------------------------------------------------
+
+describe("cronAgentRuntime", () => {
+  const original = process.env.CRON_RUNTIME;
+  afterEach(() => {
+    if (original === undefined) delete process.env.CRON_RUNTIME;
+    else process.env.CRON_RUNTIME = original;
+  });
+
+  it("defaults to the SDK", () => {
+    delete process.env.CRON_RUNTIME;
+    expect(cronAgentRuntime()).toBe("sdk");
+    process.env.CRON_RUNTIME = "";
+    expect(cronAgentRuntime()).toBe("sdk");
+  });
+
+  it("falls back to the main agent loop only on an explicit CRON_RUNTIME=main", () => {
+    process.env.CRON_RUNTIME = "main";
+    expect(cronAgentRuntime()).toBe("main");
+    process.env.CRON_RUNTIME = "  MAIN  ";
+    expect(cronAgentRuntime()).toBe("main");
+  });
+
+  it("treats anything else as the default rather than guessing", () => {
+    process.env.CRON_RUNTIME = "pilot";
+    expect(cronAgentRuntime()).toBe("sdk");
+    process.env.CRON_RUNTIME = "nonsense";
+    expect(cronAgentRuntime()).toBe("sdk");
+  });
+
+  it("is read per call, so the flip needs a restart and not a rebuild", () => {
+    const src = readFileSync("src/pilot/cron-route.ts", "utf-8");
+    expect(src).toMatch(/export function cronAgentRuntime\(\)/);
+    // Not captured in a module-level const at import time.
+    expect(src).not.toMatch(/^const CRON_RUNTIME/m);
   });
 });
 
@@ -73,29 +137,36 @@ describe("cron service agent-turn context", () => {
 });
 
 describe("cron agent-turn router", () => {
-  it("routes a pilot-flagged channel through the pilot session", () => {
-    const fn = indexSrc.slice(indexSrc.indexOf("async function runCronAgentTurn"));
-    const body = fn.slice(0, 3000);
-    expect(body).toContain("planPilotCronRoute(");
-    expect(body).toContain("isPilotChannelId(route.configChannelId)");
-    expect(body).toContain("submitToPilotSession(");
+  it("routes every agent turn through a pilot session", () => {
+    expect(routerBody).toContain("planPilotCronRoute(");
+    expect(routerBody).toContain("submitToPilotSession(");
+  });
+
+  it("no longer gates on the channel's pilot flag", () => {
+    expect(routerBody).not.toContain("isPilotChannelId(");
+    expect(indexSrc).not.toContain("isPilotChannelId");
+  });
+
+  it("skips the pilot path only when CRON_RUNTIME asks for the main loop", () => {
+    expect(routerBody).toMatch(/cronAgentRuntime\(\) === "main"\s*\n?\s*\?\s*null/);
   });
 
   it("creates a thread only when the target is not already one", () => {
-    const fn = indexSrc.slice(indexSrc.indexOf("async function runCronAgentTurn"));
-    expect(fn.slice(0, 3000)).toMatch(/route\.needsThread\s*\n?\s*\?\s*await ensureThread/);
+    expect(routerBody).toMatch(/route\.needsThread\s*\n?\s*\?\s*await ensureThread/);
   });
 
   it("falls back to the main agent when pilot routing fails", () => {
-    const fn = indexSrc.slice(indexSrc.indexOf("async function runCronAgentTurn"));
-    const body = fn.slice(0, 3000);
-    expect(body).toContain("catch (err)");
-    // The fallback is the last statement, so both the non-pilot path and a
-    // failed pilot route reach it.
-    expect(body).toContain("return processAgentTurn({ message, model });");
-    expect(body.lastIndexOf("return processAgentTurn")).toBeGreaterThan(
-      body.indexOf("submitToPilotSession("),
+    expect(routerBody).toContain("catch (err)");
+    // The fallback is the last statement, so the no-route case and a failed
+    // pilot route both reach it.
+    expect(routerBody).toContain("return processAgentTurn({ message, model });");
+    expect(routerBody.lastIndexOf("return processAgentTurn")).toBeGreaterThan(
+      routerBody.indexOf("submitToPilotSession("),
     );
+  });
+
+  it("says why a run went to the main loop instead of failing silently", () => {
+    expect(routerBody).toContain("on the main agent loop");
   });
 
   it("is what cron actually calls", () => {
@@ -105,8 +176,33 @@ describe("cron agent-turn router", () => {
   it("forwards a per-job model override to the pilot session", () => {
     // It used to warn that the override was ignored; the session now starts its
     // child on that model, so the job's model is honoured either way it routes.
-    const fn = indexSrc.slice(indexSrc.indexOf("async function runCronAgentTurn"));
-    expect(fn.slice(0, 3000)).toContain("modelOverride: model");
-    expect(fn.slice(0, 3000)).not.toMatch(/ignored for pilot sessions/);
+    expect(routerBody).toContain("modelOverride: model");
+    expect(routerBody).not.toMatch(/ignored for pilot sessions/);
+  });
+});
+
+describe("replies to a cron session", () => {
+  it("routes a channel with a live pilot session to that session, flag or not", () => {
+    // Cron sessions live in threads nobody flagged; without this a reply would
+    // be answered by the main agent loop with none of the session's context.
+    expect(messagesSrc).toContain("hasLivePilotSession(message.channelId)");
+    const fn = messagesSrc.slice(messagesSrc.indexOf("function isPilotChannel("));
+    const body = fn.slice(0, 1200);
+    expect(body.indexOf("hasLivePilotSession")).toBeLessThan(
+      body.indexOf("pilotConfigChannelId("),
+    );
+  });
+});
+
+describe("/cron annotations", () => {
+  it("marks agent-turn jobs as SDK-routed without consulting the channel flag", () => {
+    const fn = commandsSrc.slice(commandsSrc.indexOf("function isPilotRoutedJob("));
+    const body = fn.slice(0, 400);
+    expect(body).toContain('cronAgentRuntime() === "sdk"');
+    expect(body).not.toContain("isPilotChannelId(");
+  });
+
+  it("keeps the created-job note on the same rule as the router", () => {
+    expect(commandsSrc).toContain("const pilotNote = isPilotRoutedJob(job)");
   });
 });

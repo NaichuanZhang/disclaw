@@ -2,8 +2,8 @@ import "dotenv/config";
 
 import { initDb } from "./db/index.js";
 import {
+  cronAgentRuntime,
   initPilot,
-  isPilotChannelId,
   planPilotCronRoute,
   stopAllPilotSessions,
   submitToPilotSession,
@@ -53,19 +53,26 @@ let discordClient: any = null;
 // ---------------------------------------------------------------------------
 
 /**
- * Run a cron `agentTurn` job on the runtime its channel is configured for.
+ * Run a cron `agentTurn` job on a Claude Agent SDK session.
  *
- * A pilot-flagged channel is served by a Claude Agent SDK session everywhere
- * else (normal messages, threads), so a scheduled job landing there used to be
- * the one place that silently fell back to the main agent loop — different
- * tools, different workspace, none of the session context. Now the delivery
- * channel decides.
+ * Cron used to be the one place with two runtimes: a pilot-flagged channel got
+ * an SDK session and everything else silently fell back to the in-process agent
+ * loop — different tools, different workspace, none of the session context. The
+ * channel flag no longer decides. Every agent turn runs on the SDK, in a fresh
+ * thread per run (or in the thread itself when delivery already points at one,
+ * or in the DM when it points there), which also means every job gets a clean
+ * session. `CRON_RUNTIME=main` forces the old loop back if that goes wrong.
  *
- * Pilot submission is fire-and-forget: the session relays its own output to the
- * channel and the run record just says where it went. That also means the cron
- * per-job timeout does not bound the work — the pilot turn watchdog
- * (`PILOT_TURN_TIMEOUT_MS`) does. A per-job `model` override does not apply to
- * pilot sessions, whose model comes from the pilot environment.
+ * The main loop stays reachable as a fallback for the two cases the SDK path
+ * cannot serve — a job with no delivery channel to host a session, and a route
+ * that throws — because a scheduled job must never silently stop running.
+ *
+ * Submission is fire-and-forget: the session relays its own output to the
+ * channel and the run record just says where it went, so cron history no longer
+ * holds the job's output or its real pass/fail. It also means the cron per-job
+ * timeout does not bound the work — the pilot turn watchdog
+ * (`PILOT_TURN_TIMEOUT_MS`) does. A per-job `model` override is honoured, since
+ * a fresh thread means a session that has not started yet.
  */
 async function runCronAgentTurn(
   message: string,
@@ -73,22 +80,26 @@ async function runCronAgentTurn(
   context?: CronAgentTurnContext,
 ): Promise<string> {
   // Read the delivery channel from the client cache (no API call) so a job
-  // pointed at a thread inherits its parent's pilot flag, the same rule normal
-  // messages follow. An uncached channel is treated as a plain channel, which
-  // is what a configured cron delivery target almost always is.
+  // pointed at a thread keeps its session in that thread, and a DM target is
+  // recognised as one (it can hold a session but not a thread). An uncached
+  // channel is treated as a plain channel, which is what a configured cron
+  // delivery target almost always is; `ensureThread` no-ops off-guild anyway.
   const cached: any = context?.channelId
     ? discordClient?.channels?.cache?.get(context.channelId)
     : null;
   const cachedIsThread =
     cached && typeof cached.isThread === "function" ? cached.isThread() : false;
-  const route = planPilotCronRoute({
-    channelId: context?.channelId,
-    isThread: cachedIsThread,
-    parentId: cachedIsThread ? cached.parentId : null,
-    isDM: cached ? cached.isDMBased?.() === true : false,
-  });
+  const route =
+    cronAgentRuntime() === "main"
+      ? null
+      : planPilotCronRoute({
+          channelId: context?.channelId,
+          isThread: cachedIsThread,
+          parentId: cachedIsThread ? cached.parentId : null,
+          isDM: cached ? cached.isDMBased?.() === true : false,
+        });
 
-  if (route && discordClient && isPilotChannelId(route.configChannelId)) {
+  if (route && discordClient) {
     try {
       const channel: any =
         cached ?? (await discordClient.channels.fetch(route.sessionChannelId));
@@ -124,6 +135,16 @@ async function runCronAgentTurn(
         err instanceof Error ? err.message : err,
       );
     }
+  } else {
+    const reason =
+      cronAgentRuntime() === "main"
+        ? "CRON_RUNTIME=main"
+        : !route
+          ? "no delivery channel to host a session"
+          : "Discord client not ready";
+    console.log(
+      `[cron] Running agentTurn "${context?.jobName}" on the main agent loop (${reason})`,
+    );
   }
 
   return processAgentTurn({ message, model });
