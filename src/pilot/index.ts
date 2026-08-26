@@ -21,6 +21,7 @@ export {
   interruptPilotSession,
   isPilotChannelId,
   pilotConfigChannelId,
+  resetPilotSession,
   stopAllPilotSessions,
   stopPilotSession,
   submitToPilotSession,
