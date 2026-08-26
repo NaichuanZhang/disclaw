@@ -28,8 +28,10 @@ import type {
 import { DATA_DIR } from "../shared/paths.js";
 import { getChannelConfig, setChannelConfig } from "../db/index.js";
 import { sendChunked } from "../shared/discord-utils.js";
+import { fmtDuration, fmtTokens } from "../shared/format.js";
 import { buildPilotEnv } from "./env.js";
 import { createPilotMcpServer } from "./bridge.js";
+import { PilotRelayQueue } from "./relay-queue.js";
 import { getSkillService } from "../skills/service.js";
 import { EVOLUTION_INSTRUCTIONS } from "../evolution/instructions.js";
 
@@ -54,6 +56,18 @@ const TOOL_PREVIEW_CHARS = 160;
 
 /** Reaction dropped on a message that steered a turn already in flight. */
 const STEER_EMOJI = "↩️";
+
+/** Max characters of a failed tool result we echo into the channel. */
+const TOOL_ERROR_CHARS = 200;
+
+/** How many tool_use ids we keep around to label their results. */
+const TOOL_NAME_CACHE_LIMIT = 64;
+
+/**
+ * How many user messages we keep for replay. Only used when a resume fails
+ * before the session produced anything, so the queue is short by definition.
+ */
+const REPLAY_LIMIT = 20;
 
 // ---------------------------------------------------------------------------
 // Channel config helpers — pilot mode is data, not code
@@ -85,6 +99,18 @@ export function pilotConfigChannelId(input: {
 function savePilotSessionId(channelId: string, sdkSessionId: string): void {
   const config = getChannelConfig(channelId);
   const settings = { ...(config?.settings ?? {}), pilotSessionId: sdkSessionId };
+  setChannelConfig(channelId, { settings });
+}
+
+/**
+ * Forget the stored SDK session id. Called when the CLI cannot resume it —
+ * otherwise the stale id is passed forever and every turn in that thread dies
+ * on the same error.
+ */
+function clearPilotSessionId(channelId: string): void {
+  const config = getChannelConfig(channelId);
+  const settings = { ...(config?.settings ?? {}) };
+  delete settings.pilotSessionId;
   setChannelConfig(channelId, { settings });
 }
 
@@ -132,6 +158,51 @@ export interface PilotInterruptResult {
 }
 
 // ---------------------------------------------------------------------------
+// Small relay helpers
+// ---------------------------------------------------------------------------
+
+/** Coerce an unknown JSON number to a finite number, defaulting to 0. */
+function num(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * The model that did most of the talking in a turn, from the SDK's per-model
+ * usage map. Subagents can add entries, so pick the busiest rather than the
+ * first.
+ */
+function primaryModel(modelUsage: unknown): string | null {
+  if (!modelUsage || typeof modelUsage !== "object") return null;
+  let best: string | null = null;
+  let bestTokens = -1;
+  for (const [model, usage] of Object.entries(modelUsage as Record<string, unknown>)) {
+    const tokens = num((usage as Record<string, unknown> | null)?.outputTokens);
+    if (tokens > bestTokens) {
+      bestTokens = tokens;
+      best = model;
+    }
+  }
+  return best;
+}
+
+/** One-line summary of a failed tool_result's content, for the channel. */
+function summariseToolResult(content: unknown): string {
+  let text = "";
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content
+      .map((part) => {
+        const p = part as Record<string, unknown>;
+        return p && p.type === "text" && typeof p.text === "string" ? p.text : "";
+      })
+      .filter(Boolean)
+      .join(" ");
+  }
+  return text.replace(/\s+/g, " ").trim().slice(0, TOOL_ERROR_CHARS);
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -165,10 +236,39 @@ export class PilotSession {
   /** Capabilities advertised by the CLI in the system/init message. */
   private capabilities: string[] = [];
 
+  /** True once the CLI has handshaked — tells a resume failure from a real one. */
+  private sawInit = false;
+  /** Messages handed to the CLI but not yet answered, for resume replay. */
+  private pendingReplay: SDKUserMessage[] = [];
+  /** tool_use id -> short tool name, so we can label failed results. */
+  private toolNames = new Map<string, string>();
+  /** Cost the last result reported — the SDK's total is cumulative. */
+  private lastCostUsd = 0;
+
+  /** Order-preserving, rate-limited outbound relay to the channel. */
+  private outbound: PilotRelayQueue;
+
   constructor(target: PilotChannelTarget) {
     this.channelId = target.id;
     this.target = target;
+    // Reads this.target on every send, so a re-fetched channel object is picked
+    // up without rebuilding the queue.
+    this.outbound = new PilotRelayQueue({
+      send: (text) => sendChunked(this.target, text),
+      onError: (err) =>
+        console.error(
+          `[pilot] failed to send to ${this.channelId}:`,
+          err instanceof Error ? err.message : err,
+        ),
+    });
   }
+
+  /**
+   * Who the session is talking to right now. Handed to the MCP bridge as a
+   * function so `ask_user` mentions and `evolve_*` attribution track the
+   * current speaker instead of freezing on whoever opened the session.
+   */
+  private currentUserId = (): string | undefined => this.lastUserId;
 
   /** Wall-clock ms since the last message in either direction. */
   get idleMs(): number {
@@ -239,7 +339,7 @@ export class PilotSession {
     }
     const nth = this.steerCount > 1 ? ` ${this.steerCount}×` : "";
     const was = this.lastToolName ? ` · was **${this.lastToolName}**` : "";
-    await this.say(`-# ${STEER_EMOJI} **steered mid-run**${nth}${was}`);
+    this.say(`-# ${STEER_EMOJI} **steered mid-run**${nth}${was}`);
   }
 
   /**
@@ -283,19 +383,28 @@ export class PilotSession {
     }
   }
 
-  /** Turn is over: stop the typing indicator and reset per-turn markers. */
+  /** Turn is over: flush output, stop typing, reset per-turn markers. */
   private endTurn(): void {
     this.turnActive = false;
     this.sawTurnOutput = false;
     this.steerCount = 0;
     this.stopTyping();
+    // The debounce must never outlive the turn, or the tail of a transcript
+    // sits in the buffer until the next message arrives.
+    void this.outbound.flush();
   }
 
-  /** Stop the session and kill its child process. */
-  async stop(reason = "stopped"): Promise<void> {
+  /**
+   * Stop the session and kill its child process. `notice` is relayed to the
+   * channel first, so a teardown the user did not ask for (an idle reap) can
+   * explain itself.
+   */
+  async stop(reason = "stopped", notice?: string): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.stopTyping();
+
+    if (notice) this.say(notice);
 
     const wake = this.wake;
     this.wake = null;
@@ -311,6 +420,7 @@ export class PilotSession {
     if (this.loop) {
       await this.loop.catch(() => {});
     }
+    await this.outbound.close();
   }
 
   // -------------------------------------------------------------------------
@@ -321,6 +431,8 @@ export class PilotSession {
     while (!this.closed) {
       while (this.queue.length > 0) {
         const next = this.queue.shift()!;
+        this.pendingReplay.push(next);
+        if (this.pendingReplay.length > REPLAY_LIMIT) this.pendingReplay.shift();
         yield next;
       }
       if (this.closed) return;
@@ -396,7 +508,9 @@ export class PilotSession {
       mcpServers: {
         discordclaw: createPilotMcpServer({
           channelId: this.channelId,
-          userId: this.lastUserId,
+          // A getter, not a value: the server is built once but the person
+          // talking changes, and ask_user / evolve_* must follow them.
+          getUserId: this.currentUserId,
         }),
       },
       systemPrompt: {
@@ -425,31 +539,89 @@ export class PilotSession {
     };
   }
 
+  /**
+   * Run the SDK session until it ends.
+   *
+   * A stored session id can go stale (the CLI prunes its own transcripts, or a
+   * restart lands on a different machine). Resuming it then fails immediately —
+   * before the `system/init` handshake — and every later turn in that thread
+   * hits the same wall. So a failure with no handshake is treated as a bad
+   * resume exactly once: forget the id, replay whatever the CLI never answered,
+   * and start fresh.
+   */
   private async run(): Promise<void> {
     ensurePilotDirs();
-    const options = this.buildOptions();
-
-    console.log(
-      `[pilot] starting SDK session for channel ${this.channelId} (cwd=${PILOT_WORKSPACE_DIR}${options.resume ? `, resume=${options.resume}` : ""})`,
-    );
 
     try {
-      const stream = query({ prompt: this.prompt(), options });
-      this.stream = stream;
-      for await (const message of stream) {
-        this.lastActivityAt = Date.now();
-        await this.relay(message);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const options = this.buildOptions();
+        const resumed = Boolean(options.resume);
+        this.sawInit = false;
+
+        // A retry inherits a queue that the previous attempt's endTurn() just
+        // marked idle, so re-arm the turn state before handing it over.
+        if (this.queue.length > 0) {
+          this.turnActive = true;
+          this.startTyping();
+        }
+
+        console.log(
+          `[pilot] starting SDK session for channel ${this.channelId} (cwd=${PILOT_WORKSPACE_DIR}${options.resume ? `, resume=${options.resume}` : ""})`,
+        );
+
+        try {
+          const stream = query({ prompt: this.prompt(), options });
+          this.stream = stream;
+          for await (const message of stream) {
+            this.lastActivityAt = Date.now();
+            await this.relay(message);
+          }
+          return;
+        } catch (err) {
+          if (this.closed) return;
+          const detail = err instanceof Error ? err.message : String(err);
+          console.error(`[pilot] session error for ${this.channelId}: ${detail}`);
+
+          if (resumed && !this.sawInit && attempt === 0) {
+            console.log(
+              `[pilot] resume failed for ${this.channelId} — clearing stored session id and starting fresh`,
+            );
+            clearPilotSessionId(this.channelId);
+            this.sdkSessionId = undefined;
+            // Drop the abandoned generator's waker so a message arriving during
+            // the retry can't be yielded into the dead stream.
+            this.wake = null;
+            this.requeueForReplay();
+            this.say(
+              "-# ⚠️ couldn't resume the previous pilot session — starting a fresh one (earlier context is gone)",
+            );
+            continue;
+          }
+
+          this.say(`⚠️ Pilot session error: ${detail.slice(0, 500)}`);
+          return;
+        } finally {
+          this.stream = null;
+          this.endTurn();
+        }
       }
-    } catch (err) {
-      if (this.closed) return;
-      const detail = err instanceof Error ? err.message : String(err);
-      console.error(`[pilot] session error for ${this.channelId}: ${detail}`);
-      await this.say(`⚠️ Pilot session error: ${detail.slice(0, 500)}`);
     } finally {
-      this.stream = null;
-      this.endTurn();
       removeSession(this.channelId, this);
     }
+  }
+
+  /**
+   * Put messages the CLI never answered back at the front of the queue, so a
+   * fresh session after a failed resume still does the work that was asked for.
+   * The stored session_id is dropped — the new session assigns its own.
+   */
+  private requeueForReplay(): void {
+    if (this.pendingReplay.length === 0) return;
+    const replay = this.pendingReplay.map(
+      (message) => ({ ...message, session_id: "" }) as SDKUserMessage,
+    );
+    this.pendingReplay = [];
+    this.queue = [...replay, ...this.queue];
   }
 
   // -------------------------------------------------------------------------
@@ -461,6 +633,7 @@ export class PilotSession {
       const subtype = (message as { subtype?: string }).subtype;
       const sessionId = (message as { session_id?: string }).session_id;
       if (subtype === "init") {
+        this.sawInit = true;
         // Feature-detect from the init handshake rather than sniffing versions.
         const caps = (message as { capabilities?: unknown }).capabilities;
         this.capabilities = Array.isArray(caps)
@@ -486,7 +659,7 @@ export class PilotSession {
           const text = b.text.trim();
           if (text) {
             this.sawTurnOutput = true;
-            await this.say(text);
+            this.say(text);
           }
         } else if (b.type === "tool_use") {
           this.sawTurnOutput = true;
@@ -494,14 +667,40 @@ export class PilotSession {
             typeof b.name === "string"
               ? b.name.replace(/^mcp__discordclaw__/, "")
               : "tool";
-          await this.say(this.formatToolUse(b));
+          if (typeof b.id === "string") this.rememberToolName(b.id, this.lastToolName);
+          this.sayProgress(this.formatToolUse(b));
         }
+      }
+      return;
+    }
+
+    // A tool that fails mid-turn is otherwise invisible: the model sees the
+    // error and may quietly work around it, leaving the channel with a gap.
+    if (message.type === "user") {
+      const blocks = (message as { message?: { content?: unknown } }).message
+        ?.content;
+      if (!Array.isArray(blocks)) return;
+      for (const block of blocks) {
+        const b = block as Record<string, unknown>;
+        if (b.type !== "tool_result" || b.is_error !== true) continue;
+        const name =
+          (typeof b.tool_use_id === "string" && this.toolNames.get(b.tool_use_id)) ||
+          "tool";
+        const detail = summariseToolResult(b.content);
+        this.sawTurnOutput = true;
+        this.sayProgress(
+          detail
+            ? `-# ⚠️ **${name}** failed · ${detail}`
+            : `-# ⚠️ **${name}** failed`,
+        );
       }
       return;
     }
 
     if (message.type === "result") {
       this.endTurn();
+      // The CLI answered, so nothing is left to replay.
+      this.pendingReplay = [];
       const result = message as {
         subtype?: string;
         is_error?: boolean;
@@ -512,10 +711,51 @@ export class PilotSession {
           typeof result.result === "string" && result.result
             ? result.result
             : (result.subtype ?? "unknown error");
-        await this.say(`⚠️ Pilot turn ended with an error: ${detail.slice(0, 500)}`);
+        this.say(`⚠️ Pilot turn ended with an error: ${detail.slice(0, 500)}`);
       }
+      const usageLine = this.formatUsage(message as Record<string, unknown>);
+      if (usageLine) this.say(usageLine);
+      void this.outbound.flush();
       return;
     }
+  }
+
+  /** Remember a tool_use id so its result can be labelled. Bounded. */
+  private rememberToolName(id: string, name: string): void {
+    this.toolNames.set(id, name);
+    if (this.toolNames.size > TOOL_NAME_CACHE_LIMIT) {
+      const oldest = this.toolNames.keys().next().value;
+      if (oldest !== undefined) this.toolNames.delete(oldest);
+    }
+  }
+
+  /**
+   * Per-turn usage footer, matching the main path's `-# 📊` line.
+   *
+   * `usage` is per-turn for the main loop, but `total_cost_usd` is cumulative
+   * across a streaming-input session, so the cost shown is the delta since the
+   * previous result.
+   */
+  private formatUsage(result: Record<string, unknown>): string | null {
+    const usage = result.usage as Record<string, unknown> | undefined;
+    if (!usage) return null;
+
+    const inTokens = num(usage.input_tokens);
+    const outTokens = num(usage.output_tokens);
+    const cacheRead = num(usage.cache_read_input_tokens);
+    const cacheCreate = num(usage.cache_creation_input_tokens);
+    if (inTokens + outTokens + cacheRead + cacheCreate === 0) return null;
+
+    const totalCost = num(result.total_cost_usd);
+    const turnCost = Math.max(0, totalCost - this.lastCostUsd);
+    if (totalCost > 0) this.lastCostUsd = totalCost;
+
+    const model = primaryModel(result.modelUsage) ?? "pilot";
+    const durationMs = num(result.duration_ms);
+    const cached = cacheRead > 0 ? ` (${fmtTokens(cacheRead)} cached)` : "";
+    const durationPart = durationMs > 0 ? ` · ${fmtDuration(durationMs)}` : "";
+
+    return `-# 📊 ${model} · ${fmtTokens(inTokens + cacheRead + cacheCreate)} in${cached} / ${fmtTokens(outTokens)} out · $${turnCost.toFixed(4)}${durationPart}`;
   }
 
   private formatToolUse(block: Record<string, unknown>): string {
@@ -541,15 +781,14 @@ export class PilotSession {
       : `-# ⚙️ **${shortName}**`;
   }
 
-  private async say(text: string): Promise<void> {
-    try {
-      await sendChunked(this.target, text);
-    } catch (err) {
-      console.error(
-        `[pilot] failed to send to ${this.channelId}:`,
-        err instanceof Error ? err.message : err,
-      );
-    }
+  /** Relay a line to the channel promptly, behind the shared send queue. */
+  private say(text: string): void {
+    this.outbound.push(text);
+  }
+
+  /** Relay a tool-progress line — merged with its neighbours, then sent. */
+  private sayProgress(text: string): void {
+    this.outbound.pushCoalescing(text);
   }
 
   // -------------------------------------------------------------------------
@@ -662,8 +901,12 @@ function startIdleReaper(): void {
   idleTimer = setInterval(() => {
     for (const [channelId, session] of [...sessions.entries()]) {
       if (session.idleMs > PILOT_IDLE_MS) {
+        const idleMinutes = Math.round(session.idleMs / 60_000);
         sessions.delete(channelId);
-        void session.stop(`reaped after ${Math.round(session.idleMs / 1000)}s idle`);
+        void session.stop(
+          `reaped after ${Math.round(session.idleMs / 1000)}s idle`,
+          `-# 💤 pilot session closed after ${idleMinutes}m idle — the next message resumes it`,
+        );
       }
     }
   }, IDLE_SWEEP_INTERVAL_MS);

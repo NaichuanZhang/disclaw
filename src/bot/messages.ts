@@ -29,6 +29,7 @@ import { isRestarting } from "../restart.js";
 import { transcribeAudio, getLastTranscriptionFailureSummary } from "../audio/transcribe.js";
 import { recordSignal } from "../reflection/signals.js";
 import { splitMessage, DISCORD_MAX_LENGTH } from "../shared/discord-utils.js";
+import { fmtDuration, fmtTokens } from "../shared/format.js";
 import { acquireSessionLock, SessionAbortedError } from "../agent/session-lock.js";
 import {
   isPilotChannelId,
@@ -175,21 +176,6 @@ function getModelPricing(model: string) {
   // Could add model-specific pricing here in the future
   void model;
   return PRICING.default;
-}
-
-/** Format token count: 1234 → "1.2k", 123456 → "123.5k" */
-function fmtTokens(n: number): string {
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
-  return String(n);
-}
-
-/** Format duration in seconds: 45200 → "45.2s", 125000 → "2m 5s" */
-function fmtDuration(ms: number): string {
-  const secs = ms / 1000;
-  if (secs < 60) return `${secs.toFixed(1)}s`;
-  const mins = Math.floor(secs / 60);
-  const remainSecs = Math.round(secs % 60);
-  return `${mins}m ${remainSecs}s`;
 }
 
 /** Build a single-line usage string for appending to the message */

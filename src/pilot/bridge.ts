@@ -25,8 +25,13 @@ import { handleEvolutionTool, setEvolutionContext } from "../evolution/tools.js"
 export interface PilotBridgeOptions {
   /** Channel the pilot session lives in — used as the default target. */
   channelId: string;
-  /** User the pilot session is talking to — used as the default mention. */
-  userId?: string;
+  /**
+   * Who the session is talking to *right now*, as a getter rather than a value.
+   * The MCP server is built once per session, so a captured string would freeze
+   * the first speaker forever — `ask_user` would mention them and every
+   * `evolve_*` call would be attributed to them no matter who is talking.
+   */
+  getUserId?: () => string | undefined;
 }
 
 /** MCP server name; tools appear to the model as `mcp__discordclaw__<name>`. */
@@ -93,7 +98,7 @@ async function runEvolutionTool(
   ctx: PilotBridgeOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   try {
-    setEvolutionContext(ctx.channelId, ctx.userId);
+    setEvolutionContext(ctx.channelId, ctx.getUserId?.());
     const result = await handleEvolutionTool(name, input);
     return textResult(result);
   } catch (err) {
@@ -110,7 +115,7 @@ async function runEvolutionTool(
  * pilot session.
  */
 export function createPilotMcpServer(options: PilotBridgeOptions) {
-  const { channelId, userId } = options;
+  const { channelId } = options;
 
   return createSdkMcpServer({
     name: PILOT_MCP_SERVER_NAME,
@@ -220,7 +225,7 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
             context: args.context,
             wait_seconds: args.wait_seconds,
             channel_id: args.channel_id ?? channelId,
-            user_id: args.user_id ?? userId,
+            user_id: args.user_id ?? options.getUserId?.(),
           }),
       ),
 
