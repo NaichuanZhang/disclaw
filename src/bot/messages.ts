@@ -25,6 +25,10 @@ import {
 } from "./thread-history.js";
 import type { Message as DbMessage, TokenUsage } from "../db/index.js";
 import { broadcastLog } from "../gateway/server.js";
+import {
+  savePilotAttachments,
+  formatAttachmentBlock,
+} from "../pilot/attachments.js";
 import { isRestarting } from "../restart.js";
 import { transcribeAudio, getLastTranscriptionFailureSummary } from "../audio/transcribe.js";
 import { recordSignal } from "../reflection/signals.js";
@@ -1303,14 +1307,7 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
   // 6e. Pilot mode pre-check — bail out before thread creation when there is
   // nothing a pilot session could act on, so we never leave an empty thread
   // behind. Placed after transcription so voice messages still work.
-  if (inPilotChannel && !cleanContent) {
-    if (hasImages || hasDocuments) {
-      await message
-        .reply(
-          "🧪 Pilot mode doesn't handle image/document attachments yet — send text (or a path to the file) instead.",
-        )
-        .catch(() => {});
-    }
+  if (inPilotChannel && !cleanContent && message.attachments.size === 0) {
     return;
   }
 
@@ -1335,10 +1332,74 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
   // replyTarget is still the channel, so we degrade to an in-channel session.
   if (inPilotChannel) {
     const target = replyTarget as unknown as PilotChannelTarget;
+
+    // A pilot session takes plain text, not content blocks, but it has its own
+    // Read tool — so attachments are downloaded into its workspace and handed
+    // over as absolute paths. Skipped ones are named, never silently dropped.
+    let pilotText = cleanContent;
+    if (message.attachments.size > 0) {
+      if ("sendTyping" in message.channel) {
+        message.channel.sendTyping().catch(() => {});
+      }
+      const result = await savePilotAttachments(
+        message.id,
+        [...message.attachments.values()].map((a) => ({
+          name: a.name,
+          url: a.url,
+          size: a.size,
+          contentType: a.contentType,
+        })),
+      );
+      const block = formatAttachmentBlock(result);
+      if (block) pilotText = pilotText ? `${pilotText}\n${block}` : block.trim();
+      console.log(
+        `[bot] Pilot attachments for ${target.id}: ${result.saved.length} saved, ${result.skipped.length} skipped`,
+      );
+    }
+
+    // Log the human side into the normal conversation tables so a pilot thread
+    // is visible to /history, the archive and get_conversation_history. The
+    // assistant side is written by the session itself, once per turn.
+    const pilotChannelName =
+      "name" in message.channel && message.channel.name ? message.channel.name : "DM";
+    let pilotLogSessionId: string | undefined;
+    try {
+      const pilotSessionRow = resolveSession({
+        threadId: sessionThreadId,
+        channelId: message.channelId,
+        userId: message.author.id,
+        guildId: message.guildId || undefined,
+        isDM,
+      });
+      pilotLogSessionId = pilotSessionRow.id;
+      addMessage({
+        sessionId: pilotSessionRow.id,
+        role: "user",
+        content: pilotText,
+        discordMessageId: message.id,
+      });
+      broadcastLog({
+        type: "message",
+        sessionId: pilotSessionRow.id,
+        role: "user",
+        content: pilotText,
+        channel: pilotChannelName,
+        user: message.author.username,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      console.error(
+        `[bot] Failed to log pilot message for ${target.id}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+
     submitToPilotSession(target, {
-      text: cleanContent,
+      text: pilotText,
       userId: message.author.id,
       userName: message.author.displayName ?? message.author.username,
+      logSessionId: pilotLogSessionId,
+      channelName: pilotChannelName,
       react: (emoji) => message.react(emoji),
     });
     console.log(

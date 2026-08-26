@@ -26,7 +26,8 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { DATA_DIR } from "../shared/paths.js";
-import { getChannelConfig, setChannelConfig } from "../db/index.js";
+import { getChannelConfig, setChannelConfig, addMessage } from "../db/index.js";
+import { broadcastLog } from "../gateway/server.js";
 import { sendChunked } from "../shared/discord-utils.js";
 import { fmtDuration, fmtTokens } from "../shared/format.js";
 import { buildPilotEnv } from "./env.js";
@@ -142,6 +143,14 @@ export interface PilotIncomingMessage {
   userId: string;
   userName: string;
   /**
+   * Conversation-row id (from `resolveSession`) this turn belongs to. When set,
+   * the session writes one assistant row per turn so pilot conversations land in
+   * the same archive/history as every other channel. Absent = no logging.
+   */
+  logSessionId?: string;
+  /** Channel name, for the log-viewer broadcast only. */
+  channelName?: string;
+  /**
    * Best-effort reaction hook on the Discord message this came from. Used to
    * mark a message that landed mid-turn; absent when the caller has no message
    * to react to.
@@ -247,6 +256,11 @@ export class PilotSession {
   private sawInit = false;
   /** Messages handed to the CLI but not yet answered, for resume replay. */
   private pendingReplay: SDKUserMessage[] = [];
+  /** Conversation row + channel name for logging, from the latest message. */
+  private logSessionId?: string;
+  private logChannelName?: string;
+  /** Assistant text relayed so far this turn, joined into one row at `result`. */
+  private turnText: string[] = [];
   /** tool_use id -> short tool name, so we can label failed results. */
   private toolNames = new Map<string, string>();
   /** Cost the last result reported — the SDK's total is cumulative. */
@@ -299,6 +313,8 @@ export class PilotSession {
     if (this.closed) return;
     this.lastActivityAt = Date.now();
     this.lastUserId = message.userId;
+    if (message.logSessionId) this.logSessionId = message.logSessionId;
+    if (message.channelName) this.logChannelName = message.channelName;
 
     // A steer is a message that lands after the turn already started talking.
     // Messages fired back-to-back before any output are just batched input, so
@@ -392,6 +408,9 @@ export class PilotSession {
 
   /** Turn is over: flush output, stop typing, reset per-turn markers. */
   private endTurn(): void {
+    // Before the flags reset: an interrupted or errored turn still said things,
+    // and logTurn() clears its own buffer, so this is safe to call on every path.
+    this.logTurn();
     this.turnActive = false;
     this.sawTurnOutput = false;
     this.steerCount = 0;
@@ -704,6 +723,7 @@ export class PilotSession {
           const text = b.text.trim();
           if (text) {
             this.sawTurnOutput = true;
+            this.turnText.push(text);
             this.say(text);
           }
         } else if (b.type === "tool_use") {
@@ -762,6 +782,40 @@ export class PilotSession {
       if (usageLine) this.say(usageLine);
       void this.outbound.flush();
       return;
+    }
+  }
+
+  /**
+   * Persist this turn's assistant text as one conversation row, so pilot output
+   * is visible to /history, the archive and `get_conversation_history` like any
+   * other channel. Best-effort: logging must never break a turn.
+   *
+   * What is stored is what the channel saw — relayed text, not tool detail.
+   */
+  private logTurn(): void {
+    const text = this.turnText.join("\n\n").trim();
+    this.turnText = [];
+    if (!this.logSessionId || !text) return;
+
+    try {
+      addMessage({
+        sessionId: this.logSessionId,
+        role: "assistant",
+        content: text,
+      });
+      broadcastLog({
+        type: "message",
+        sessionId: this.logSessionId,
+        role: "assistant",
+        content: text,
+        channel: this.logChannelName ?? this.channelId,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      console.error(
+        `[pilot] failed to log turn for ${this.channelId}:`,
+        err instanceof Error ? err.message : err,
+      );
     }
   }
 
