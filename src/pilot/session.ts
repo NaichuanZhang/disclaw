@@ -62,6 +62,21 @@ const IDLE_SWEEP_INTERVAL_MS = 60_000;
 /** Max characters of a tool input we echo into the channel. */
 const TOOL_PREVIEW_CHARS = 160;
 
+/**
+ * How long a single turn may run before it is interrupted. A wedged turn used
+ * to hang forever with the typing indicator on and no way back except /stop.
+ * Interrupt, not kill: the child and its context survive, so "continue" works.
+ */
+const PILOT_TURN_TIMEOUT_MS = Number(
+  process.env.PILOT_TURN_TIMEOUT_MS || 15 * 60 * 1000,
+);
+
+/**
+ * Soft per-turn spend warning (USD). 0 disables. Purely advisory — pilot never
+ * refuses to run because of cost, it just says so in the channel.
+ */
+const PILOT_TURN_MAX_COST_USD = Number(process.env.PILOT_TURN_MAX_COST_USD || 0);
+
 /** Reaction dropped on a message that steered a turn already in flight. */
 const STEER_EMOJI = "↩️";
 
@@ -234,6 +249,8 @@ export class PilotSession {
   private started = false;
 
   private turnActive = false;
+  /** Watchdog for the turn in flight — see PILOT_TURN_TIMEOUT_MS. */
+  private turnTimer: ReturnType<typeof setTimeout> | null = null;
   private typingTimer: ReturnType<typeof setInterval> | null = null;
   private lastActivityAt = Date.now();
   private lastUserId: string | undefined;
@@ -329,8 +346,7 @@ export class PilotSession {
       session_id: this.sdkSessionId ?? "",
     } as SDKUserMessage);
 
-    this.startTyping();
-    this.turnActive = true;
+    this.beginTurn();
 
     const wake = this.wake;
     this.wake = null;
@@ -407,10 +423,49 @@ export class PilotSession {
   }
 
   /** Turn is over: flush output, stop typing, reset per-turn markers. */
+  /** Mark a turn as running: typing indicator on, watchdog armed. */
+  private beginTurn(): void {
+    this.turnActive = true;
+    this.startTyping();
+    this.armTurnWatchdog();
+  }
+
+  /**
+   * Arm (or re-arm) the turn watchdog. Idempotent: a second message inside the
+   * same turn extends the deadline, which is what a user steering a long task
+   * expects.
+   */
+  private armTurnWatchdog(): void {
+    this.clearTurnWatchdog();
+    if (!(PILOT_TURN_TIMEOUT_MS > 0)) return;
+    this.turnTimer = setTimeout(() => {
+      this.turnTimer = null;
+      if (this.closed || !this.turnActive) return;
+      const minutes = Math.round(PILOT_TURN_TIMEOUT_MS / 60_000);
+      console.warn(
+        `[pilot] turn in ${this.channelId} exceeded ${minutes}m — interrupting`,
+      );
+      this.say(
+        `-# ⏱️ turn ran past ${minutes}m — interrupting it. The session keeps its context, so say "continue" to resume.`,
+      );
+      void this.interrupt();
+    }, PILOT_TURN_TIMEOUT_MS);
+    // Never hold the process open for a watchdog.
+    this.turnTimer.unref?.();
+  }
+
+  private clearTurnWatchdog(): void {
+    if (this.turnTimer) {
+      clearTimeout(this.turnTimer);
+      this.turnTimer = null;
+    }
+  }
+
   private endTurn(): void {
     // Before the flags reset: an interrupted or errored turn still said things,
     // and logTurn() clears its own buffer, so this is safe to call on every path.
     this.logTurn();
+    this.clearTurnWatchdog();
     this.turnActive = false;
     this.sawTurnOutput = false;
     this.steerCount = 0;
@@ -429,6 +484,7 @@ export class PilotSession {
     if (this.closed) return;
     this.closed = true;
     this.stopTyping();
+    this.clearTurnWatchdog();
 
     if (notice) this.say(notice);
 
@@ -615,8 +671,7 @@ export class PilotSession {
         // A retry inherits a queue that the previous attempt's endTurn() just
         // marked idle, so re-arm the turn state before handing it over.
         if (this.queue.length > 0) {
-          this.turnActive = true;
-          this.startTyping();
+          this.beginTurn();
         }
 
         console.log(
@@ -854,7 +909,11 @@ export class PilotSession {
     const cached = cacheRead > 0 ? ` (${fmtTokens(cacheRead)} cached)` : "";
     const durationPart = durationMs > 0 ? ` · ${fmtDuration(durationMs)}` : "";
 
-    return `-# 📊 ${model} · ${fmtTokens(inTokens + cacheRead + cacheCreate)} in${cached} / ${fmtTokens(outTokens)} out · $${turnCost.toFixed(4)}${durationPart}`;
+    const footer = `-# 📊 ${model} · ${fmtTokens(inTokens + cacheRead + cacheCreate)} in${cached} / ${fmtTokens(outTokens)} out · $${turnCost.toFixed(4)}${durationPart}`;
+    if (PILOT_TURN_MAX_COST_USD > 0 && turnCost > PILOT_TURN_MAX_COST_USD) {
+      return `${footer}\n-# 💸 that turn cost $${turnCost.toFixed(4)}, over the $${PILOT_TURN_MAX_COST_USD.toFixed(2)} soft cap`;
+    }
+    return footer;
   }
 
   private formatToolUse(block: Record<string, unknown>): string {
@@ -979,6 +1038,21 @@ export async function stopPilotSession(channelId: string): Promise<boolean> {
   await session.stop("stopped by request");
   sessions.delete(channelId);
   return true;
+}
+
+/**
+ * Forget everything pilot remembers about a channel: stop the live session and
+ * drop the stored SDK session id, so the next message starts a genuinely fresh
+ * session instead of resuming. This is what `/clear` means in a pilot channel —
+ * clearing our own conversation rows does nothing, because a pilot session
+ * keeps its context inside the CLI, not in our DB.
+ *
+ * Returns whether a live session was stopped.
+ */
+export async function resetPilotSession(channelId: string): Promise<boolean> {
+  const stopped = await stopPilotSession(channelId);
+  clearPilotSessionId(channelId);
+  return stopped;
 }
 
 /** Stop every pilot session. Returns how many were stopped. */

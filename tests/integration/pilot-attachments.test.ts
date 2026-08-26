@@ -257,6 +257,9 @@ describe("pilot message dispatch", () => {
     expect(sessionSrc).toContain("private logTurn(): void");
     expect(sessionSrc).toContain('role: "assistant"');
     // logTurn() lives in endTurn() so interrupted and errored turns log too.
-    expect(sessionSrc).toContain("this.logTurn();\n    this.turnActive = false;");
+    const endTurn = sessionSrc.slice(sessionSrc.indexOf("private endTurn()"));
+    const body = endTurn.slice(0, 500);
+    expect(body).toContain("this.logTurn();");
+    expect(body.indexOf("this.logTurn();")).toBeLessThan(body.indexOf("this.turnActive = false"));
   });
 });

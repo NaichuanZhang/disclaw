@@ -18,7 +18,11 @@ import { startVoice, stopVoice, isConnected } from "../voice/index.js";
 import {
   activePilotChannelIds,
   interruptPilotSession,
+  isPilotChannelId,
+  pilotConfigChannelId,
+  resetPilotSession,
   stopAllPilotSessions,
+  stopPilotSession,
 } from "../pilot/index.js";
 import { abortAllSessions, getActiveSessionInfo } from "../agent/session-lock.js";
 import { CAVEMAN_LEVELS, getCavemanLevel } from "../agent/agent.js";
@@ -120,6 +124,23 @@ export const slashCommands: ApplicationCommandData[] = [
   {
     name: "interrupt",
     description: "Stop the pilot session's current turn, keep its context",
+  },
+  {
+    name: "pilot",
+    description: "Turn pilot mode (Claude Agent SDK sessions) on or off here",
+    options: [
+      {
+        name: "state",
+        description: "on, off, or status (default: status)",
+        type: ApplicationCommandOptionType.String,
+        required: false,
+        choices: [
+          { name: "on", value: "on" },
+          { name: "off", value: "off" },
+          { name: "status", value: "status" },
+        ],
+      },
+    ],
   },
   {
     name: "soul",
@@ -451,6 +472,9 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
         break;
       case "interrupt":
         await handleInterrupt(interaction);
+        break;
+      case "pilot":
+        await handlePilot(interaction);
         break;
       case "soul":
         await handleSoul(interaction);
@@ -904,6 +928,7 @@ async function handleHelp(
           "`/clear` — Clear the current session",
           "`/stop` — Stop all active processing sessions",
           "`/interrupt` — Interrupt this channel's pilot turn (keeps context)",
+          "`/pilot on|off|status` — Toggle pilot mode (Claude Agent SDK) here",
           "`/soul` — Show the bot personality",
           "`/model` — Show the active model",
           "`/model name:<model>` — Switch models (persists across restarts)",
@@ -1031,6 +1056,33 @@ async function handleClear(
       ? interaction.channel.isThread()
       : false;
 
+  // In a pilot channel, our own conversation rows are not the context the model
+  // reads — the SDK session holds it inside the CLI. Clearing rows there looked
+  // like it worked and changed nothing, so /clear resets the pilot session
+  // instead: stop it and forget the stored resume id.
+  const pilotConfigId = pilotConfigChannelId({
+    channelId: interaction.channelId,
+    isDM,
+    isThread,
+    parentId:
+      interaction.channel && "parentId" in interaction.channel
+        ? interaction.channel.parentId
+        : null,
+  });
+  if (pilotConfigId && isPilotChannelId(pilotConfigId)) {
+    const stopped = await resetPilotSession(interaction.channelId);
+    await interaction.reply({
+      content: stopped
+        ? "Pilot session stopped and its context dropped. The next message starts a fresh one."
+        : "No live pilot session here — cleared the stored session id, so the next message starts fresh.",
+      ephemeral: true,
+    });
+    console.log(
+      `[bot] Pilot session ${interaction.channelId} reset by ${interaction.user.tag}`,
+    );
+    return;
+  }
+
   const session = resolveSession({
     threadId: isThread && interaction.channel ? interaction.channel.id : undefined,
     channelId: interaction.channelId,
@@ -1130,6 +1182,90 @@ async function handleInterrupt(
   });
   console.log(
     `[bot] pilot turn in ${channelId} interrupted by ${interaction.user.tag}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// /pilot
+//
+// Pilot mode is data (`channel_configs.settings.pilot`), so this command only
+// flips a flag — but it was previously a manual DB edit, which made an
+// experimental runtime awkward to turn off in a hurry.
+// ---------------------------------------------------------------------------
+
+async function handlePilot(
+  interaction: import("discord.js").ChatInputCommandInteraction,
+): Promise<void> {
+  const state = interaction.options.getString("state") ?? "status";
+
+  if (!interaction.guildId) {
+    await interaction.reply({
+      content: "Pilot mode is per guild channel — DMs always use the main agent.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const isThread =
+    interaction.channel &&
+    "isThread" in interaction.channel &&
+    typeof interaction.channel.isThread === "function"
+      ? interaction.channel.isThread()
+      : false;
+
+  // Threads inherit the flag from their parent, so that is the row to write.
+  const configId = pilotConfigChannelId({
+    channelId: interaction.channelId,
+    isDM: false,
+    isThread,
+    parentId:
+      interaction.channel && "parentId" in interaction.channel
+        ? interaction.channel.parentId
+        : null,
+  });
+
+  if (!configId) {
+    await interaction.reply({
+      content: "Can't work out which channel owns pilot mode here.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const enabled = isPilotChannelId(configId);
+  const scope = configId === interaction.channelId ? "this channel" : `<#${configId}>`;
+
+  if (state === "status") {
+    await interaction.reply({
+      content: enabled
+        ? `🧪 Pilot mode is **on** for ${scope} (${activePilotChannelIds().length} live session(s) bot-wide).`
+        : `Pilot mode is **off** for ${scope} — messages go to the main agent.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const turnOn = state === "on";
+  const existing = getChannelConfig(configId);
+  setChannelConfig(configId, {
+    settings: { ...(existing?.settings ?? {}), pilot: turnOn },
+  });
+
+  // Turning it off should also end whatever is running, or the old runtime
+  // keeps answering in this thread until it idles out.
+  let stopped = false;
+  if (!turnOn) {
+    stopped = await stopPilotSession(interaction.channelId);
+  }
+
+  await interaction.reply({
+    content: turnOn
+      ? `🧪 Pilot mode **on** for ${scope}. New messages open a Claude Agent SDK session per thread.`
+      : `Pilot mode **off** for ${scope}.${stopped ? " Stopped the live session here." : ""} Messages go back to the main agent.`,
+    ephemeral: true,
+  });
+  console.log(
+    `[bot] Pilot mode ${turnOn ? "enabled" : "disabled"} for ${configId} by ${interaction.user.tag}`,
   );
 }
 
