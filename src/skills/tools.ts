@@ -5,6 +5,22 @@
 import fs from "node:fs";
 import path from "node:path";
 import { SKILLS_DIR } from "../shared/paths.js";
+import { getSkillService } from "./service.js";
+
+/**
+ * A disabled skill is absent from the prompt listing, so a model only reaches
+ * for one by name — but the tools read straight off disk and used to serve it
+ * anyway, in both runtimes. Treat disabled as not installed.
+ */
+function disabledSkillError(skillName: string): string | null {
+  const skill = getSkillService()?.getByName(skillName);
+  if (skill && skill.enabled === false) {
+    return JSON.stringify({
+      error: `Skill "${skillName}" is disabled`,
+    });
+  }
+  return null;
+}
 
 export const skillTools = [
   {
@@ -63,6 +79,8 @@ export function handleSkillTool(
         if (!fs.existsSync(skillDir)) {
           return JSON.stringify({ error: `Skill "${skillName}" not found` });
         }
+        const disabled = disabledSkillError(skillName);
+        if (disabled) return disabled;
 
         // Path traversal protection
         const resolved = path.resolve(skillDir, file);
@@ -104,6 +122,8 @@ export function handleSkillTool(
         if (!fs.existsSync(skillDir)) {
           return JSON.stringify({ error: `Skill "${skillName}" not found` });
         }
+        const disabledList = disabledSkillError(skillName);
+        if (disabledList) return disabledList;
 
         const files = listFilesRecursive(skillDir, skillDir);
         return JSON.stringify({ skill: skillName, files });

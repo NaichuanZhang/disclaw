@@ -20,9 +20,11 @@ import {
   interruptPilotSession,
   isPilotChannelId,
   pilotConfigChannelId,
-  resetPilotSession,
+  activePilotSessionCount,
+  interruptPilotSessionsUnder,
+  resetPilotSessionScope,
+  stopPilotSessionsUnder,
   stopAllPilotSessions,
-  stopPilotSession,
 } from "../pilot/index.js";
 import { abortAllSessions, getActiveSessionInfo } from "../agent/session-lock.js";
 import { CAVEMAN_LEVELS, getCavemanLevel } from "../agent/agent.js";
@@ -494,10 +496,18 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
       case "leave":
         await handleLeave(interaction);
         break;
-      case "restart":
-        await interaction.reply({ content: "Restarting...", ephemeral: true });
+      case "restart": {
+        const livePilots = activePilotSessionCount();
+        await interaction.reply({
+          content:
+            livePilots > 0
+              ? `Restarting... (stopping ${livePilots} pilot session(s) first — their context is resumed after the restart)`
+              : "Restarting...",
+          ephemeral: true,
+        });
         triggerRestart();
         break;
+      }
       case "caveman":
         await handleCaveman(interaction);
         break;
@@ -688,6 +698,7 @@ async function handleModel(
         `${result.warning ? "⚠️" : "✅"} Model set to \`${result.model}\` for all channels, ` +
         `threads, and DMs${result.warning ? ` — ${result.warning}` : ""}.\n` +
         `-# Takes effect on the next message — replies already in flight keep the previous model. ` +
+        `A running pilot session keeps its model until it restarts (\`/clear\` in the channel forces that). ` +
         `Voice and the cycling coach are configured separately.`,
     });
     return;
@@ -894,6 +905,15 @@ async function handlePing(
         value: statusText,
         inline: false,
       },
+      ...(activePilotSessionCount() > 0
+        ? [
+            {
+              name: "Pilot",
+              value: `🧪 ${activePilotSessionCount()} live session(s)`,
+              inline: false,
+            },
+          ]
+        : []),
     )
     .setColor(allHealthy ? 0x57f287 : 0xed4245)
     .setTimestamp();
@@ -925,13 +945,13 @@ async function handleHelp(
           "`/config show` — View channel configuration",
           "`/config set-prompt <prompt>` — Set a channel system prompt",
           "`/config toggle` — Enable/disable bot in this channel",
-          "`/clear` — Clear the current session",
+          "`/clear` — Clear the current session (in a pilot channel: reset the pilot session)",
           "`/stop` — Stop all active processing sessions",
           "`/interrupt` — Interrupt this channel's pilot turn (keeps context)",
           "`/pilot on|off|status` — Toggle pilot mode (Claude Agent SDK) here",
           "`/soul` — Show the bot personality",
           "`/model` — Show the active model",
-          "`/model name:<model>` — Switch models (persists across restarts)",
+          "`/model name:<model>` — Switch models (persists across restarts; pilot sessions pick it up on their next session)",
           "`/join` — Join your voice channel as a voice assistant",
           "`/leave` — Leave the voice channel",
           "`/skills list` — List installed skills",
@@ -993,6 +1013,13 @@ async function handleConfig(
             name: "System Prompt",
             value: config?.systemPrompt || "_Not set_",
           },
+          {
+            name: "Runtime",
+            value: isPilotChannelId(channelId)
+              ? "🧪 Pilot (Claude Agent SDK) — the system prompt above is applied when a session starts"
+              : "Main agent",
+            inline: true,
+          },
         )
         .setColor(0x5865f2);
 
@@ -1009,7 +1036,7 @@ async function handleConfig(
       });
 
       await interaction.reply({
-        content: `Channel system prompt updated.`,
+        content: "Channel system prompt updated." + pilotPromptNote(channelId),
         ephemeral: true,
       });
       console.log(`[bot] System prompt set for channel ${channelId}`);
@@ -1070,11 +1097,15 @@ async function handleClear(
         : null,
   });
   if (pilotConfigId && isPilotChannelId(pilotConfigId)) {
-    const stopped = await resetPilotSession(interaction.channelId);
+    // Scope, not one channel: sessions are keyed to threads, so /clear in the
+    // parent channel used to report success while every thread session kept
+    // its context. This resets the channel and the threads under it.
+    const { stopped } = await resetPilotSessionScope(interaction.channelId);
     await interaction.reply({
-      content: stopped
-        ? "Pilot session stopped and its context dropped. The next message starts a fresh one."
-        : "No live pilot session here — cleared the stored session id, so the next message starts fresh.",
+      content:
+        stopped > 0
+          ? `Stopped ${stopped} pilot session(s) and dropped their context. The next message starts fresh.`
+          : "No live pilot session here — cleared the stored session id, so the next message starts fresh.",
       ephemeral: true,
     });
     console.log(
@@ -1153,7 +1184,26 @@ async function handleInterrupt(
   interaction: import("discord.js").ChatInputCommandInteraction,
 ): Promise<void> {
   const channelId = interaction.channelId;
-  const result = await interruptPilotSession(channelId);
+  let result = await interruptPilotSession(channelId);
+
+  if (!result) {
+    // Sessions are keyed to threads. Used in the parent pilot channel this
+    // command used to answer "no active session" while a turn was streaming one
+    // level down, so fall back to the sessions this channel owns.
+    const under = await interruptPilotSessionsUnder(channelId);
+    if (under.length > 1) {
+      const ok = under.filter((entry) => entry.result.ok).length;
+      const dropped = under.reduce((sum, e) => sum + e.result.dropped, 0);
+      await interaction.reply({
+        content: `⏹️ Interrupted **${ok}/${under.length}** pilot session(s) in this channel's threads. Dropped **${dropped}** queued message(s).`,
+      });
+      console.log(
+        `[bot] ${under.length} pilot turn(s) under ${channelId} interrupted by ${interaction.user.tag}`,
+      );
+      return;
+    }
+    result = under[0]?.result ?? null;
+  }
 
   if (!result) {
     await interaction.reply({
@@ -1192,6 +1242,32 @@ async function handleInterrupt(
 // flips a flag — but it was previously a manual DB edit, which made an
 // experimental runtime awkward to turn off in a hurry.
 // ---------------------------------------------------------------------------
+
+/**
+ * Suffix for settings that a pilot session only reads when it starts.
+ *
+ * A pilot child's system prompt is fixed for its lifetime, so a caveman level or
+ * channel prompt changed mid-session applies from the next one. Empty for
+ * non-pilot channels, so ordinary replies are unchanged.
+ */
+/**
+ * Suffix for skill changes, which a pilot session only sees in its start-up prompt.
+ *
+ * Skills are global, so this is keyed on live sessions rather than the invoking
+ * channel — and stays empty when none are running.
+ */
+function pilotSkillsNote(): string {
+  const live = activePilotSessionCount();
+  return live > 0
+    ? `\n-# 🧪 ${live} running pilot session(s) keep the skill list they started with — \`/clear\` in the pilot channel to reload.`
+    : "";
+}
+
+function pilotPromptNote(channelId: string): string {
+  return isPilotChannelId(channelId)
+    ? "\n-# 🧪 Pilot channel: a running session keeps the prompt it started with — `/clear` here to apply it now."
+    : "";
+}
 
 async function handlePilot(
   interaction: import("discord.js").ChatInputCommandInteraction,
@@ -1253,15 +1329,20 @@ async function handlePilot(
 
   // Turning it off should also end whatever is running, or the old runtime
   // keeps answering in this thread until it idles out.
-  let stopped = false;
+  // Sessions are keyed to threads, so stopping only `interaction.channelId`
+  // left every thread session of a parent channel running until the idle reaper.
+  let stopped = 0;
   if (!turnOn) {
-    stopped = await stopPilotSession(interaction.channelId);
+    stopped = await stopPilotSessionsUnder(interaction.channelId);
+    if (interaction.channelId !== configId) {
+      stopped += await stopPilotSessionsUnder(configId);
+    }
   }
 
   await interaction.reply({
     content: turnOn
       ? `🧪 Pilot mode **on** for ${scope}. New messages open a Claude Agent SDK session per thread.`
-      : `Pilot mode **off** for ${scope}.${stopped ? " Stopped the live session here." : ""} Messages go back to the main agent.`,
+      : `Pilot mode **off** for ${scope}.${stopped ? ` Stopped ${stopped} live session(s).` : ""} Messages go back to the main agent.`,
     ephemeral: true,
   });
   console.log(
@@ -1328,7 +1409,7 @@ async function handleSkills(
       try {
         const skill = await skillService.installFromGitHub({ url, name });
         await interaction.editReply({
-          content: `Skill **${skill.name}** installed from GitHub.`,
+          content: `Skill **${skill.name}** installed from GitHub.` + pilotSkillsNote(),
         });
         console.log(`[bot] Skill installed via /skills add-github: ${skill.name}`);
       } catch (err) {
@@ -1358,7 +1439,7 @@ async function handleSkills(
 
         const skill = await skillService.installFromUpload({ content, name });
         await interaction.editReply({
-          content: `Skill **${skill.name}** installed from upload.`,
+          content: `Skill **${skill.name}** installed from upload.` + pilotSkillsNote(),
         });
         console.log(`[bot] Skill installed via /skills add-file: ${skill.name}`);
       } catch (err) {
@@ -1391,7 +1472,7 @@ async function handleSkills(
       }
 
       await interaction.reply({
-        content: `Skill **${name}** removed.`,
+        content: `Skill **${name}** removed.` + pilotSkillsNote(),
         ephemeral: true,
       });
       console.log(`[bot] Skill removed via /skills remove: ${name}`);
@@ -1451,6 +1532,20 @@ function formatJobModel(job: CronJob): string {
 }
 
 /**
+ * True when an agent-turn job delivers into a pilot channel, so its run is
+ * routed to a pilot session (in a per-run thread) rather than the main agent.
+ *
+ * Only the delivery channel is checked — a job delivering into a thread whose
+ * parent is the pilot channel still routes to pilot at run time, but resolving
+ * that here would need a channel fetch, so the annotation is conservative.
+ */
+function isPilotRoutedJob(job: CronJob): boolean {
+  if (job.payload.kind !== "agentTurn") return false;
+  const channelId = job.delivery?.channelId;
+  return channelId ? isPilotChannelId(channelId) : false;
+}
+
+/**
  * Parse a schedule string from the user into a CronSchedule.
  */
 function parseScheduleInput(input: string, tz?: string): CronSchedule {
@@ -1506,7 +1601,8 @@ async function handleCron(
           job.payload.kind === "agentTurn" && job.payload.model
             ? ` · Model: \`${job.payload.model}\``
             : "";
-        return `${status} **${job.name}** (\`${job.id}\`)\n  Schedule: ${schedule} · Next: ${nextRun}${model}`;
+        const pilot = isPilotRoutedJob(job) ? " · 🧪 pilot" : "";
+        return `${status} **${job.name}** (\`${job.id}\`)\n  Schedule: ${schedule} · Next: ${nextRun}${model}${pilot}`;
       });
 
       const embed = new EmbedBuilder()
@@ -1594,8 +1690,12 @@ async function handleCron(
         ? `\nModel: \`${model}\`${modelWarning ? ` (⚠️ ${modelWarning})` : ""}`
         : "";
 
+      const pilotNote = isPilotChannelId(deliveryChannelId)
+        ? "\n-# 🧪 Delivers into a pilot channel — each run gets its own thread and pilot session."
+        : "";
+
       await interaction.editReply({
-        content: `✅ Cron job **${name}** created (\`${job.id}\`). Next run: ${nextRun}${modelNote}`,
+        content: `✅ Cron job **${name}** created (\`${job.id}\`). Next run: ${nextRun}${modelNote}${pilotNote}`,
       });
       console.log(`[bot] Cron job created via /cron add: "${name}" (${job.id})`);
       break;
@@ -1638,11 +1738,17 @@ async function handleCron(
         return;
       }
 
+      const setModelPilotNote = isPilotRoutedJob(job)
+        ? "\n-# 🧪 This job routes to a pilot session, which starts on this model."
+        : "";
+
       await interaction.editReply({
-        content: result.model
-          ? `${result.warning ? "⚠️" : "✅"} Job **${job.name}** will now run on \`${result.model}\`` +
-            `${result.warning ? ` — ${result.warning}` : ""}.`
-          : `✅ Job **${job.name}** now inherits the global model (\`${resolveModel()}\`).`,
+        content:
+          (result.model
+            ? `${result.warning ? "⚠️" : "✅"} Job **${job.name}** will now run on \`${result.model}\`` +
+              `${result.warning ? ` — ${result.warning}` : ""}.`
+            : `✅ Job **${job.name}** now inherits the global model (\`${resolveModel()}\`).`) +
+          setModelPilotNote,
       });
       console.log(
         `[bot] Cron job model set via /cron set-model: "${job.name}" (${id}) → ${result.model ?? "inherit"}`,
@@ -1816,7 +1922,13 @@ function buildJobDetailEmbed(job: CronJob): EmbedBuilder {
     { name: "Next Run", value: nextRun, inline: false },
     { name: "Last Run", value: lastRun, inline: false },
     { name: "Payload", value: payload, inline: false },
-    { name: "Model", value: formatJobModel(job), inline: false },
+    {
+      name: "Model",
+      value:
+        formatJobModel(job) +
+        (isPilotRoutedJob(job) ? " · applies to the pilot session this job runs on" : ""),
+      inline: false,
+    },
     { name: "Delivery", value: delivery, inline: false },
   ];
 
@@ -1876,7 +1988,8 @@ async function handleCaveman(
       settings,
     });
     await interaction.reply({
-      content: "🪨 Caveman mode **off** for this channel.",
+      content:
+        "🪨 Caveman mode **off** for this channel." + pilotPromptNote(channelId),
       ephemeral: true,
     });
     console.log(`[bot] Caveman mode disabled for channel ${channelId} by ${interaction.user.tag}`);
@@ -1898,7 +2011,9 @@ async function handleCaveman(
   });
 
   await interaction.reply({
-    content: `🪨 Caveman mode **on** for this channel — level \`${level}\`. Say "stop caveman" or run \`/caveman level:off\` to disable.`,
+    content:
+      `🪨 Caveman mode **on** for this channel — level \`${level}\`. Say "stop caveman" or run \`/caveman level:off\` to disable.` +
+      pilotPromptNote(channelId),
     ephemeral: true,
   });
   console.log(`[bot] Caveman mode set to "${level}" for channel ${channelId} by ${interaction.user.tag}`);

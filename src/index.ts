@@ -5,6 +5,7 @@ import {
   initPilot,
   isPilotChannelId,
   planPilotCronRoute,
+  stopAllPilotSessions,
   submitToPilotSession,
 } from "./pilot/index.js";
 import { expireStalePendingQuestions } from "./agent/questions.js";
@@ -103,17 +104,14 @@ async function runCronAgentTurn(
           )
         : channel;
 
-      if (model) {
-        console.warn(
-          `[cron] Job "${context?.jobName}" sets model "${model}", ignored for pilot sessions`,
-        );
-      }
-
       submitToPilotSession(target, {
         text: message,
         userId: ADMIN_USER_ID,
         userName: "cron",
         channelName: context?.jobName ? `cron:${context.jobName}` : "cron",
+        // A fresh thread means a fresh session, so a per-job model override is
+        // applied for real rather than logged and dropped.
+        modelOverride: model,
       });
       console.log(
         `[cron] Routed agentTurn "${context?.jobName}" to pilot session ${target.id}`,
@@ -450,6 +448,13 @@ async function main(): Promise<void> {
       stopMemoryWatcher();
       skillService.stop();
       gateway.close();
+      // process.exit() runs neither SIGTERM nor beforeExit, so the pilot
+      // teardown hooks never fire — without this, every pilot child is orphaned
+      // until the next boot's sweep.
+      const stoppedPilots = await stopAllPilotSessions();
+      if (stoppedPilots > 0) {
+        console.log(`[discordclaw] Stopped ${stoppedPilots} pilot session(s)`);
+      }
       await stopBot(client);
 
       process.exit(100);
