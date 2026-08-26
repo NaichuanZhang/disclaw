@@ -33,6 +33,13 @@ import { buildPilotEnv } from "./env.js";
 import { createPilotMcpServer } from "./bridge.js";
 import { PilotRelayQueue } from "./relay-queue.js";
 import { getSkillService } from "../skills/service.js";
+import { getSoul } from "../soul/soul.js";
+import { recordSignal } from "../reflection/signals.js";
+import {
+  MEMORY_RECALL_INSTRUCTIONS,
+  buildCavemanInstructions,
+  getCavemanLevel,
+} from "../shared/prompt-fragments.js";
 import { EVOLUTION_INSTRUCTIONS } from "../evolution/instructions.js";
 
 // ---------------------------------------------------------------------------
@@ -447,6 +454,30 @@ export class PilotSession {
   // -------------------------------------------------------------------------
 
   /**
+   * SOUL.md and the memory-recall rules — the bot's identity and habits, shared
+   * verbatim with the main agent. Without them a pilot channel answered as a
+   * generic Claude Code session and never searched memory unasked.
+   */
+  private buildIdentityPrompt(): string {
+    const parts: string[] = [];
+    const soul = getSoul();
+    if (soul) parts.push(`## Soul\n\n${soul}`);
+    parts.push(MEMORY_RECALL_INSTRUCTIONS);
+    return `\n\n${parts.join("\n\n")}`;
+  }
+
+  /**
+   * Caveman mode, if /caveman is on for this channel. Read when the session
+   * starts: the system prompt is fixed for the life of the SDK child, so a
+   * level changed mid-session applies from the next session (idle reap, /stop).
+   */
+  private buildCavemanPrompt(): string {
+    const level = getCavemanLevel(getChannelConfig(this.channelId));
+    if (!level) return "";
+    return `\n\n${buildCavemanInstructions(level)}`;
+  }
+
+  /**
    * Skills are shared with the main agent: the same metadata listing, loaded
    * on demand through the bridged read_skill / list_skill_files tools. The SDK
    * prefixes MCP tool names, so the prompt points at the prefixed forms.
@@ -529,7 +560,11 @@ export class PilotSession {
           "",
           "New user messages can arrive while you are still working. Treat them as",
           "additional instructions from the same person and adapt mid-task.",
-        ].join("\n") + this.buildSkillsPrompt() + this.buildEvolutionPrompt(),
+        ].join("\n") +
+          this.buildIdentityPrompt() +
+          this.buildSkillsPrompt() +
+          this.buildEvolutionPrompt() +
+          this.buildCavemanPrompt(),
       },
       ...(resume ? { resume } : {}),
       stderr: (data: string) => {
@@ -581,6 +616,16 @@ export class PilotSession {
           if (this.closed) return;
           const detail = err instanceof Error ? err.message : String(err);
           console.error(`[pilot] session error for ${this.channelId}: ${detail}`);
+          // Feed the reflection daemon the same way agent errors do, so pilot
+          // failures are visible to self-improvement instead of console-only.
+          recordSignal({
+            type: "error",
+            source: "pilot",
+            detail: `Pilot session error: ${detail.slice(0, 300)}`,
+            metadata: { channelId: this.channelId, resumed, attempt },
+            sessionId: this.sdkSessionId,
+            userId: this.lastUserId,
+          });
 
           if (resumed && !this.sawInit && attempt === 0) {
             console.log(
