@@ -36,6 +36,7 @@ import { splitMessage, DISCORD_MAX_LENGTH } from "../shared/discord-utils.js";
 import { fmtDuration, fmtTokens } from "../shared/format.js";
 import { acquireSessionLock, SessionAbortedError } from "../agent/session-lock.js";
 import {
+  hasLivePilotSession,
   isPilotChannelId,
   pilotConfigChannelId,
   submitToPilotSession,
@@ -816,8 +817,19 @@ function isMonitoredChannel(message: DiscordMessage): boolean {
  * Threads inherit pilot mode from their parent channel — same semantics as
  * isMonitoredChannel — so pilot conversations get the normal Discord threading
  * behaviour with one isolated SDK session per thread.
+ *
+ * A live session in this exact channel also counts, independently of the flag,
+ * so cron-spawned sessions in unflagged channels can be replied to.
  */
 function isPilotChannel(message: DiscordMessage): boolean {
+  // A channel that already has a live session keeps talking to it, flag or not.
+  // Cron runs every agent turn on the SDK now, including in channels nobody
+  // flagged, so without this a reply to a cron report inside the thread that
+  // report was written in would be answered by the main agent loop — a second
+  // runtime with none of that session's context. Once the session is stopped or
+  // idle-reaped, routing goes back to the channel flag on its own.
+  if (hasLivePilotSession(message.channelId)) return true;
+
   const configChannelId = pilotConfigChannelId({
     channelId: message.channelId,
     isDM: message.channel.isDMBased(),

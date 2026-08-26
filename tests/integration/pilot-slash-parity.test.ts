@@ -204,11 +204,14 @@ describe("settings that only apply on the next session say so", () => {
 // ---------------------------------------------------------------------------
 
 describe("/cron marks pilot-routed jobs", () => {
-  it("has a predicate based on the delivery channel", () => {
+  it("has a predicate based on the payload kind and the cron runtime", () => {
+    // It used to read the delivery channel's pilot flag. Every agent turn now
+    // runs on an SDK session, so the only questions left are whether the job
+    // runs an agent at all and whether the CRON_RUNTIME=main hatch is set.
     const fn = fnBody(commandsSrc, "function isPilotRoutedJob(");
-    expect(fn).toContain("job.delivery?.channelId");
-    expect(fn).toContain("isPilotChannelId(");
     expect(fn).toContain('job.payload.kind !== "agentTurn"');
+    expect(fn).toContain('cronAgentRuntime() === "sdk"');
+    expect(fn).not.toContain("isPilotChannelId(");
   });
 
   it("annotates list, show and set-model", () => {
