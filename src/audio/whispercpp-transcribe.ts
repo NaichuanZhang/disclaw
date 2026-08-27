@@ -231,6 +231,136 @@ function cleanTranscript(raw: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// whisper-cli core
+// ---------------------------------------------------------------------------
+
+/**
+ * Run whisper-cli against an already-prepared 16kHz mono 16-bit PCM WAV file
+ * and return the cleaned transcript (or null when nothing usable came out).
+ *
+ * Shared by both entry points: the URL path (which downloads + converts with
+ * ffmpeg first) and the PCM path (which already has the right format).
+ *
+ * @param wavPath - path to a 16kHz mono PCM16 WAV file
+ * @param label - human-readable description for the log lines
+ */
+async function runWhisperCli(
+  wavPath: string,
+  label: string,
+): Promise<string | null> {
+  console.log(`[whispercpp] Transcribing ${label} locally...`);
+  const startedAt = Date.now();
+
+  const result = await runCommand(
+    binPath(),
+    [
+      "-m",
+      modelPath(),
+      "-f",
+      wavPath,
+      "-t",
+      threadCount(),
+      "-nt", // no timestamps — plain text only
+      "-np", // no progress/system prints, keeps stdout clean
+    ],
+    { timeoutMs: 5 * 60 * 1000 },
+  );
+
+  if (result.code !== 0) {
+    throw new Error(
+      `whisper-cli failed (exit ${result.code}): ${shortDetail(result, 500)}`,
+    );
+  }
+
+  const text = cleanTranscript(result.stdout);
+  const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+
+  if (!text) {
+    console.log(
+      `[whispercpp] Completed in ${elapsed}s but produced no speech text (silent or non-speech audio).`,
+    );
+    return null;
+  }
+
+  console.log(
+    `[whispercpp] Transcribed in ${elapsed}s (${text.length} chars): "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`,
+  );
+  return text;
+}
+
+/**
+ * Minimal RIFF/WAVE header for 16-bit mono PCM.
+ */
+function wavHeader(sampleCount: number, sampleRate: number): Buffer {
+  const dataBytes = sampleCount * 2;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataBytes, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16); // fmt chunk size
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28); // byte rate
+  header.writeUInt16LE(2, 32); // block align
+  header.writeUInt16LE(16, 34); // bits per sample
+  header.write("data", 36);
+  header.writeUInt32LE(dataBytes, 40);
+  return header;
+}
+
+/**
+ * Transcribe raw 16kHz mono PCM16 samples via whisper.cpp.
+ *
+ * This is the entry point for the realtime voice pipelines, which already
+ * produce exactly the format whisper.cpp wants — so unlike the URL path there
+ * is no download and no ffmpeg conversion, just a WAV header and the binary.
+ *
+ * Returns the transcript, or null when the backend is unavailable or the audio
+ * held no usable speech.
+ *
+ * @param pcm16kMono - Int16Array of 16kHz mono samples
+ * @param sampleRate - sample rate of the input (default 16000)
+ */
+export async function transcribePcm16kWhisperCpp(
+  pcm16kMono: Int16Array,
+  sampleRate = 16_000,
+): Promise<string | null> {
+  const ready = await ensureWhisperCppReady();
+  if (!ready) {
+    console.log(
+      `[whispercpp] backend unavailable — skipping. Reason: ${setupFailureReason || "unknown"}`,
+    );
+    return null;
+  }
+
+  const wavPath = join(
+    tmpdir(),
+    `discordclaw-utterance-${randomBytes(8).toString("hex")}.16k.wav`,
+  );
+  const durationSec = pcm16kMono.length / sampleRate;
+
+  try {
+    writeFileSync(
+      wavPath,
+      Buffer.concat([
+        wavHeader(pcm16kMono.length, sampleRate),
+        Buffer.from(pcm16kMono.buffer, pcm16kMono.byteOffset, pcm16kMono.byteLength),
+      ]),
+    );
+
+    return await runWhisperCli(wavPath, `${durationSec.toFixed(1)}s utterance`);
+  } finally {
+    try {
+      if (existsSync(wavPath)) unlinkSync(wavPath);
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Transcribe
 // ---------------------------------------------------------------------------
 
@@ -291,46 +421,10 @@ export async function transcribeAudioWhisperCpp(
       );
     }
 
-    console.log(
-      `[whispercpp] Transcribing ${filename || "voice message"} locally (${audioBuffer.length} bytes)...`,
+    return await runWhisperCli(
+      wavPath,
+      `${filename || "voice message"} (${audioBuffer.length} bytes)`,
     );
-    const startedAt = Date.now();
-
-    const result = await runCommand(
-      binPath(),
-      [
-        "-m",
-        modelPath(),
-        "-f",
-        wavPath,
-        "-t",
-        threadCount(),
-        "-nt", // no timestamps — plain text only
-        "-np", // no progress/system prints, keeps stdout clean
-      ],
-      { timeoutMs: 5 * 60 * 1000 },
-    );
-
-    if (result.code !== 0) {
-      throw new Error(
-        `whisper-cli failed (exit ${result.code}): ${shortDetail(result, 500)}`,
-      );
-    }
-
-    const text = cleanTranscript(result.stdout);
-    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-
-    if (!text) {
-      console.log(
-        `[whispercpp] Completed in ${elapsed}s but produced no speech text (silent or non-speech audio).`,
-      );
-      return null;
-    }
-
-    console.log(
-      `[whispercpp] Transcribed in ${elapsed}s (${text.length} chars): "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`,
-    );
-    return text;
   } finally {
     for (const p of [rawPath, wavPath]) {
       try {

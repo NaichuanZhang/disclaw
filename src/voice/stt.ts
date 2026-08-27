@@ -1,26 +1,40 @@
 /**
- * Speech-to-Text client using EigenAI Whisper V3 Turbo.
+ * Speech-to-Text for the realtime voice pipelines.
  *
- * Takes PCM audio (16kHz mono Int16) → wraps in WAV → sends to EigenAI API → returns text.
+ * Takes PCM audio (16kHz mono Int16) and transcribes it **locally** via
+ * whisper.cpp — the same backend the Discord voice-message path uses, so
+ * audio never leaves the machine and there is no per-utterance API cost.
+ *
+ * Previously this called EigenAI Whisper V3 Turbo. EigenAI dropped its audio
+ * models (the endpoint now answers `500 {"detail":"Unsupported category"}`),
+ * so that path is gone. Measured on a 2.3s utterance, local whisper.cpp is
+ * also *faster* than the remote services it replaced (~1.65s vs ~2.45s).
+ *
+ * An optional remote fallback (ElevenLabs Scribe) can be enabled with
+ * VOICE_STT_REMOTE_FALLBACK=1 for hosts where whisper.cpp cannot be built, or
+ * when non-English input matters — `base.en` is English-only.
  */
 
 import { VAD_SAMPLE_RATE } from "./receiver.js";
+import { transcribePcm16kWhisperCpp } from "../audio/whispercpp-transcribe.js";
 
 // ---------------------------------------------------------------------------
-// Constants
+// Remote fallback (opt-in)
 // ---------------------------------------------------------------------------
 
-const EIGENAI_STT_URL = "https://api-web.eigenai.com/api/v1/generate";
-const EIGENAI_MODEL = "whisper_v3_turbo";
+const SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text";
+const SCRIBE_MODEL = "scribe_v1";
 
-// ---------------------------------------------------------------------------
-// WAV encoding
-// ---------------------------------------------------------------------------
+/** True when the operator opted into the remote fallback. */
+function remoteFallbackEnabled(): boolean {
+  return process.env.VOICE_STT_REMOTE_FALLBACK === "1";
+}
 
 /**
- * Wrap raw PCM Int16 samples in a WAV header.
+ * Wrap raw PCM Int16 samples in a WAV header, for the multipart upload the
+ * remote fallback needs.
  */
-function encodeWav(samples: Int16Array, sampleRate: number, channels: number = 1): Buffer {
+function encodeWav(samples: Int16Array, sampleRate: number, channels = 1): Buffer {
   const bytesPerSample = 2; // Int16
   const dataSize = samples.length * bytesPerSample;
   const headerSize = 44;
@@ -45,10 +59,48 @@ function encodeWav(samples: Int16Array, sampleRate: number, channels: number = 1
   buffer.write("data", 36);
   buffer.writeUInt32LE(dataSize, 40);
 
-  // Copy PCM data
   Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength).copy(buffer, headerSize);
 
   return buffer;
+}
+
+/**
+ * Transcribe via ElevenLabs Scribe. Only called when the local backend is
+ * unavailable *and* VOICE_STT_REMOTE_FALLBACK=1.
+ */
+async function transcribeRemote(pcm16kMono: Int16Array): Promise<string> {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  if (!apiKey) {
+    console.warn("[stt] remote fallback enabled but ELEVENLABS_API_KEY is not set");
+    return "";
+  }
+
+  const wavBuffer = encodeWav(pcm16kMono, VAD_SAMPLE_RATE);
+  const durationSec = pcm16kMono.length / VAD_SAMPLE_RATE;
+
+  const formData = new FormData();
+  formData.append("model_id", SCRIBE_MODEL);
+  formData.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "utterance.wav");
+
+  const startTime = Date.now();
+  const response = await fetch(SCRIBE_URL, {
+    method: "POST",
+    headers: { "xi-api-key": apiKey },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "unknown error");
+    console.error(`[stt] ❌ Scribe error ${response.status}: ${errText}`);
+    return "";
+  }
+
+  const data = (await response.json()) as { text?: string };
+  const text = (data.text ?? "").trim();
+  console.log(
+    `[stt] ✅ Scribe transcribed in ${Date.now() - startTime}ms (${durationSec.toFixed(1)}s audio): "${text}"`,
+  );
+  return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -56,50 +108,31 @@ function encodeWav(samples: Int16Array, sampleRate: number, channels: number = 1
 // ---------------------------------------------------------------------------
 
 /**
- * Transcribe PCM audio to text using EigenAI Whisper.
+ * Transcribe PCM audio to text.
+ *
  * @param pcm16kMono Int16Array of 16kHz mono audio samples
- * @returns Transcribed text, or empty string if nothing was detected
+ * @returns Transcribed text, or an empty string if nothing was detected
  */
 export async function transcribe(pcm16kMono: Int16Array): Promise<string> {
-  const apiKey = process.env.EIGENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error("EIGENAI_API_KEY environment variable is not set");
-  }
-
-  // Encode as WAV
-  const wavBuffer = encodeWav(pcm16kMono, VAD_SAMPLE_RATE);
   const durationSec = pcm16kMono.length / VAD_SAMPLE_RATE;
+  console.log(`[stt] Transcribing ${durationSec.toFixed(1)}s audio locally (whisper.cpp)`);
 
-  console.log(`[stt] Sending ${durationSec.toFixed(1)}s audio (${wavBuffer.length} bytes WAV) to ${EIGENAI_MODEL}`);
-
-  // Build multipart form data
-  const formData = new FormData();
-  formData.append("model", EIGENAI_MODEL);
-  formData.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "utterance.wav");
-  formData.append("language", "en");
-  formData.append("response_format", "json");
-
-  const startTime = Date.now();
-
-  const response = await fetch(EIGENAI_STT_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: formData,
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "unknown error");
-    console.error(`[stt] ❌ API error ${response.status}: ${errText}`);
-    throw new Error(`EigenAI STT failed (${response.status}): ${errText}`);
+  try {
+    const text = await transcribePcm16kWhisperCpp(pcm16kMono, VAD_SAMPLE_RATE);
+    if (text) return text;
+    // null means the backend was unavailable or the audio held no speech.
+    // Fall through to the remote fallback only if one is configured.
+  } catch (err) {
+    console.error("[stt] local whisper.cpp failed:", err);
   }
 
-  const data = await response.json() as { text?: string };
-  const elapsed = Date.now() - startTime;
-  const text = (data.text ?? "").trim();
+  if (remoteFallbackEnabled()) {
+    try {
+      return await transcribeRemote(pcm16kMono);
+    } catch (err) {
+      console.error("[stt] remote fallback failed:", err);
+    }
+  }
 
-  console.log(`[stt] ✅ Transcribed in ${elapsed}ms (${durationSec.toFixed(1)}s audio): "${text}"`);
-
-  return text;
+  return "";
 }

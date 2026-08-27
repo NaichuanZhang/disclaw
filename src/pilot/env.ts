@@ -8,7 +8,8 @@
 // through Bash sees them too.
 //
 // There used to be an allowlist here that stripped secrets. It was removed on
-// request along with the (already unenforced) tool-call policy in policy.ts.
+// request, along with the (already unenforced) tool-call policy that lived
+// beside it.
 // To restore the boundary, filter `source` through an explicit allowlist again
 // instead of spreading it.
 // ---------------------------------------------------------------------------
