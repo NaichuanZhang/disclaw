@@ -5,10 +5,10 @@
  *
  * Flow:
  *   User speaks → opus decode → downsample → Silero VAD → utterance detection
- *   → EigenAI Whisper STT → Claude Sonnet → EigenAI Chatterbox TTS (streaming) → play audio
+ *   → local whisper.cpp STT → Claude → ElevenLabs TTS (streaming) → play audio
  *
- * TTS streaming: each sentence gets streamed via SSE — playback starts as soon
- * as the first PCM chunk arrives (~500ms) instead of waiting for full synthesis (~1.4s).
+ * TTS streaming: each sentence is streamed over HTTP chunked transfer — playback
+ * starts as soon as the first mp3 chunk arrives instead of waiting for full synthesis.
  */
 
 import {

@@ -1,16 +1,9 @@
 /**
- * Voice-optimized agent — supports both Anthropic (Claude) and Eigen LLM backends.
+ * Voice-optimized agent, on Anthropic (Claude).
  *
  * Uses a short max_tokens limit and a voice-specific system prompt that produces
- * spoken-style responses (no markdown, no lists, 1-3 sentences).
- *
- * Backend selection:
- *   - VOICE_MODEL=eigen:qwen3-8b-fp8  → Eigen LLM (OpenAI-compatible, ~350ms TTFT)
- *   - VOICE_MODEL=bedrock-claude-haiku-4-5 → Anthropic/Bedrock (~900ms TTFT)
- *
- * When using Eigen backend, tools are disabled (small models don't support
- * tool_use reliably). The agent runs in pure text-in/text-out mode for minimum
- * latency.
+ * spoken-style responses (no markdown, no lists, 1-3 sentences). Pick the model
+ * with VOICE_MODEL (e.g. bedrock-claude-haiku-4-5 for ~900ms TTFT).
  *
  * Supports streaming mode: sentences are delivered via callback as the LLM
  * generates them, enabling sentence-level TTS pipelining.
@@ -25,7 +18,6 @@ import { discordTools, handleDiscordTool } from "../agent/tools.js";
 import { skillTools, handleSkillTool } from "../skills/tools.js";
 import { dangerousTools, handleDangerousTool } from "../agent/dangerous-tools.js";
 import { getSkillService } from "../skills/service.js";
-import { eigenStreamCompletion } from "./eigenllm.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -37,21 +29,6 @@ const MAX_TOOL_ROUNDS = 5; // Max tool-use rounds before forcing a text response
 
 function getVoiceModel(): string {
   return process.env.VOICE_MODEL || DEFAULT_VOICE_MODEL;
-}
-
-/**
- * Check if the current voice model is an Eigen model.
- * Eigen models are prefixed with "eigen:" (e.g., "eigen:qwen3-8b-fp8").
- */
-function isEigenModel(): boolean {
-  return getVoiceModel().startsWith("eigen:");
-}
-
-/**
- * Get the raw Eigen model name (without the "eigen:" prefix).
- */
-function getEigenModelName(): string {
-  return getVoiceModel().replace(/^eigen:/, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -73,10 +50,6 @@ CRITICAL RULES FOR VOICE RESPONSES:
 - Numbers should be spoken form (say "about three thousand" not "3,000").
 
 You have access to the full set of tools: memory, Discord, bash, file I/O, and skills. Use them when needed, but keep your spoken responses brief.`;
-
-// Shorter system prompt for Eigen models (fewer tokens = faster prefill)
-const EIGEN_VOICE_SYSTEM_PROMPT = `You are a voice assistant. Respond in 1-3 short spoken sentences.
-No markdown, no lists, no emojis, no URLs. Speak naturally like a friend. Use contractions. Be concise.`;
 
 // ---------------------------------------------------------------------------
 // Voice tools — everything except evolution (built dynamically for mem9)
@@ -238,108 +211,6 @@ function buildVoiceContext(
   return { systemPrompt, messages };
 }
 
-/**
- * Build lightweight context for Eigen models (shorter prompt = faster).
- */
-function buildEigenVoiceContext(
-  text: string,
-  displayName: string,
-): { systemPrompt: string; messages: Array<{ role: "user" | "assistant" | "system"; content: string }> } {
-  const now = new Date().toLocaleString("en-US", {
-    weekday: "long",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZoneName: "short",
-  });
-
-  const systemPrompt = `${EIGEN_VOICE_SYSTEM_PROMPT}\nTime: ${now}. Speaking with: ${displayName}.`;
-
-  const messages: Array<{ role: "user" | "assistant" | "system"; content: string }> = [];
-  for (const turn of voiceHistory) {
-    messages.push({ role: turn.role, content: turn.content });
-  }
-  messages.push({ role: "user", content: text });
-
-  return { systemPrompt, messages };
-}
-
-// ---------------------------------------------------------------------------
-// Eigen streaming path (no tools, pure speed)
-// ---------------------------------------------------------------------------
-
-/**
- * Process a voice utterance via Eigen LLM with streaming.
- * No tool support — pure text-in/text-out for minimum latency.
- */
-async function processVoiceUtteranceEigen(
-  text: string,
-  displayName: string,
-  onSentence: (sentence: string) => void,
-  signal?: AbortSignal,
-): Promise<string> {
-  const startTime = Date.now();
-  const model = getEigenModelName();
-
-  console.log(`[voice-agent] Eigen streaming from ${displayName}: "${text}"`);
-  console.log(`[voice-agent] Voice history: ${voiceHistory.length} turns, model: eigen:${model}`);
-
-  const { systemPrompt, messages } = buildEigenVoiceContext(text, displayName);
-
-  const allText: string[] = [];
-  let sentenceBuffer = "";
-  let firstDeltaTime: number | null = null;
-
-  function flushSentences(): void {
-    let boundary = findSentenceBoundary(sentenceBuffer);
-    while (boundary > 0) {
-      const sentence = sentenceBuffer.slice(0, boundary).trim();
-      sentenceBuffer = sentenceBuffer.slice(boundary).trimStart();
-      if (sentence) {
-        allText.push(sentence);
-        onSentence(sentence);
-      }
-      boundary = findSentenceBoundary(sentenceBuffer);
-    }
-  }
-
-  const fullText = await eigenStreamCompletion({
-    model,
-    systemPrompt,
-    messages,
-    maxTokens: VOICE_MAX_TOKENS,
-    signal,
-    onDelta: (delta: string) => {
-      if (!firstDeltaTime) {
-        firstDeltaTime = Date.now();
-        console.log(`[voice-agent] Eigen TTFT: ${firstDeltaTime - startTime}ms`);
-      }
-      sentenceBuffer += delta;
-      flushSentences();
-    },
-  });
-
-  // Flush any remaining text
-  if (sentenceBuffer.trim()) {
-    allText.push(sentenceBuffer.trim());
-    onSentence(sentenceBuffer.trim());
-  }
-
-  const fullResponse = allText.join(" ").trim() || fullText.trim();
-  const elapsed = Date.now() - startTime;
-
-  console.log(`[voice-agent] ✅ Eigen response in ${elapsed}ms: "${fullResponse}"`);
-
-  // Update history
-  voiceHistory.push({ role: "user", content: text });
-  voiceHistory.push({ role: "assistant", content: fullResponse || "..." });
-
-  while (voiceHistory.length > MAX_VOICE_HISTORY * 2) {
-    voiceHistory.shift();
-  }
-
-  return fullResponse || "Sorry, I didn't have anything to say to that.";
-}
-
 // ---------------------------------------------------------------------------
 // Streaming voice utterance processing (main entry point)
 // ---------------------------------------------------------------------------
@@ -347,8 +218,6 @@ async function processVoiceUtteranceEigen(
 /**
  * Process a voice utterance with streaming — delivers sentences via callback
  * as the LLM generates them, enabling sentence-level TTS pipelining.
- *
- * Routes to Eigen or Anthropic backend based on VOICE_MODEL.
  *
  * @param text Transcribed speech from the user
  * @param displayName Display name of the speaker
@@ -362,12 +231,6 @@ export async function processVoiceUtteranceStreaming(
   onSentence: (sentence: string) => void,
   signal?: AbortSignal,
 ): Promise<string> {
-  // Route to Eigen path for eigen: prefixed models
-  if (isEigenModel()) {
-    return processVoiceUtteranceEigen(text, displayName, onSentence, signal);
-  }
-
-  // --- Anthropic path (original) ---
   const startTime = Date.now();
 
   console.log(`[voice-agent] Streaming utterance from ${displayName}: "${text}"`);
