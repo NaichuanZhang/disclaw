@@ -6,14 +6,16 @@
 // injected while a turn is already running — the thing our own agent loop
 // cannot do today.
 //
-// Boundaries:
-//   - cwd is data/pilot/workspace/, never the repo root
-//   - the child env is an explicit allowlist (see env.ts)
+// Boundaries: effectively none, by operator choice.
+//   - cwd is data/pilot/workspace/, but nothing confines the session to it
+//   - the child inherits the full process environment, secrets included
+//     (see env.ts) — a pilot session can read DISCORD_BOT_TOKEN, GH_TOKEN and
+//     every provider key straight out of its own env
 //   - permissionMode is 'bypassPermissions' (allowDangerouslySkipPermissions):
-//     tool calls are NOT gated by our own policy or by permission prompts, so
-//     a pilot session can reach the repo, git and credential files. This is a
-//     deliberate operator choice; revert to permissionMode 'default' plus a
-//     canUseTool gate (see policy.ts) to restore the guard rails.
+//     tool calls are NOT gated by permission prompts or a canUseTool hook, so
+//     a pilot session can reach the repo, git and credential files.
+//   To restore guard rails: filter the child env in env.ts, and set
+//   permissionMode 'default' with a canUseTool gate or a PreToolUse hook.
 // ---------------------------------------------------------------------------
 
 import { existsSync, mkdirSync, readlinkSync, readFileSync, readdirSync } from "node:fs";
