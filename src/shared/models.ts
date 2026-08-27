@@ -1,5 +1,7 @@
 import { getConfig, setConfig, deleteConfig } from "../db/index.js";
 import { createLogger } from "../logging/logger.js";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -223,6 +225,7 @@ export async function listModels(opts?: { force?: boolean }): Promise<ModelList>
 
   // Collapse concurrent callers (e.g. autocomplete keystrokes) into one request.
   if (!inflight) {
+    count(P.modelsListFetch);
     inflight = fetchModels().finally(() => {
       inflight = null;
     });
@@ -241,6 +244,7 @@ export function getCachedModelList(): ModelList | undefined {
 }
 
 export function invalidateModelCache(): void {
+  count(P.modelsCacheInvalidate);
   cache = null;
   lastFailureAt = 0;
 }
@@ -250,6 +254,7 @@ export function invalidateModelCache(): void {
  * called at boot so the first autocomplete sees the real catalog.
  */
 export function warmModelCache(): void {
+  count(P.modelsCacheWarm);
   void listModels().catch(() => {
     /* listModels never throws; this is belt-and-braces */
   });

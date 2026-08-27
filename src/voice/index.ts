@@ -26,6 +26,8 @@ import { SileroVAD, FRAME_SIZE } from "./vad.js";
 import { transcribe } from "./stt.js";
 import { synthesize, synthesizeStream, type TTSStreamResult } from "./tts.js";
 import { processVoiceUtteranceStreaming, clearVoiceHistory } from "./agent.js";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -121,6 +123,7 @@ export function setVoiceDiscordClient(client: Client): void {
  * Join a voice channel and start listening.
  */
 export async function startVoice(channel: VoiceBasedChannel): Promise<void> {
+  count(P.voiceSessionStart);
   if (!vad) {
     throw new Error("Voice not initialized. Call initVoice() first.");
   }
@@ -194,6 +197,7 @@ export async function startVoice(channel: VoiceBasedChannel): Promise<void> {
  * Leave the voice channel and clean up.
  */
 export function stopVoice(): void {
+  count(P.voiceSessionStop);
   // Clean up all user streams
   for (const [userId, stream] of userStreams) {
     stream.destroy();

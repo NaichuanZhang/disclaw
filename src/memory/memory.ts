@@ -3,6 +3,8 @@ import { readFile, readdir, mkdir } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import { DATA_DIR } from "../shared/paths.js";
 import { getDb } from "../db/index.js";
+import { count as countInvocation } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -211,6 +213,7 @@ export function searchMemory(
   query: string,
   maxResults: number = 5
 ): MemorySearchResult[] {
+  countInvocation(P.memorySearchLocal);
   const db = getDb();
 
   const safeQuery = sanitizeFts5Query(query);
@@ -249,6 +252,7 @@ export function getMemoryLines(
   from?: number,
   lines?: number
 ): string {
+  countInvocation(P.memoryGetLines);
   // filePath is relative to data/ — resolve to absolute
   const absPath = resolve(DATA_DIR, filePath);
 

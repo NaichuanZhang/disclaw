@@ -20,6 +20,8 @@ import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { randomBytes } from "crypto";
 import { fileURLToPath } from "url";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PARAKEET_SCRIPT = join(__dirname, "parakeet_transcribe.py");
@@ -277,6 +279,7 @@ export async function transcribeAudioLocal(
   filename?: string,
   onStatus?: (msg: string) => void,
 ): Promise<string | null> {
+  count(P.audioTranscribeLocalNemo);
   const ready = await ensureLocalTranscriptionReady(onStatus);
   if (!ready) {
     const status = getLocalTranscriptionStatus();

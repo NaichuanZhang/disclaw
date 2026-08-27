@@ -2,6 +2,12 @@ import "dotenv/config";
 
 import { initDb } from "./db/index.js";
 import {
+  initMetrics,
+  stopMetrics,
+  declareCommandPaths,
+  declareSkillPaths,
+} from "./metrics/counters.js";
+import {
   cronAgentRuntime,
   initPilot,
   planPilotCronRoute,
@@ -14,9 +20,9 @@ import { initMemory, stopMemoryWatcher } from "./memory/memory.js";
 import { isMem9Enabled } from "./memory/mem9.js";
 import { CronService, type CronAgentTurnContext } from "./cron/service.js";
 import { SkillService } from "./skills/service.js";
-import { processAgentTurn } from "./agent/agent.js";
+import { processAgentTurn, declareAgentToolPaths } from "./agent/agent.js";
 import { createClient, startBot, stopBot } from "./bot/client.js";
-import { setCommandsSkillService, setCommandsCronService } from "./bot/commands.js";
+import { setCommandsSkillService, setCommandsCronService, slashCommands } from "./bot/commands.js";
 import { startGateway } from "./gateway/server.js";
 import { cleanExpiredSessions } from "./agent/sessions.js";
 import { setRestartHandler } from "./restart.js";
@@ -161,6 +167,11 @@ async function main(): Promise<void> {
   console.log("[discordclaw] Initializing database...");
   initDb();
 
+  // Invocation metrics — seeds one row per instrumented code path (count 0) and
+  // starts the batched flush. Declared-but-never-counted paths are the
+  // dead-code signal; see src/metrics/report.ts.
+  initMetrics();
+
   // Any question left pending by the previous process can never be answered
   // into a live agent turn — retire them so stale clicks report cleanly.
   const expiredQuestions = expireStalePendingQuestions();
@@ -187,6 +198,11 @@ async function main(): Promise<void> {
   console.log("[discordclaw] Loading skills...");
   const skillService = new SkillService();
   await skillService.init();
+
+  // Seed usage rows for commands, tools and skills so unused ones show as dead
+  declareCommandPaths(slashCommands);
+  declareSkillPaths(skillService.list());
+  declareAgentToolPaths();
   setCommandsSkillService(skillService);
 
   // 3.6 Snapshot evolvable resources (resource registry)
@@ -421,6 +437,9 @@ async function main(): Promise<void> {
 
     // Stop periodic cleanup
     clearInterval(cleanupInterval);
+
+    // Persist buffered invocation counts before exiting
+    stopMetrics();
 
     // Stop reflection daemon
     stopReflectionDaemon();

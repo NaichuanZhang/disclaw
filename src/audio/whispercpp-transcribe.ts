@@ -27,6 +27,8 @@ import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { randomBytes } from "crypto";
 import { fileURLToPath } from "url";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 /** Repo root — this file lives at <root>/src/audio/. */
@@ -376,6 +378,7 @@ export async function transcribeAudioWhisperCpp(
   url: string,
   filename?: string,
 ): Promise<string | null> {
+  count(P.audioTranscribeWhisperCpp);
   const ready = await ensureWhisperCppReady();
   if (!ready) {
     console.log(

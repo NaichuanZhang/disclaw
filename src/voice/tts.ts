@@ -20,6 +20,8 @@
  */
 
 import { PassThrough } from "node:stream";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -92,6 +94,7 @@ export interface TTSStreamResult {
  * @returns mp3 audio buffer
  */
 export async function synthesize(text: string, signal?: AbortSignal): Promise<Buffer> {
+  count(P.voiceTtsSynthesize);
   const key = apiKey();
   const voice = voiceId();
 
@@ -139,6 +142,7 @@ export async function synthesize(text: string, signal?: AbortSignal): Promise<Bu
  * @returns TTSStreamResult with the stream and a done promise
  */
 export function synthesizeStream(text: string, signal?: AbortSignal): TTSStreamResult {
+  count(P.voiceTtsSynthesizeStream);
   const key = apiKey();
   const voice = voiceId();
 

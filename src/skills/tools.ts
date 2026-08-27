@@ -6,6 +6,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { SKILLS_DIR } from "../shared/paths.js";
 import { getSkillService } from "./service.js";
+import { count, countSkill } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 /**
  * A disabled skill is absent from the prompt listing, so a model only reaches
@@ -72,6 +74,8 @@ export function handleSkillTool(
     switch (name) {
       case "read_skill": {
         const skillName = input.skill_name as string;
+        count(P.skillsRead);
+        countSkill(skillName);
         const file = (input.file as string) || "SKILL.md";
 
         // Validate skill directory exists

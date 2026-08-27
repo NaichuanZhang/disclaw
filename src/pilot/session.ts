@@ -46,6 +46,8 @@ import {
   getCavemanLevel,
 } from "../shared/prompt-fragments.js";
 import { EVOLUTION_INSTRUCTIONS } from "../evolution/instructions.js";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 // ---------------------------------------------------------------------------
 // Paths & constants
@@ -420,6 +422,7 @@ export class PilotSession {
    * still run and is reported back via `stillQueued`.
    */
   async interrupt(): Promise<PilotInterruptResult> {
+    count(P.pilotSessionInterrupt);
     const dropped = this.queue.length;
     const lastTool = this.lastToolName;
     this.queue = [];
@@ -509,6 +512,7 @@ export class PilotSession {
    */
   async stop(reason = "stopped", notice?: string): Promise<void> {
     if (this.closed) return;
+    count(P.pilotSessionStop);
     this.closed = true;
     this.stopTyping();
     this.clearTurnWatchdog();
@@ -1074,6 +1078,7 @@ export function submitToPilotSession(
   } else {
     session.setTarget(target);
   }
+  count(P.pilotTurnSubmit);
   session.submit(message);
   return session;
 }
