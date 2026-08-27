@@ -8,9 +8,12 @@
 // Cron `agentTurn` jobs are the exception: they run on an SDK session whatever
 // the channel flag says (see cron-route.ts).
 //
-// See src/pilot/session.ts for the session lifecycle, policy.ts for the
-// currently-unenforced permission rules, bridge.ts for the in-process MCP
-// tools and env.ts for the child-process environment allowlist.
+// Pilot sessions are unrestricted: tool calls are unguarded
+// (permissionMode: 'bypassPermissions') and the child inherits the full
+// process environment, secrets included.
+//
+// See src/pilot/session.ts for the session lifecycle, bridge.ts for the
+// in-process MCP tools and env.ts for the child-process environment.
 // ---------------------------------------------------------------------------
 
 export {
@@ -39,16 +42,7 @@ export {
   type PilotInterruptResult,
 } from "./session.js";
 
-export { buildPilotEnv, isSecretEnvVar, PILOT_ENV_ALLOWLIST } from "./env.js";
-
-export {
-  checkPilotCommand,
-  checkPilotPath,
-  defaultPilotPolicyContext,
-  evaluatePilotToolCall,
-  type PilotPolicyContext,
-  type PolicyDecision,
-} from "./policy.js";
+export { buildPilotEnv } from "./env.js";
 
 export { createPilotMcpServer, PILOT_MCP_SERVER_NAME } from "./bridge.js";
 export {
