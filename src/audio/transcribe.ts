@@ -20,6 +20,8 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { randomBytes } from "crypto";
 import { transcribeAudioLocal, getLocalTranscriptionStatus } from "./local-transcribe.js";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 import {
   transcribeAudioWhisperCpp,
   getWhisperCppStatus,
@@ -153,6 +155,7 @@ export async function transcribeAudio(
   filename?: string,
   onStatus?: (msg: string) => void,
 ): Promise<string | null> {
+  count(P.audioTranscribeDispatch);
   const attempts: BackendAttempt[] = [];
 
   // --- 1. whisper.cpp (local, no Python required) -------------------------

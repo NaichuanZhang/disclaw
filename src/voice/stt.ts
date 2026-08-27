@@ -17,6 +17,8 @@
 
 import { VAD_SAMPLE_RATE } from "./receiver.js";
 import { transcribePcm16kWhisperCpp } from "../audio/whispercpp-transcribe.js";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 // ---------------------------------------------------------------------------
 // Remote fallback (opt-in)
@@ -114,6 +116,7 @@ async function transcribeRemote(pcm16kMono: Int16Array): Promise<string> {
  * @returns Transcribed text, or an empty string if nothing was detected
  */
 export async function transcribe(pcm16kMono: Int16Array): Promise<string> {
+  count(P.voiceSttTranscribe);
   const durationSec = pcm16kMono.length / VAD_SAMPLE_RATE;
   console.log(`[stt] Transcribing ${durationSec.toFixed(1)}s audio locally (whisper.cpp)`);
 

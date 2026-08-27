@@ -1,5 +1,7 @@
 import { Cron } from "croner";
 import { CronStore } from "./store.js";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 import type {
   CronJob,
   CronJobCreate,
@@ -175,6 +177,7 @@ export class CronService {
       log(`forceRun: job ${id} not found`);
       return;
     }
+    count(P.cronJobForceRun);
     log(`Force-running job "${job.name}" (${job.id})`);
     await this.executeJob(job);
   }
@@ -315,6 +318,8 @@ export class CronService {
   // ---------------------------------------------------------------------------
 
   private async executeJob(job: CronJob): Promise<void> {
+    count(P.cronJobRun);
+
     const startedAt = Date.now();
     let status: "ok" | "error" = "ok";
     let result: string | undefined;

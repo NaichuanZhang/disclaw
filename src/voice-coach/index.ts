@@ -25,6 +25,8 @@ import {
   getCoachConnection,
 } from "./player.js";
 import { startListening, stopListening, flushRiderMessages } from "./listener.js";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -78,6 +80,7 @@ export function initVoiceCoach(config: {
   elevenLabsApiKey: string;
   elevenLabsVoiceId: string;
 }): void {
+  count(P.voiceCoachInit);
   coachChannelId = config.channelId;
   trackedUserId = config.userId;
 
@@ -102,6 +105,7 @@ export function setVoiceCoachClient(client: Client): void {
  * Stop the voice coach and clean up.
  */
 export function destroyVoiceCoach(): void {
+  count(P.voiceCoachDestroy);
   stopCoachSession();
 
   if (discordClient) {

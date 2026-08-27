@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR } from "../shared/paths.js";
+import { count } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -91,6 +93,7 @@ export async function searchMem9(
   query: string,
   maxResults: number = 5,
 ): Promise<Mem9Memory[]> {
+  count(P.memoryMem9Search);
   const cfg = getConfig();
   if (!cfg) return [];
 
@@ -137,6 +140,7 @@ export async function storeMem9(
   content: string,
   metadata?: Record<string, unknown>,
 ): Promise<boolean> {
+  count(P.memoryMem9Store);
   const cfg = getConfig();
   if (!cfg) return false;
 
@@ -184,6 +188,7 @@ export async function updateMem9(
   memoryId: string,
   content: string,
 ): Promise<boolean> {
+  count(P.memoryMem9Update);
   const cfg = getConfig();
   if (!cfg) return false;
 
@@ -225,6 +230,7 @@ export async function updateMem9(
  * Never throws.
  */
 export async function deleteMem9(memoryId: string): Promise<boolean> {
+  count(P.memoryMem9Delete);
   const cfg = getConfig();
   if (!cfg) return false;
 

@@ -52,6 +52,7 @@ import {
 import type { SkillService } from "../skills/service.js";
 import type { CronService } from "../cron/service.js";
 import type { CronJob, CronSchedule, CronPayload, CronDelivery } from "../cron/types.js";
+import { countCommand } from "../metrics/counters.js";
 
 // ---------------------------------------------------------------------------
 // Service references (set from index.ts after init)
@@ -455,6 +456,9 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName } = interaction;
+
+  // Usage metrics — which commands and subcommands actually get used
+  countCommand(commandName, interaction.options.getSubcommand(false) ?? undefined);
 
   try {
     switch (commandName) {

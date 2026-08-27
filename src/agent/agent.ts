@@ -20,6 +20,8 @@ import {
 } from "../shared/prompt-fragments.js";
 import { getSkillService } from "../skills/service.js";
 import { createLogger, toolCallLog } from "../logging/logger.js";
+import { count, countTool, declareToolPaths } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -142,6 +144,14 @@ Guidelines:
 // ---------------------------------------------------------------------------
 // All tools combined (built dynamically to include mem9 tools when configured)
 // ---------------------------------------------------------------------------
+
+/**
+ * Seed usage metrics with every registered tool name. Called once at boot so
+ * tools that are never invoked show up as dead code rather than as absent.
+ */
+export function declareAgentToolPaths(): void {
+  declareToolPaths(getAllTools());
+}
 
 function getAllTools(): Anthropic.Messages.Tool[] {
   return [
@@ -395,6 +405,9 @@ async function executeTool(
     // Result wasn't JSON or parsing failed — that's fine
   }
 
+  // Usage metrics — surfaces tools nobody ever calls (see src/metrics/)
+  countTool(name);
+
   // Record structured tool call log
   toolCallLog({
     tool: name,
@@ -492,6 +505,8 @@ export async function processMessage(opts: {
   /** Thread ID for the current conversation — prevents creating duplicate threads */
   threadId?: string;
 }): Promise<AgentResponse> {
+  count(P.agentTurnInteractive);
+
   const systemPrompt = buildSystemPrompt({
     context: opts.context,
     channelConfig: opts.channelConfig,
@@ -582,6 +597,7 @@ export async function processMessage(opts: {
 
       // If we've hit the dupe limit, force the model to stop looping
       if (consecutiveDupes >= MAX_CONSECUTIVE_DUPES) {
+        count(P.agentLoopDuplicateBreak);
         log.warn("Breaking loop — repeated duplicate tool calls", {
           tools: currentSignatures.map((s) => s.split(":")[0]),
         });
@@ -689,6 +705,7 @@ export async function processMessage(opts: {
 
   // Extract images from the response text
   const { cleanText, images } = extractImages(rawText);
+  if (images.length > 0) count(P.agentImagesExtracted);
 
   return {
     text: cleanText || rawText, // Fall back to raw if extraction stripped everything
@@ -705,6 +722,8 @@ export async function processAgentTurn(opts: {
   message: string;
   model?: string;
 }): Promise<string> {
+  count(P.agentTurnCron);
+
   const soul = getSoul();
   const systemParts: string[] = [BASE_INSTRUCTIONS];
   if (soul) {
@@ -776,6 +795,7 @@ export async function processAgentTurn(opts: {
     prevCallSignatures = currentSignatures;
 
     if (consecutiveDupes >= MAX_CONSECUTIVE_DUPES) {
+      count(P.agentLoopDuplicateBreak);
       log.warn("Cron loop broken — repeated duplicate tool calls");
       messages.push({ role: "assistant", content: response.content });
       messages.push({

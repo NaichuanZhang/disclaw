@@ -20,6 +20,16 @@ import {
   updateEvolution,
 } from "../evolution/log.js";
 import { getSandboxCIStatus } from "../evolution/sandbox.js";
+import { countRoute, declareRoutePaths, flushMetrics } from "../metrics/counters.js";
+import {
+  getMetrics,
+  getDeadPaths,
+  getLowUsePaths,
+  getStalePaths,
+  getMetricsSummary,
+  getObservationWindow,
+} from "../metrics/report.js";
+import type { PathKind } from "../metrics/registry.js";
 import {
   getAppLogs,
   getErrorLogs,
@@ -71,6 +81,17 @@ export function createApiRouter(opts: {
 }): Router {
   const { cronService, skillService, discordClient } = opts;
   const router = Router();
+
+  // Usage metrics — count route hits so unused endpoints surface as dead code.
+  // req.route is only populated after matching, so read it on finish; that also
+  // means unmatched (404) requests are correctly not counted.
+  router.use((req: Request, res: Response, next) => {
+    res.on("finish", () => {
+      const routePattern = (req as Request & { route?: { path?: string } }).route?.path;
+      if (routePattern) countRoute(req.method, routePattern);
+    });
+    next();
+  });
 
   // Health endpoint (used by start.sh, no auth)
   registerHealthRoute(router);
@@ -750,6 +771,76 @@ export function createApiRouter(opts: {
     res.json({ message: "Restarting..." });
     triggerRestart();
   });
+
+  // =========================================================================
+  // Invocation metrics — usage, dead code, low-use features
+  // =========================================================================
+
+  /** Narrow a query param to a PathKind, or undefined when absent/invalid. */
+  function parseKind(raw: unknown): PathKind | undefined {
+    const kinds = ["command", "tool", "route", "skill", "feature", "branch"];
+    return typeof raw === "string" && kinds.includes(raw) ? (raw as PathKind) : undefined;
+  }
+
+  router.get("/metrics/invocations", (req: Request, res: Response) => {
+    try {
+      flushMetrics(); // include counts still buffered in memory
+      const minCountRaw = parseInt(req.query.minCount as string, 10);
+      res.json({
+        metrics: getMetrics({
+          kind: parseKind(req.query.kind),
+          minCount: isNaN(minCountRaw) ? undefined : minCountRaw,
+          limit: parseInt(req.query.limit as string, 10) || undefined,
+        }),
+        summary: getMetricsSummary(),
+        window: getObservationWindow(),
+      });
+    } catch (err) {
+      log("Error in GET /metrics/invocations:", err);
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  router.get("/metrics/dead", (req: Request, res: Response) => {
+    try {
+      flushMetrics();
+      res.json({
+        dead: getDeadPaths({
+          kind: parseKind(req.query.kind),
+          includeRare: req.query.includeRare === "1" || req.query.includeRare === "true",
+        }),
+        summary: getMetricsSummary(),
+        window: getObservationWindow(),
+      });
+    } catch (err) {
+      log("Error in GET /metrics/dead:", err);
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  router.get("/metrics/low-use", (req: Request, res: Response) => {
+    try {
+      flushMetrics();
+      const threshold = parseInt(req.query.threshold as string, 10);
+      const staleDays = parseInt(req.query.staleDays as string, 10);
+      res.json({
+        lowUse: getLowUsePaths({
+          threshold: isNaN(threshold) ? undefined : threshold,
+          kind: parseKind(req.query.kind),
+          limit: parseInt(req.query.limit as string, 10) || undefined,
+        }),
+        stale: getStalePaths({ days: isNaN(staleDays) ? undefined : staleDays }),
+        window: getObservationWindow(),
+      });
+    } catch (err) {
+      log("Error in GET /metrics/low-use:", err);
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Seed one row per route now that every route is registered, so endpoints
+  // nobody calls are visible as dead rather than missing.
+  declareRoutePaths(router as unknown as { stack?: any[] });
 
   return router;
 }

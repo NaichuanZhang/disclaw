@@ -13,6 +13,7 @@ npm test             # Run integration tests (vitest run)
 npm run test:watch   # Run tests in watch mode
 npx vitest run tests/integration/foo.test.ts  # Run a single test file
 npm run daemon       # Start watchdog daemon (spawns bot, health checks, crash recovery)
+npx tsx scripts/metrics-report.ts  # Invocation metrics: dead code, low-use features, busiest paths
 ./start.sh           # Production: git pull → migrate → build → start → health check → rollback
 ```
 
@@ -199,13 +200,29 @@ All logging functions are **non-blocking and never throw** — errors during log
 
 The reflection daemon automatically consumes structured logs alongside signals, providing tool call statistics, error breakdowns by category, and slowest tool calls as additional context for self-improvement analysis. Log pruning happens during each reflection cycle.
 
+### Invocation Metrics
+
+`src/metrics/` counts how often each instrumented code path runs, so unused features and dead code are identifiable from data instead of guesswork.
+
+The key design point: **counting alone cannot find dead code** — you only see paths that did run. So every instrumented site is also *declared*, and declared paths are seeded into `invocation_metrics` with `count = 0`. "Declared but never counted" is the dead-code signal.
+
+- `metrics/registry.ts` — `P` (stable dotted path ids) and `FEATURE_PATHS` (specs for hand-instrumented paths). A spec marked `rare: true` is an error/fallback path that is *supposed* to be idle, so the report never flags it as dead. Path ids are an append-only vocabulary: renaming one orphans its history.
+- `metrics/counters.ts` — `count(path)` bumps an in-memory Map (one hash lookup, no I/O); a batched flush folds deltas into SQLite every 60s and on shutdown. `declareCommandPaths()`, `declareToolPaths()`, `declareRoutePaths()` and `declareSkillPaths()` derive their paths from the existing manifests at boot (the slash-command array, `getAllTools()`, the Express router stack, the skill list), so those four surfaces can never go stale.
+- `metrics/report.ts` — `getDeadPaths()`, `getLowUsePaths()`, `getStalePaths()`, `getMetrics()`, `getMetricsSummary()`, `getObservationWindow()`.
+
+Instrumented surfaces: slash commands (+ subcommands), every agent tool, every gateway route, skill reads, memory backends (local FTS vs mem9), transcription backends, voice/voice-coach entry points, model cache paths, cron runs, pilot vs interactive vs cron agent turns.
+
+Read it via `npx tsx scripts/metrics-report.ts` (`--kind=tool`, `--threshold=N`, `--stale-days=N`, `--top=N`) or the API endpoints below.
+
+Two caveats when acting on the numbers: a zero count only means "not observed since instrumentation landed" — always check `getObservationWindow()` before concluding a feature is dead, and remember a rarely-hit path may be a critical recovery branch rather than dead weight. Like logging, every metrics write is wrapped and can never crash the bot.
+
 ### Reflection System
 
 `src/reflection/` implements autonomous self-improvement discovery. Signal collection (`signals.ts`) passively records errors, tool failures, and duplicate loop patterns from `bot/messages.ts` and `agent/agent.ts`. The structured logging system (`src/logging/`) provides additional data: tool call statistics, error logs with stack traces, and performance metrics. The reflection daemon (`daemon.ts`) runs on a configurable interval (default: 6h), analyzes both signals and structured logs, and if an improvement is found, records an evolution idea and posts to Discord. Level 1 trust: never auto-implements.
 
 ### Gateway
 
-Express server + WebSocket at `/ws/logs` for real-time log streaming. REST API at `/api/*` exposes CRUD for sessions, channels, config, soul, memory, skills, cron, artifacts, and evolutions. Artifact routes are mounted separately via `src/gateway/artifacts.ts`. Health check at `/api/health` (no auth). Auth middleware is currently disabled (TODO for cloud gateway). React SPA dashboard served from `dist/ui/`.
+Express server + WebSocket at `/ws/logs` for real-time log streaming. REST API at `/api/*` exposes CRUD for sessions, channels, config, soul, memory, skills, cron, artifacts, and evolutions. Usage metrics are at `/api/metrics/invocations`, `/api/metrics/dead` and `/api/metrics/low-use` (the last also returns stale paths via `?staleDays=`); a router-level middleware counts route hits on response finish, so unmatched 404s are correctly not counted. Artifact routes are mounted separately via `src/gateway/artifacts.ts`. Health check at `/api/health` (no auth). Auth middleware is currently disabled (TODO for cloud gateway). React SPA dashboard served from `dist/ui/`.
 
 ### Database Schema
 
@@ -223,6 +240,7 @@ SQLite with WAL mode, FKs enabled. Key tables in `src/db/index.ts`:
 - `application_log` — structured application log entries (level, category, message, metadata)
 - `error_log` — structured error log entries with stack traces
 - `tool_call_log` — tool invocation records with input, result, timing, success/failure status
+- `invocation_metrics` — one row per instrumented code path (path, kind, description, rare, count, first_seen, last_seen); rows are seeded at count 0 when declared, so unused paths are visible as dead code
 
 ### Migrations
 
@@ -241,6 +259,7 @@ Shell scripts in `migrations/` run by `start.sh` before build. All idempotent (`
 - **Shared utilities**: `src/shared/` contains extracted helpers used by both the main agent and the voice agent — `paths.ts` (project root resolution), `anthropic.ts` (SDK client factory), `discord-utils.ts` (channel/guild helpers), `conversation-history.ts` (cross-session message loading + conversation history tool definitions), `format.ts` (token/duration formatting for the `-# 📊` footer), `prompt-fragments.ts` (memory-recall + caveman prompt text shared by the main agent and pilot). Import from `shared/` when adding code that both pipelines need — anything a *second* runtime needs to say identically belongs in `prompt-fragments.ts` rather than in one runtime's prompt builder.
 - **Watchdog daemon**: `src/daemon/index.ts` is a standalone process (zero imports from the main bot) that spawns the bot, monitors health, handles crash recovery with evolution rollback, and sends Discord webhook notifications. Exit code 100 from the bot triggers a deploy-restart (git pull + rebuild) rather than a simple respawn.
 - **Signal collection is passive and non-blocking**: `recordSignal()` never throws — errors during recording are caught and logged.
+- **Metrics counting is non-blocking**: `count(path)` only touches an in-memory Map; persistence is batched and try/catch'd. Add a path to `metrics/registry.ts` *and* count it at the call site — declaring without counting reports the path as dead forever, counting without declaring loses the zero-count baseline.
 - **Structured logging is non-blocking**: All `appLog()`, `errorLog()`, and `toolCallLog()` calls silently catch DB errors. Console output is always preserved for the daemon log buffer. Use `createLogger(category)` factory for scoped module loggers.
 - **Token usage**: Aggregated across all API calls within a single user→response turn (including tool-use loops). Costs computed at query time (not stored) so pricing can be updated without migration.
 - **Production deployment**: `start.sh` runs: kill existing → git pull → npm ci (if lockfile changed) → migrations → seed cron → build → start → health check (30s timeout) → auto-rollback on failure. Discord webhook notifications on success/failure.

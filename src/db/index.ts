@@ -204,6 +204,22 @@ export function initDb(): void {
 
     CREATE INDEX IF NOT EXISTS idx_agent_questions_status ON agent_questions(status);
     CREATE INDEX IF NOT EXISTS idx_agent_questions_channel ON agent_questions(channel_id);
+
+    -- Invocation metrics: one row per instrumented code path. Rows are seeded
+    -- with count 0 when a path is declared, so "declared but never counted"
+    -- identifies dead code (see src/metrics/).
+    CREATE TABLE IF NOT EXISTS invocation_metrics (
+      path TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      description TEXT,
+      rare INTEGER NOT NULL DEFAULT 0,
+      count INTEGER NOT NULL DEFAULT 0,
+      first_seen INTEGER,
+      last_seen INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_invocation_metrics_kind ON invocation_metrics(kind);
+    CREATE INDEX IF NOT EXISTS idx_invocation_metrics_count ON invocation_metrics(count);
   `);
 
   // ---------------------------------------------------------------------------
