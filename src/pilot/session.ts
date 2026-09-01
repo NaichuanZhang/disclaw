@@ -690,6 +690,16 @@ export class PilotSession {
           // talking changes, and ask_user / evolve_* must follow them.
           getUserId: this.currentUserId,
         }),
+        ...(process.env.NOTION_API_KEY
+          ? {
+              notion: {
+                type: "stdio",
+                command: "npx",
+                args: ["-y", "@notionhq/notion-mcp-server"],
+                env: { NOTION_TOKEN: process.env.NOTION_API_KEY },
+              },
+            }
+          : {}),
       },
       systemPrompt: {
         type: "preset",
