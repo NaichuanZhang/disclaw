@@ -693,7 +693,7 @@ export class PilotSession {
         ...(process.env.NOTION_API_KEY
           ? {
               notion: {
-                type: "stdio" as const,
+                type: "stdio",
                 command: "npx",
                 args: ["-y", "@notionhq/notion-mcp-server"],
                 env: { NOTION_TOKEN: process.env.NOTION_API_KEY },
