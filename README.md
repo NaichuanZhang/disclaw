@@ -18,7 +18,7 @@ A stripped-down Discord agent powered by Claude. Simplified fork of [openclaw](h
 - 📜 **Conversation History** — Messages are archived across sessions. Query past conversations with `get_conversation_history` and `get_conversation_stats` tools.
 - 🎭 **Customizable Personality** — Edit `SOUL.md` to change how the bot behaves. Hot-reloads on save.
 - 🔧 **Tool Use** — Runs shell commands, reads/writes files, sends messages across channels, reacts to messages, attaches files, creates threads. Real-time tool call progress shown in Discord during agentic loops.
-- 🔒 **Session Locking** — Per-session mutex prevents interleaved responses. `/stop` command aborts all active processing with graceful cancellation.
+- ↩️ **Mid-turn Steering** — A message sent while the bot is still working is injected into the running turn instead of queueing behind it; the bot reacts ↩️ and says which tool it interrupted. `/interrupt` cuts the turn but keeps the session, `/stop` kills it.
 - 📦 **Skills** — Drop a `SKILL.md` folder into `data/skills/` and the bot learns new capabilities instantly. Install from GitHub or upload directly.
 - ⏰ **Scheduled Tasks** — Cron jobs that run agent turns on a schedule, delivering results in daily threads. Hot-reloads `jobs.json` without restart.
 - 🧬 **Self-Evolution** — The bot can modify its own source code via GitHub PRs. You approve the **build plan up front**; once CI passes, the PR is merged and deployed automatically (no diff review step). Optional Daytona sandbox CI for isolated validation. Deployment notifications posted automatically.
@@ -66,16 +66,15 @@ Bot: [evolve_start(plan, plan_approved) → evolve_write → evolve_propose]
 | `/ping` | Show bot health status, latency, and uptime |
 | `/help` | Show all commands and capabilities |
 | `/config` | Toggle bot on/off per channel, set custom instructions |
-| `/clear` | Reset conversation history in current session |
-| `/pilot on\|off\|status` | Turn pilot mode on/off for this channel (thread → parent channel) |
+| `/clear` | Stop this channel's session and drop its context (channel + the threads under it) |
 | `/soul` | View the bot's personality |
 | `/model` | Show the active model, or switch to another one from the proxy's list (persists across restarts) |
 | `/skills` | List, install (from GitHub or file upload), or remove skills |
 | `/cron` | View, add, enable/disable, force-run, set a per-job model, or show history of cron jobs |
 | `/caveman` | Toggle terse caveman-speak mode (lite/full/ultra/off) for the current channel |
 | `/restart` | Restart the bot process |
-| `/stop` | Abort all active processing sessions (graceful cancellation via AbortSignal) |
-| `/interrupt` | Interrupt the current pilot turn in this channel/thread, keeping the session and its context alive |
+| `/stop` | Stop every running session (kills the SDK child processes) |
+| `/interrupt` | Interrupt the current turn in this channel/thread, keeping the session and its context alive |
 | `/join` | Join your voice channel as a voice assistant |
 | `/leave` | Leave the voice channel |
 
@@ -226,15 +225,16 @@ git merge upstream/main
 | `VOICE_TOOLS_MODE` | No | Voice agent tools: `full` (all tools except evolution) or `minimal` (memory + conversation history only). Default: `full` |
 | `VOICE_TTS_VOICE_ID` | No | ElevenLabs voice for the assistant. Falls back to `ELEVENLABS_VOICE_ID`, then premade "Sarah" |
 | `VOICE_STT_REMOTE_FALLBACK` | No | `1` = fall back to ElevenLabs Scribe when local whisper.cpp is unavailable (default off) |
-| `PILOT_IDLE_MS` | No | Pilot session idle timeout before teardown (default: `1800000` = 30 min) |
-| `CRON_RUNTIME` | No | `main` forces cron `agentTurn` jobs back onto the in-process agent loop. Default (`sdk`) runs every one on a Claude Agent SDK session. |
-| `PILOT_TURN_TIMEOUT_MS` | No | Interrupt a pilot turn that runs longer than this (default: `900000` = 15 min) |
-| `PILOT_TURN_MAX_COST_USD` | No | Soft cost cap per turn — over it, the usage footer says so. `0` (default) disables the warning |
-| `PILOT_ATTACHMENT_MAX_BYTES` | No | Per-file cap on attachments downloaded into the pilot inbox (default: `26214400` = 25 MB) |
-| `PILOT_INBOX_MAX_AGE_MS` | No | How long pilot keeps downloaded attachments before pruning (default: `86400000` = 24 h) |
-| `PILOT_ANTHROPIC_API_KEY` | No | Opt into API-key auth for pilot sessions (overrides inherited model auth) |
-| `PILOT_ANTHROPIC_MODEL` | No | Override the model used by pilot sessions |
-| `PILOT_ANTHROPIC_BASE_URL` | No | Alternate Anthropic-compatible endpoint for pilot sessions (e.g. a local gateway) |
+| `SDK_IDLE_MS` | No | Session idle timeout before teardown (default: `1800000` = 30 min) |
+| `SDK_TURN_TIMEOUT_MS` | No | Interrupt a turn that runs longer than this (default: `900000` = 15 min) |
+| `SDK_TURN_MAX_COST_USD` | No | Soft cost cap per turn — over it, the usage footer says so. `0` (default) disables the warning |
+| `SDK_ATTACHMENT_MAX_BYTES` | No | Per-file cap on attachments downloaded into the session inbox (default: `26214400` = 25 MB) |
+| `SDK_INBOX_MAX_AGE_MS` | No | How long downloaded attachments are kept before pruning (default: `86400000` = 24 h) |
+| `SDK_ANTHROPIC_API_KEY` | No | Opt into API-key auth for sessions (overrides inherited model auth) |
+| `SDK_ANTHROPIC_MODEL` | No | Override the model used by sessions |
+| `SDK_ANTHROPIC_BASE_URL` | No | Alternate Anthropic-compatible endpoint for sessions (e.g. a local gateway) |
+
+The `SDK_*` names above are also read under their pre-rename `PILOT_*` spellings, so an existing `.env` keeps working.
 
 *Either `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` required.
 
@@ -244,15 +244,15 @@ git merge upstream/main
 
 **Memory** — Hybrid search system. Local markdown files in `data/` indexed with SQLite FTS5 (BM25-ranked), plus optional mem9 cloud memory for semantic vector search. Both sources are queried in parallel on every `memory_search` call. Queries are sanitized for FTS5 compatibility (special characters like hyphens and colons are handled automatically).
 
-**Sessions** — Per-thread/DM/channel conversation tracking. History loaded as context for each message. Auto-expires after TTL. Messages are archived to enable cross-session querying via `get_conversation_history` and `get_conversation_stats` tools. Per-session mutex locking (`agent/session-lock.ts`) ensures only one message is processed at a time per session — queued messages wait until the lock is released. An `AbortSignal` is threaded through the agent loop, enabling graceful cancellation via the `/stop` command.
+**Sessions** — Per-thread/DM/channel conversation tracking. The context the model reads lives inside its own SDK child process; our `messages` rows are the durable transcript, archived so `get_conversation_history` and `get_conversation_stats` can query across sessions. Ordering is handled by the session itself rather than a lock: a message arriving mid-turn is injected into the running turn (see Agent Runtime), so nothing has to wait for a mutex.
 
-**Cron** — Scheduled tasks with three schedule types: one-shot (`at`), interval (`every`), cron expression (`cron`). `agentTurn` jobs run the agent and deliver results inside threads (the agent handles all delivery via tools — no duplicate top-level messages). Every `agentTurn` runs on a Claude Agent SDK session (see Pilot Mode), whatever the delivery channel is; `CRON_RUNTIME=main` forces the old in-process loop back. `systemEvent` jobs deliver results directly to the configured channel. Auto-disables after 3 consecutive failures. Hot-reloads `jobs.json` on each tick cycle (up to every 60s) so externally-added jobs are picked up without a restart.
+**Cron** — Scheduled tasks with three schedule types: one-shot (`at`), interval (`every`), cron expression (`cron`). `agentTurn` jobs run the agent and deliver results inside threads (the agent handles all delivery via tools — no duplicate top-level messages). Each one gets a fresh session in a thread of its own, so a scheduled run starts with clean context and a per-job `/cron set-model` override actually applies. `systemEvent` jobs deliver results directly to the configured channel. Auto-disables after 3 consecutive failures. Hot-reloads `jobs.json` on each tick cycle (up to every 60s) so externally-added jobs are picked up without a restart.
 
 **Skills** — Modular capabilities defined as SKILL.md files with YAML frontmatter. Install from GitHub URL or upload directly. Uses SDK progressive loading pattern: only skill metadata (name, description, path) is injected into the system prompt; the agent reads full skill content on demand via `read_skill` tool. Skills can include companion files (scripts, references). Manageable via dashboard and `/skills` command.
 
 **Dashboard** — Single-page React app at `http://localhost:3000`. Pages: Status, Sessions, Channels, Config, Cron, Skills, Artifacts, Evolution, Logs. Real-time message streaming via WebSocket.
 
-**Agent Loop** — The tool-use loop runs until the model produces a final text response. To prevent infinite loops, consecutive duplicate tool calls (same tool + same arguments) are detected — after 2 identical rounds the agent is forced to produce a final response. Typing indicator refreshes every 8 seconds to stay visible during long tool chains. An `onToolCallProgress` callback fires for each tool invocation, sending real-time status messages to Discord (rate-limited to max 4 per 5s window).
+**Agent Runtime** — Every message and every scheduled `agentTurn` is handled by a [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) session (`src/sdk/`) — one child process per Discord thread, DM or channel, keyed by target id. The tool loop, context compaction and duplicate-call handling are the SDK's; what this repo owns is the Discord side of it. See **Agent Sessions** below.
 
 **Thread-First Replies** — In guild text channels, every bot response creates a thread on the user's message. Bot-created threads don't require @mentions for follow-up. Monitored channels auto-respond to all messages without @mention. DMs bypass threading entirely.
 
@@ -274,7 +274,19 @@ The transcribed text is passed to the agent as the message content. If every bac
 
 **Artifacts** — Persistent file storage system for tracking session inputs and outputs. When files are uploaded to or generated by the agent, they're registered as artifacts with metadata (direction, MIME type, size, Discord URL). Artifacts are stored on disk under `data/artifacts/<sessionId>/` and tracked in SQLite. The dashboard Artifacts page provides per-session browsing with download links. API routes at `/api/artifacts` and `/api/artifacts/:sessionId`. Uses `GATEWAY_PUBLIC_URL` for generating download URLs in production.
 
-**Pilot Mode** — An experimental second runtime. A channel flagged with `settings.pilot = true` in `channel_configs` is served by the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) (`src/pilot/`) instead of our own agent loop. It exists to test three things the normal path can't do: **mid-conversation injection** (the SDK prompt is an async iterable, so a new Discord message is handed to a turn that is already running — and when it lands mid-flight the bot reacts ↩️ on that message and posts a small marker line naming the tool it interrupted, so the transcript shows where the course changed), **unguarded tool execution** (`permissionMode: 'bypassPermissions'` with `allowDangerouslySkipPermissions: true` — no permission prompts and no `canUseTool` gate), and **in-process MCP tools** (`createSdkMcpServer` re-exports `send_message`, `send_file`, `add_reaction`, `ask_user`, the memory tools, the context tools `get_channel_history`/`create_thread`/`get_conversation_history`/`get_conversation_stats` and the skill tools `read_skill`/`list_skill_files`, so pilot sessions can use the same skill library as the main agent; the full `evolve_*` tool set is also bridged, so a pilot session self-evolves through the same worktree → PR → CI → auto-merge path as the main agent, with the plan-approval gate still enforced in code by `evolve_start`). There are **no remaining guards**, by operator choice. cwd is `data/pilot/workspace/` but nothing confines the session to it; paths and shell commands are unrestricted (a pilot session can edit `src/**`, read `.env`, run `git push`); and the child process inherits the **full** environment (`src/pilot/env.ts`), so `DISCORD_BOT_TOKEN`, `GH_TOKEN` and every provider key are readable from inside the session with one `Bash` call. Only convention holds: the system prompt tells it to route source changes through the `evolve_*` worktree tools, and `evolve_start` enforces the plan-approval gate in code. To restore a boundary, filter the child env in `env.ts` and set `permissionMode: 'default'` with a `canUseTool` gate or a `PreToolUse` hook. Threading matches every other channel: a top-level message in a pilot channel spawns a thread via the normal `createThreadForReply` path and the pilot session is keyed to that **thread** id, so each thread is an isolated SDK session (threads inherit the parent channel's pilot flag). Sessions are resumed by SDK session id after a restart, reaped after `PILOT_IDLE_MS` (default 30 min) idle, killed by `/stop`, and any child that outlives a hard kill is swept at boot by matching its cwd. `/interrupt` is the softer sibling of `/stop`: it is scoped to the channel or thread it is used in and calls the SDK's native `Query.interrupt()`, which aborts the running turn but keeps the child process and its context, so the session simply waits for the next message. It also clears our own pending queue; the shipped CLI does not implement `cancel_queued`, so anything already handed over may still run and is reported back when the CLI advertises `interrupt_receipt_v1`. Its reply names the tool that was in flight when the turn was cut. Note that an interrupt is not a rollback — side effects the turn already committed (files written, commands run) stay. Model auth arrives with the rest of the inherited environment, so pilot spends the same budget — set `PILOT_ANTHROPIC_API_KEY` (or `PILOT_ANTHROPIC_BASE_URL`/`PILOT_ANTHROPIC_MODEL`) to point pilot at a separate key, endpoint or model. Rollback is a flag flip. Relayed output goes through a batching queue (`src/pilot/relay-queue.ts`): tool-progress lines are merged on a short debounce and a 5-sends/5s token bucket waits rather than dropping, so a tool-heavy turn no longer loses lines to Discord's rate limit. Each turn ends with a `-# 📊` usage footer (per-turn tokens, cost as the delta of the SDK's cumulative total, latency), a failed tool posts a `-# ⚠️ <tool> failed` line, and an idle reap says so in the channel. If a stored session id can no longer be resumed, pilot clears it, replays whatever the CLI never answered, and starts fresh instead of failing every later turn. Pilot shares the bot's identity rather than reinventing it: `SOUL.md`, the memory-recall instructions and `/caveman` are injected into the SDK system prompt from `src/shared/prompt-fragments.ts`, the same text the main agent uses, and a failed pilot turn records an `error` signal so the reflection daemon sees it. A channel system prompt (`/config set-prompt`) is injected the same way, under a `## Channel Instructions` heading. Both are read when the session starts, so a change mid-session applies from the next one — the replies say so with a `-# 🧪` note — and both fall back to the parent channel, since the session lives on a thread while those commands write to the channel above it. Attachments work by handing over paths rather than content blocks: an image or document posted in a pilot channel is downloaded to `data/pilot/workspace/inbox/<messageId>/`, size-capped (`PILOT_ATTACHMENT_MAX_BYTES`, default 25 MB) with sanitised filenames, pruned after 24 h (`PILOT_INBOX_MAX_AGE_MS`), and its absolute path is appended to the message so the session reads it with its own tools. Pilot turns are also logged like every other channel — the user message and one assistant row per turn go into the normal `messages` tables, so `/history`, the archive, `get_conversation_history` and the log viewer all see pilot conversations. A turn that wedges no longer holds the session forever: a watchdog (`PILOT_TURN_TIMEOUT_MS`, default 15 min) interrupts it rather than killing the child, so the session stays resumable and you can just say "continue", and `PILOT_TURN_MAX_COST_USD` adds a `-# 💸` line to the footer when a single turn runs past a soft cost cap. Turning pilot mode on or off is `/pilot on|off|status` instead of a manual `channel_configs` edit (`off` also stops whatever is running), and `/clear` in a pilot channel resets the SDK session — stopping it and dropping the stored `pilotSessionId` — rather than clearing rows the pilot never reads. `/clear`, `/stop` and `/pilot off` act on the whole channel scope (the channel plus the live sessions in threads under it), because sessions key to threads while the commands are usually typed in the parent. The rest of the surface is pilot-aware too: `/restart` stops pilot children before exiting instead of orphaning them, `/ping` and `/config show` report the live session count and which runtime a channel is on, `/skills disable` is honoured by the bridged `read_skill`/`list_skill_files`, and `/model` (or a per-job cron model) sets the model a *new* pilot session starts on — `PILOT_ANTHROPIC_MODEL` still wins, and a running child keeps the model it started with. Scheduled work does not follow the channel flag at all — it is always on this runtime: **every** cron `agentTurn` job is run by a pilot session (a fresh thread per run, or the thread itself if delivery already points at one, or the DM when it points there), so each job gets a clean session with pilot's tools and workspace. The main agent loop stays reachable only as a fallback for the two cases a session can't serve — a job with no delivery channel, and a route that throws — so a job never silently stops running, plus the `CRON_RUNTIME=main` escape hatch for rolling the whole thing back with a restart instead of a revert. Consequences worth knowing: submission is fire-and-forget, so such a job is bounded by the pilot turn watchdog rather than the cron per-job timeout and its run record says only which session it went to (not its output or its real pass/fail); a per-job `model` override *is* honoured; `/cron list|show|add|set-model` mark the jobs that route to pilot; and because cron threads now appear in channels nobody flagged, a channel with a **live** session keeps routing to it regardless of the flag, so a human reply to a cron report reaches the session that wrote it rather than the other runtime. Known limit: no message-edit streaming.
+**Agent Sessions** — Every Discord message and every scheduled `agentTurn` is served by a [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) session (`src/sdk/`): one child process per target, keyed by thread / DM / channel id. A top-level message spawns a thread via the normal `createThreadForReply` path and the session keys to that **thread**, so each thread is an isolated session with its own context. Sessions are resumed by SDK session id after a restart, reaped after `SDK_IDLE_MS` (default 30 min) idle, killed by `/stop`, and any child that outlives a hard kill is swept at boot by matching its cwd. If a stored session id can no longer be resumed, the session is cleared, whatever the CLI never answered is replayed, and a fresh one starts rather than every later turn failing.
+
+**Mid-conversation injection** — the SDK prompt is an async iterable, so a message arriving mid-turn is handed to the turn already running instead of queueing behind it. When that happens the bot reacts ↩️ on the message and posts a marker line naming the tool it interrupted, so the transcript shows where the course changed.
+
+**Tools** — an in-process MCP server (`createSdkMcpServer`) bridges `send_message`, `send_file`, `add_reaction`, `ask_user`, the memory tools, the context tools `get_channel_history` / `create_thread` / `get_conversation_history` / `get_conversation_stats`, the skill tools `read_skill` / `list_skill_files` (which honour `/skills disable`), and the full `evolve_*` set — so a session self-evolves through the same worktree → PR → CI → auto-merge path, with the plan-approval gate still enforced in code by `evolve_start`.
+
+**No sandbox, by operator choice** — `permissionMode: 'bypassPermissions'` with `allowDangerouslySkipPermissions: true`: no permission prompts, no `canUseTool` gate. cwd is `data/sdk/workspace/` but nothing confines a session to it — paths and shell commands are unrestricted (a session can edit `src/**`, read `.env`, run `git push`) — and the child inherits the **full** environment (`src/sdk/env.ts`), so `DISCORD_BOT_TOKEN`, `GH_TOKEN` and every provider key are readable with one `Bash` call. Only convention holds: the system prompt says to route source changes through `evolve_*`. To restore a boundary, filter the child env in `env.ts` and set `permissionMode: 'default'` with a `canUseTool` gate or a `PreToolUse` hook.
+
+**Identity and configuration** — `SOUL.md`, the memory-recall instructions and `/caveman` are injected into the system prompt from `src/shared/prompt-fragments.ts`, and a channel prompt (`/config set-prompt`) goes in under a `## Channel Instructions` heading. Both are read at session start, so a change mid-session applies from the next one (the replies say so with a `-# 🧪` note) and both fall back to the parent channel, since the session lives on a thread while those commands write to the channel above it. `/model` (or a per-job cron model) sets the model a *new* session starts on; `SDK_ANTHROPIC_MODEL` still wins and a running child keeps the model it started with. Model auth arrives with the inherited environment — set `SDK_ANTHROPIC_API_KEY` / `SDK_ANTHROPIC_BASE_URL` to point sessions at a separate key or endpoint.
+
+**Attachments** are handed over as paths, not content blocks: an image or document is downloaded to `data/sdk/workspace/inbox/<messageId>/`, size-capped (`SDK_ATTACHMENT_MAX_BYTES`, default 25 MB) with sanitised filenames, pruned after 24 h (`SDK_INBOX_MAX_AGE_MS`), and its absolute path is appended to the message so the session reads it with its own tools.
+
+**Output and limits** — relayed output goes through a batching queue (`src/sdk/relay-queue.ts`): tool-progress lines are merged on a short debounce and a 5-sends/5s token bucket waits rather than dropping. Each turn ends with a `-# 📊` usage footer (per-turn tokens, cost as the delta of the SDK's cumulative total, latency), a failed tool posts `-# ⚠️ <tool> failed`, and an idle reap says so in the channel. A wedged turn is interrupted by a watchdog (`SDK_TURN_TIMEOUT_MS`, default 15 min) rather than killed, so the session stays resumable and you can just say "continue"; `SDK_TURN_MAX_COST_USD` adds a `-# 💸` line when a single turn passes a soft cost cap. Turns are logged like everything else — the user message and one assistant row per turn go into the normal `messages` tables, so `/history`, the archive, `get_conversation_history` and the log viewer all see them — and a failed turn records an `error` signal for the reflection daemon. `/interrupt` is the softer sibling of `/stop`: scoped to the channel or thread it is used in, it calls the SDK's native `Query.interrupt()`, aborting the running turn but keeping the child and its context, and its reply names the tool that was in flight. It also clears our pending queue; the shipped CLI does not implement `cancel_queued`, so anything already handed over may still run and is reported back once the CLI advertises `interrupt_receipt_v1`. An interrupt is not a rollback — files written and commands run stay. `/clear`, `/stop` and `/restart` act on the whole channel scope (the channel plus live sessions in threads under it), because sessions key to threads while the commands are usually typed in the parent. Known limit: no message-edit streaming.
 
 **Evolution Engine** — The bot can modify its own source code through GitHub pull requests. All changes are isolated in a git worktree at `worktrees/<id>/`, validated, and submitted as PRs via `gh` CLI. Validation runs in two modes: **Daytona Sandbox CI** (preferred) spins up an ephemeral container via `@daytona/sdk`, clones the branch, runs `npm ci`, `tsc --noEmit`, and `vitest run` in full isolation — providing clean CI without interfering with the running bot; **local fallback** runs typecheck and tests in the worktree with symlinked `node_modules` when `DAYTONA_API_KEY` is not set. The agent has 9 evolution tools: `evolve_start`, `evolve_read`, `evolve_write`, `evolve_bash`, `evolve_propose`, `evolve_suggest`, `evolve_cancel`, `evolve_review`, and `evolve_merge`. **The human gate is the build plan, not the diff:** `evolve_start` requires a `plan` plus `plan_approved: true`, so the agent must post its plan and get explicit approval before writing any code. After that, `evolve_propose` validates, opens the PR, merges it (squash), posts a deployment notification thread, and restarts to deploy — fully automatic. Set `EVOLUTION_AUTO_MERGE=false` to restore manual `evolve_review` + `evolve_merge`. If auto-merge fails (merge conflict, GitHub error) the PR is left open and `evolve_merge` is the fallback. The bot also records ideas for improvements it can't yet make (`evolve_suggest`). Evolution history is tracked in SQLite and viewable in the dashboard.
 
@@ -309,16 +321,16 @@ graph TB
             SC[Slash Commands]
         end
 
-        subgraph Agent["Agent (Anthropic SDK)"]
-            PM[processMessage]
+        subgraph Agent["Agent Runtime (Claude Agent SDK)"]
+            PM[submitToSdkSession]
             SP[System Prompt Builder]
-            TL[Tool Loop]
+            TL[SDK child process<br/>+ MCP tool bridge]
         end
 
         subgraph Systems
             SOUL[Soul System<br/>SOUL.md]
             MEM[Memory System<br/>FTS5 + mem9]
-            SESS[Session Manager<br/>+ Locking]
+            SESS[Session Manager<br/>+ Archiving]
             CRON[Cron Service]
             EVO[Evolution Engine<br/>Self-Modification]
             VOICE[Voice Transcription<br/>Whisper API]
@@ -360,7 +372,7 @@ graph TB
     SP --> SOUL
     SP --> MEM
     PM --> TL
-    TL <-->|messages + tools| CLAUDE
+    TL <-->|prompt + tool results| CLAUDE
     TL -->|memory_search, memory_get| MEM
     TL -->|send_message, send_file, add_reaction, create_thread, ask_user| CL
     TL -->|evolve_start, evolve_write, evolve_propose auto-merge| EVO
@@ -376,7 +388,7 @@ graph TB
     SOUL --> FS
     ART --> DB
     ART --> FS
-    CRON -->|agent turns| PM
+    CRON -->|agentTurn → thread| PM
     CRON -->|deliver| CL
     CRON --> FS
     VCOACH <-->|telemetry + LLM| CLAUDE
@@ -405,9 +417,8 @@ sequenceDiagram
     participant B as Bot
     participant V as Voice Transcription
     participant S as Session Manager
-    participant L as Session Lock
-    participant A as Agent
-    participant C as Claude API
+    participant K as SDK Session (child process)
+    participant C as Claude
     participant M as Memory
     participant DB as SQLite
 
@@ -416,44 +427,47 @@ sequenceDiagram
 
     opt Voice Message Detected
         B->>V: transcribeAudio(attachment URL)
-        V->>V: Download OGG → Whisper API
+        V->>V: Download OGG → local whisper.cpp
         V-->>B: transcribed text
     end
 
-    B->>S: resolveSession(channel, user)
-    S->>DB: lookup / create session
-    S-->>B: session + history
-
-    B->>L: acquireSessionLock(sessionKey)
-    Note over L: Mutex — queues if another message is processing
-
-    B->>B: Start typing indicator (refreshes every 8s)
-    B->>A: processMessage(text, history, context, abortSignal)
-    A->>A: Build system prompt (soul + memory instructions + channel config)
-    A->>C: messages.create(system, messages, tools)
-
-    loop Tool Use Loop (with duplicate detection)
-        A->>A: Check AbortSignal (graceful /stop cancellation)
-        C-->>A: tool_use: memory_search
-        A->>B: onToolCallProgress(tool, input)
-        B->>U: Tool progress message (rate-limited)
-        A->>M: searchMemory(query)
-        M->>DB: FTS5 MATCH query (sanitized)
-        M-->>A: ranked results
-        A->>DB: toolCallLog(tool, input, result, duration)
-        A->>C: tool_result + continue
-        A->>A: Check for duplicate tool calls
+    opt Attachments
+        B->>B: Download to <workspace>/inbox, append absolute paths
     end
 
-    C-->>A: text response
-    A-->>B: AgentResponse (text + images + usage)
-
-    B->>B: Stop typing indicator
+    B->>U: Create thread (top-level messages only)
+    B->>S: resolveSession(channel, user)
+    S->>DB: lookup / create session row
     B->>DB: log + archive user message
-    B->>DB: log + archive assistant response (with token usage)
-    B->>U: Create thread → reply inside
-    B->>WS: broadcastLog(entry)
-    B->>L: releaseSessionLock(sessionKey)
+
+    B->>K: submitToSdkSession(threadId, text, modelOverride?)
+
+    alt No live session
+        K->>K: spawn child (cwd data/sdk/workspace, full env, resume stored id)
+        K->>K: Build system prompt (soul + memory instructions + skills + channel prompt)
+    else Turn already running
+        K->>K: Inject into the running turn
+        K->>U: ↩️ reaction + "-# steered <tool>" marker
+    end
+
+    K->>C: query() — streaming input, bypassPermissions
+
+    loop SDK tool loop
+        C-->>K: tool_use: mcp__discordclaw__memory_search
+        K->>U: Tool progress line (debounced, 5/5s bucket)
+        K->>M: searchMemory(query)
+        M->>DB: FTS5 MATCH query (sanitized)
+        M-->>K: ranked results
+        K->>DB: toolCallLog(tool, input, result, duration)
+        K->>C: tool_result + continue
+    end
+
+    C-->>K: text response + result (usage, cost)
+    K->>U: Assistant text, then "-# 📊" usage footer
+    K->>DB: log + archive assistant response (one row per turn)
+    K->>WS: broadcastLog(entry)
+
+    Note over K: Session stays warm — reaped after SDK_IDLE_MS, or on /stop
 ```
 
 ### Cron Job Execution
@@ -463,18 +477,20 @@ sequenceDiagram
     participant T as Timer Loop
     participant CS as Cron Service
     participant ST as Cron Store
-    participant A as Agent
-    participant C as Claude API
+    participant R as Cron Route
+    participant K as SDK Session
     participant D as Discord
 
     T->>CS: tick() — check due jobs
     CS->>ST: getJobs() where nextRunAtMs <= now
 
     alt agentTurn payload
-        CS->>A: processAgentTurn(message)
-        A->>C: messages.create(soul + message)
-        C-->>A: response (agent creates thread + posts via tools)
-        A-->>CS: result text (delivery handled by agent)
+        CS->>R: planSdkCronRoute(delivery channel, job)
+        R-->>CS: session channel + needsThread
+        Note over R: null route → throw, so the run record shows it
+        CS->>D: ensureThread(job name) if needed
+        CS->>K: submitToSdkSession(threadId, prompt, job model?)
+        K-->>CS: fire-and-forget (session posts via tools)
     else systemEvent payload
         CS->>CS: log event text
         opt delivery configured
@@ -944,14 +960,13 @@ discordclaw/
 │   ├── restart.ts            # Shared restart trigger — avoids circular deps
 │   ├── bot/                   # Discord bot (discord.js v14)
 │   │   ├── client.ts          # Client setup, intents, event routing, DM raw fallback
-│   │   ├── messages.ts        # Message pipeline: filter → lock → voice transcribe → thread create → pilot route → session → agent → thread reply
+│   │   ├── messages.ts        # Message pipeline: filter → voice transcribe → thread create → session dispatch
 │   │   └── commands.ts        # Slash commands: /ping /help /config /clear /soul /skills /cron /caveman /restart /stop /interrupt /join /leave
-│   ├── agent/                 # Claude integration
-│   │   ├── agent.ts           # Anthropic SDK wrapper, system prompt, tool loop + duplicate detection + abort signal
+│   ├── agent/                 # Tool definitions + session bookkeeping (bridged into SDK sessions)
 │   │   ├── tools.ts           # Discord tools (send_message, send_file, add_reaction, get_channel_history, create_thread, ask_user)
 │   │   ├── questions.ts       # Pending ask_user questions (embed + buttons, answer routing)
 │   │   ├── dangerous-tools.ts # Powerful tools: bash, read_file, write_file
-│   │   ├── session-lock.ts    # Per-session mutex lock with AbortSignal for /stop cancellation
+│   │   ├── tool-paths.ts      # Workspace path resolution for the file tools
 │   │   └── sessions.ts        # Per-thread/DM session tracking + TTL + message archiving
 │   ├── audio/                 # Voice message handling
 │   │   ├── transcribe.ts      # Backend chain: whisper.cpp → Parakeet → OpenAI, with per-backend diagnostics
@@ -972,11 +987,12 @@ discordclaw/
 │   │   ├── player.ts          # Voice channel connection + audio playback for coach
 │   │   ├── listener.ts        # Rider speech capture via VAD+STT, queued for coach brain
 │   │   └── mock-server.ts     # Simulated cycling telemetry (power, HR, cadence, speed)
-│   ├── pilot/                 # Pilot mode: Claude Agent SDK sessions per thread
+│   ├── sdk/                   # The agent runtime: one Claude Agent SDK session per thread/DM/channel
 │   │   ├── session.ts         # Per-channel SDK session, streaming-input queue, relay, usage footer, resume self-heal, idle reap, orphan sweep
 │   │   ├── relay-queue.ts     # Batching send queue: debounced merge + 5-per-5s token bucket (no dropped lines)
 │   │   ├── attachments.ts     # Downloads Discord attachments into <workspace>/inbox and hands over paths
 │   │   ├── bridge.ts          # In-process MCP server re-exporting Discord/memory/skill/history/evolve_* tools
+│   │   ├── cron-route.ts      # Routes a cron agentTurn to a session: fresh thread, the thread itself, or the DM
 │   │   ├── env.ts             # Child-process env: full inheritance, secrets included (no allowlist)
 │   │   └── index.ts           # Public surface
 │   ├── artifacts/             # Persistent file storage for session I/O
@@ -995,10 +1011,10 @@ discordclaw/
 │   │   ├── memory.ts          # File discovery, FTS5 indexing, BM25 search, query sanitization
 │   │   ├── mem9.ts            # mem9 cloud memory API client (semantic vector search)
 │   │   └── tools.ts           # memory_search + memory_get + mem9_store/update/delete tool definitions
-│   ├── shared/                # Utilities shared between main agent, voice agent and pilot
+│   ├── shared/                # Utilities shared across the runtime, the voice agents and the slash commands
 │   │   ├── paths.ts           # Project root resolution
-│   │   ├── format.ts          # Token/duration formatting for the -# usage footer (shared by agent + pilot)
-│   │   ├── prompt-fragments.ts # Memory-recall + caveman prompt text shared by agent and pilot
+│   │   ├── format.ts          # Token/duration formatting for the -# usage footer
+│   │   ├── prompt-fragments.ts # Memory-recall + caveman prompt text (system prompt + slash commands)
 │   │   ├── anthropic.ts       # Anthropic SDK client factory
 │   │   ├── discord-utils.ts   # Channel/guild helpers
 │   │   └── conversation-history.ts # Cross-session message loading + conversation history tools

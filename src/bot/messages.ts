@@ -3,46 +3,28 @@ import {
   type Message as DiscordMessage,
   type TextChannel,
   type ThreadChannel,
-  EmbedBuilder,
-  AttachmentBuilder,
   MessageFlags,
   ChannelType,
 } from "discord.js";
-import { existsSync } from "fs";
 import { basename, extname } from "path";
-import { processMessage } from "../agent/agent.js";
-import type { AgentResponse, AgentImage, ToolCallProgress } from "../agent/agent.js";
-import { resolveSession, getSessionHistory } from "../agent/sessions.js";
+import { resolveSession } from "../agent/sessions.js";
 import { getChannelConfig, addMessage } from "../db/index.js";
 import {
   findLiveQuestionForMessage,
   resolveQuestion,
 } from "../agent/questions.js";
-import {
-  buildThreadHistory,
-  appendThreadMessages,
-  clearThreadHistoryCache,
-} from "./thread-history.js";
-import type { Message as DbMessage, TokenUsage } from "../db/index.js";
 import { broadcastLog } from "../gateway/server.js";
 import {
-  savePilotAttachments,
+  saveSdkAttachments,
   formatAttachmentBlock,
-} from "../pilot/attachments.js";
+} from "../sdk/attachments.js";
 import { isRestarting } from "../restart.js";
 import { transcribeAudio, getLastTranscriptionFailureSummary } from "../audio/transcribe.js";
 import { recordSignal } from "../reflection/signals.js";
-import { splitMessage, DISCORD_MAX_LENGTH } from "../shared/discord-utils.js";
-import { fmtDuration, fmtTokens } from "../shared/format.js";
-import { acquireSessionLock, SessionAbortedError } from "../agent/session-lock.js";
 import {
-  hasLivePilotSession,
-  isPilotChannelId,
-  pilotConfigChannelId,
-  submitToPilotSession,
-  type PilotChannelTarget,
-} from "../pilot/index.js";
-import { registerArtifactFromBuffer } from "../artifacts/index.js";
+  submitToSdkSession,
+  type SdkChannelTarget,
+} from "../sdk/index.js";
 import type Anthropic from "@anthropic-ai/sdk";
 
 // ---------------------------------------------------------------------------
@@ -75,127 +57,8 @@ export function registerBotThread(threadId: string): void {
   botCreatedThreads.add(threadId);
 }
 
-// ---------------------------------------------------------------------------
-// URL validation helper
-// ---------------------------------------------------------------------------
 
-/**
- * Validate and optionally sanitize a URL for use in Discord embeds.
- * Returns the sanitized URL string if valid, or null if the URL is malformed.
- *
- * Attempts basic fixes:
- * - Prepend "https://" if protocol is missing
- * - Encode spaces as %20
- */
-function sanitizeImageUrl(url: string): string | null {
-  let candidate = url.trim();
 
-  // Quick reject: empty strings or obvious non-URLs
-  if (!candidate || candidate.length < 5) return null;
-
-  // Attempt fix: prepend https:// if no protocol
-  if (!candidate.match(/^https?:\/\//i)) {
-    // Only prepend if it looks like a domain (contains a dot)
-    if (candidate.includes(".")) {
-      candidate = `https://${candidate}`;
-    } else {
-      return null;
-    }
-  }
-
-  // Attempt fix: encode spaces
-  candidate = candidate.replace(/ /g, "%20");
-
-  // Validate with URL constructor
-  try {
-    const parsed = new URL(candidate);
-    // Ensure it's actually http(s) — reject data: URIs, javascript:, etc.
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return null;
-    }
-    return parsed.href;
-  } catch {
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Image handling helpers
-// ---------------------------------------------------------------------------
-
-/** Discord supports up to 10 embeds per message. */
-const MAX_EMBEDS_PER_MESSAGE = 10;
-
-/**
- * Build Discord embeds for URL-based images.
- * Each image gets its own embed so Discord renders them all.
- * Invalid URLs are filtered out with a warning log to prevent
- * Discord API rejections (URL_TYPE_INVALID_URL).
- */
-function buildImageEmbeds(images: AgentImage[]): EmbedBuilder[] {
-  const urlImages = images.filter((img) => img.type === "url");
-  const embeds: EmbedBuilder[] = [];
-
-  for (const img of urlImages.slice(0, MAX_EMBEDS_PER_MESSAGE)) {
-    const validUrl = sanitizeImageUrl(img.source);
-    if (!validUrl) {
-      console.warn(
-        `[bot] Skipping invalid image URL for embed: "${img.source.slice(0, 200)}"`,
-      );
-      continue;
-    }
-
-    const embed = new EmbedBuilder().setImage(validUrl);
-    if (img.alt) {
-      embed.setDescription(img.alt);
-    }
-    embeds.push(embed);
-  }
-
-  return embeds;
-}
-
-/**
- * Build Discord attachment builders for local file images.
- */
-function buildImageAttachments(images: AgentImage[]): AttachmentBuilder[] {
-  const fileImages = images.filter(
-    (img) => img.type === "file" && existsSync(img.source),
-  );
-  return fileImages.map((img) => {
-    const name = basename(img.source);
-    return new AttachmentBuilder(img.source, { name, description: img.alt });
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Token usage formatting
-// ---------------------------------------------------------------------------
-
-/** Per-million-token pricing */
-const PRICING: Record<string, { input: number; output: number; cacheRead: number; cacheCreate: number }> = {
-  default: { input: 3.0, output: 15.0, cacheRead: 0.30, cacheCreate: 3.75 },
-};
-
-function getModelPricing(model: string) {
-  // Could add model-specific pricing here in the future
-  void model;
-  return PRICING.default;
-}
-
-/** Build a single-line usage string for appending to the message */
-function formatUsageLine(usage: TokenUsage, durationMs?: number): string {
-  const pricing = getModelPricing(usage.model);
-  const cost =
-    (usage.inputTokens * pricing.input +
-      usage.outputTokens * pricing.output +
-      usage.cacheReadTokens * pricing.cacheRead +
-      usage.cacheCreationTokens * pricing.cacheCreate) /
-    1e6;
-
-  const durationPart = durationMs != null ? ` · ${fmtDuration(durationMs)}` : "";
-  return `-# 📊 ${usage.model} · ${fmtTokens(usage.inputTokens)} in / ${fmtTokens(usage.outputTokens)} out · $${cost.toFixed(4)}${durationPart}`;
-}
 
 // ---------------------------------------------------------------------------
 // Voice message detection & transcription
@@ -274,8 +137,6 @@ const SUPPORTED_IMAGE_TYPES: Record<string, Anthropic.Messages.Base64ImageSource
   "image/webp": "image/webp",
 };
 
-/** Max image size to fetch (20 MB). Discord CDN allows up to 25 MB. */
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 /**
  * Check if a Discord message has image attachments.
@@ -287,96 +148,6 @@ function hasImageAttachments(message: DiscordMessage): boolean {
   });
 }
 
-/**
- * Fetch image attachments from a Discord message and convert them to
- * Anthropic ImageBlockParam content blocks (base64-encoded).
- *
- * Also registers each image as an input artifact when sessionId is provided.
- *
- * Skips images that are too large or fail to download.
- */
-async function buildImageContentBlocks(
-  message: DiscordMessage,
-  sessionId?: string,
-): Promise<Anthropic.Messages.ImageBlockParam[]> {
-  const imageAttachments = message.attachments.filter((att) => {
-    const ct = att.contentType?.toLowerCase() || "";
-    return ct in SUPPORTED_IMAGE_TYPES;
-  });
-
-  if (imageAttachments.size === 0) return [];
-
-  const blocks: Anthropic.Messages.ImageBlockParam[] = [];
-
-  for (const [, attachment] of imageAttachments) {
-    try {
-      // Skip overly large images
-      if (attachment.size && attachment.size > MAX_IMAGE_BYTES) {
-        console.log(
-          `[bot] Skipping image ${attachment.name} — too large (${(attachment.size / 1024 / 1024).toFixed(1)} MB)`,
-        );
-        continue;
-      }
-
-      const response = await fetch(attachment.url);
-      if (!response.ok) {
-        console.error(
-          `[bot] Failed to fetch image ${attachment.name}: HTTP ${response.status}`,
-        );
-        continue;
-      }
-
-      const buffer = Buffer.from(await response.arrayBuffer());
-      const base64 = buffer.toString("base64");
-      const mediaType =
-        SUPPORTED_IMAGE_TYPES[attachment.contentType?.toLowerCase() || ""];
-
-      if (!mediaType) continue;
-
-      blocks.push({
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: mediaType,
-          data: base64,
-        },
-      });
-
-      // Register as input artifact (fire-and-forget — don't block on this)
-      if (sessionId) {
-        registerArtifactFromBuffer(
-          {
-            sessionId,
-            direction: "input",
-            filename: attachment.name || "image",
-            mimeType: mediaType,
-            discordUrl: attachment.url,
-            discordMessageId: message.id,
-            sizeBytes: buffer.length,
-            metadata: {
-              width: attachment.width ?? undefined,
-              height: attachment.height ?? undefined,
-            },
-          },
-          buffer,
-        ).catch((err) =>
-          console.error(`[bot] Failed to register image artifact:`, err),
-        );
-      }
-
-      console.log(
-        `[bot] Loaded image attachment: ${attachment.name} (${mediaType}, ${(buffer.length / 1024).toFixed(0)} KB)`,
-      );
-    } catch (err) {
-      console.error(
-        `[bot] Failed to process image attachment ${attachment.name}:`,
-        err,
-      );
-    }
-  }
-
-  return blocks;
-}
 
 // ---------------------------------------------------------------------------
 // Text file & document attachment handling
@@ -454,8 +225,6 @@ const TEXT_MIME_PREFIXES = [
 /** Max text file size to fetch (1 MB — text files can be large but we need to be reasonable). */
 const MAX_TEXT_FILE_BYTES = 1 * 1024 * 1024;
 
-/** Max characters to include from a single text file (to avoid blowing up context). */
-const MAX_TEXT_FILE_CHARS = 500_000;
 
 /**
  * Check if an attachment is a text-based file we can read.
@@ -503,173 +272,7 @@ function hasPdfAttachments(message: DiscordMessage): boolean {
   return message.attachments.some((att) => isPdfAttachment(att));
 }
 
-/**
- * Fetch text file attachments and build Anthropic DocumentBlockParam blocks.
- * Uses PlainTextSource for text files.
- *
- * Also registers each file as an input artifact when sessionId is provided.
- */
-async function buildTextFileContentBlocks(
-  message: DiscordMessage,
-  sessionId?: string,
-): Promise<Anthropic.Messages.DocumentBlockParam[]> {
-  const textAttachments = message.attachments.filter((att) => isTextFileAttachment(att));
 
-  if (textAttachments.size === 0) return [];
-
-  const blocks: Anthropic.Messages.DocumentBlockParam[] = [];
-
-  for (const [, attachment] of textAttachments) {
-    try {
-      // Skip overly large files
-      if (attachment.size && attachment.size > MAX_TEXT_FILE_BYTES) {
-        console.log(
-          `[bot] Skipping text file ${attachment.name} — too large (${(attachment.size / 1024).toFixed(0)} KB, max ${(MAX_TEXT_FILE_BYTES / 1024).toFixed(0)} KB)`,
-        );
-        continue;
-      }
-
-      const response = await fetch(attachment.url);
-      if (!response.ok) {
-        console.error(
-          `[bot] Failed to fetch text file ${attachment.name}: HTTP ${response.status}`,
-        );
-        continue;
-      }
-
-      let text = await response.text();
-
-      // Register as input artifact (save full content before truncation)
-      if (sessionId) {
-        const textBuffer = Buffer.from(text, "utf-8");
-        registerArtifactFromBuffer(
-          {
-            sessionId,
-            direction: "input",
-            filename: attachment.name || "file.txt",
-            mimeType: attachment.contentType || "text/plain",
-            discordUrl: attachment.url,
-            discordMessageId: message.id,
-            sizeBytes: textBuffer.length,
-            metadata: { charCount: text.length },
-          },
-          textBuffer,
-        ).catch((err) =>
-          console.error(`[bot] Failed to register text file artifact:`, err),
-        );
-      }
-
-      // Truncate if too long
-      if (text.length > MAX_TEXT_FILE_CHARS) {
-        text = text.slice(0, MAX_TEXT_FILE_CHARS) + `\n\n[... truncated at ${MAX_TEXT_FILE_CHARS.toLocaleString()} characters]`;
-        console.log(
-          `[bot] Truncated text file ${attachment.name} to ${MAX_TEXT_FILE_CHARS.toLocaleString()} characters`,
-        );
-      }
-
-      blocks.push({
-        type: "document",
-        source: {
-          type: "text",
-          media_type: "text/plain",
-          data: text,
-        },
-        title: attachment.name || undefined,
-      });
-
-      console.log(
-        `[bot] Loaded text file: ${attachment.name} (${text.length.toLocaleString()} chars)`,
-      );
-    } catch (err) {
-      console.error(
-        `[bot] Failed to process text file ${attachment.name}:`,
-        err,
-      );
-    }
-  }
-
-  return blocks;
-}
-
-/**
- * Fetch PDF attachments and build Anthropic DocumentBlockParam blocks.
- * Uses Base64PDFSource for PDFs.
- *
- * Also registers each PDF as an input artifact when sessionId is provided.
- */
-async function buildPdfContentBlocks(
-  message: DiscordMessage,
-  sessionId?: string,
-): Promise<Anthropic.Messages.DocumentBlockParam[]> {
-  const pdfAttachments = message.attachments.filter((att) => isPdfAttachment(att));
-
-  if (pdfAttachments.size === 0) return [];
-
-  const blocks: Anthropic.Messages.DocumentBlockParam[] = [];
-
-  for (const [, attachment] of pdfAttachments) {
-    try {
-      // Skip overly large files (PDFs can be up to 32MB for Claude)
-      const maxPdfBytes = 32 * 1024 * 1024;
-      if (attachment.size && attachment.size > maxPdfBytes) {
-        console.log(
-          `[bot] Skipping PDF ${attachment.name} — too large (${(attachment.size / 1024 / 1024).toFixed(1)} MB, max 32 MB)`,
-        );
-        continue;
-      }
-
-      const response = await fetch(attachment.url);
-      if (!response.ok) {
-        console.error(
-          `[bot] Failed to fetch PDF ${attachment.name}: HTTP ${response.status}`,
-        );
-        continue;
-      }
-
-      const buffer = Buffer.from(await response.arrayBuffer());
-      const base64 = buffer.toString("base64");
-
-      blocks.push({
-        type: "document",
-        source: {
-          type: "base64",
-          media_type: "application/pdf",
-          data: base64,
-        },
-        title: attachment.name || undefined,
-      });
-
-      // Register as input artifact (fire-and-forget)
-      if (sessionId) {
-        registerArtifactFromBuffer(
-          {
-            sessionId,
-            direction: "input",
-            filename: attachment.name || "document.pdf",
-            mimeType: "application/pdf",
-            discordUrl: attachment.url,
-            discordMessageId: message.id,
-            sizeBytes: buffer.length,
-          },
-          buffer,
-        ).catch((err) =>
-          console.error(`[bot] Failed to register PDF artifact:`, err),
-        );
-      }
-
-      console.log(
-        `[bot] Loaded PDF: ${attachment.name} (${(buffer.length / 1024).toFixed(0)} KB)`,
-      );
-    } catch (err) {
-      console.error(
-        `[bot] Failed to process PDF ${attachment.name}:`,
-        err,
-      );
-    }
-  }
-
-  return blocks;
-}
 
 // ---------------------------------------------------------------------------
 // Thread creation helper
@@ -809,362 +412,8 @@ function isMonitoredChannel(message: DiscordMessage): boolean {
   return config?.settings?.monitor === true;
 }
 
-/**
- * True when this message belongs to a channel running in pilot mode
- * (Claude Agent SDK sessions instead of our own agent loop).
- *
- * Pilot mode is a per-channel data flag: channel_configs.settings.pilot.
- * Threads inherit pilot mode from their parent channel — same semantics as
- * isMonitoredChannel — so pilot conversations get the normal Discord threading
- * behaviour with one isolated SDK session per thread.
- *
- * A live session in this exact channel also counts, independently of the flag,
- * so cron-spawned sessions in unflagged channels can be replied to.
- */
-function isPilotChannel(message: DiscordMessage): boolean {
-  // A channel that already has a live session keeps talking to it, flag or not.
-  // Cron runs every agent turn on the SDK now, including in channels nobody
-  // flagged, so without this a reply to a cron report inside the thread that
-  // report was written in would be answered by the main agent loop — a second
-  // runtime with none of that session's context. Once the session is stopped or
-  // idle-reaped, routing goes back to the channel flag on its own.
-  if (hasLivePilotSession(message.channelId)) return true;
-
-  const configChannelId = pilotConfigChannelId({
-    channelId: message.channelId,
-    isDM: message.channel.isDMBased(),
-    isThread: isThreadChannel(message),
-    parentId: isThreadChannel(message)
-      ? (message.channel as ThreadChannel).parentId
-      : null,
-  });
-  if (!configChannelId) return false;
-  return isPilotChannelId(configChannelId);
-}
-
-// ---------------------------------------------------------------------------
-// Discord thread history fetching
-// ---------------------------------------------------------------------------
-
-/** Max messages to fetch from Discord thread history */
-const MAX_THREAD_HISTORY_MESSAGES = 50;
-
-/**
- * Fetch message history from a Discord thread and convert to DbMessage format.
- * This provides context when the DB session is new/empty but the thread
- * already has conversation history.
- *
- * Excludes the current message (which will be sent separately).
- * Returns messages in chronological order (oldest first).
- */
-async function fetchDiscordThreadHistory(
-  thread: ThreadChannel,
-  currentMessageId: string,
-  sessionId: string,
-): Promise<DbMessage[]> {
-  try {
-    const botUserId = botClient?.user?.id;
-
-    // Fetch recent messages from the thread (Discord returns newest-first)
-    const discordMessages = await thread.messages.fetch({
-      limit: MAX_THREAD_HISTORY_MESSAGES,
-    });
-
-    if (discordMessages.size === 0) return [];
-
-    // Convert to array, filter out the current message, and sort chronologically
-    const sorted = Array.from(discordMessages.values())
-      .filter((msg) => msg.id !== currentMessageId)
-      .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-    if (sorted.length === 0) return [];
-
-    // Convert Discord messages to DbMessage format
-    const messages: DbMessage[] = [];
-    let idCounter = 0;
-
-    for (const msg of sorted) {
-      // Determine role: bot messages are "assistant", everything else is "user"
-      const isBot = msg.author.bot && msg.author.id === botUserId;
-      const role = isBot ? "assistant" : "user";
-
-      // Get message content — prefix user messages with the author name
-      // for multi-user threads so the agent knows who said what
-      let content = msg.content || "";
-
-      // Skip empty messages (e.g. embeds-only from the bot, system messages)
-      if (!content && msg.attachments.size === 0) continue;
-
-      // For user messages, prefix with author name
-      if (role === "user" && content) {
-        const authorName = msg.author.displayName ?? msg.author.username;
-        content = `${authorName}: ${content}`;
-      }
-
-      // Note attachments if present
-      if (msg.attachments.size > 0 && role === "user") {
-        const attachmentNames = msg.attachments.map((att) => att.name).filter(Boolean).join(", ");
-        if (attachmentNames) {
-          content = content
-            ? `${content}\n\n[Attachments: ${attachmentNames}]`
-            : `[Attachments: ${attachmentNames}]`;
-        }
-      }
-
-      if (!content) continue;
-
-      // Strip bot mentions from content (clean up for context)
-      if (botUserId) {
-        content = content.replace(new RegExp(`<@!?${botUserId}>`, "g"), "").trim();
-      }
-
-      if (!content) continue;
-
-      messages.push({
-        id: idCounter++,
-        sessionId,
-        role,
-        content,
-        discordMessageId: msg.id,
-        createdAt: msg.createdTimestamp,
-      });
-    }
-
-    return messages;
-  } catch (err) {
-    console.error("[bot] Failed to fetch Discord thread history:", err);
-    return [];
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Tool call progress → Discord message formatting
-// ---------------------------------------------------------------------------
-
-/** Emoji map for tool categories */
-const TOOL_EMOJI: Record<string, string> = {
-  // Memory
-  memory_search: "🔍",
-  memory_get: "📖",
-  mem9_store: "💾",
-  mem9_update: "✏️",
-  mem9_delete: "🗑️",
-  // Discord
-  send_message: "💬",
-  send_file: "📎",
-  add_reaction: "😀",
-  get_channel_history: "📜",
-  create_thread: "🧵",
-  // Skills
-  read_skill: "📚",
-  list_skill_files: "📂",
-  // Dangerous / system
-  bash: "⚙️",
-  read_file: "📄",
-  write_file: "✍️",
-  // Evolution
-  evolve_start: "🧬",
-  evolve_read: "🧬",
-  evolve_write: "🧬",
-  evolve_bash: "🧬",
-  evolve_propose: "🧬",
-  evolve_suggest: "💡",
-  evolve_cancel: "🧬",
-  evolve_review: "🧬",
-  evolve_merge: "🧬",
-  // Conversation history
-  get_conversation_history: "📜",
-  get_conversation_stats: "📊",
-};
-
-/** Max length for tool input/result preview in Discord message */
 
 
-/** Truncate a string and add ellipsis if too long */
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return s.slice(0, max - 1) + "…";
-}
-
-/**
- * Format a tool input object into a brief human-readable preview.
- * Shows key parameters without overwhelming the Discord channel.
- */
-function formatToolInput(toolName: string, input: Record<string, unknown>): string {
-  // For specific tools, show the most relevant parameter
-  switch (toolName) {
-    case "memory_search":
-      return input.query ? `\`${truncate(String(input.query), 80)}\`` : "";
-    case "memory_get":
-      return input.path ? `\`${truncate(String(input.path), 80)}\`` : "";
-    case "mem9_store":
-      return input.content ? `\`${truncate(String(input.content), 100)}\`` : "";
-    case "bash":
-      return input.command ? `\`${truncate(String(input.command), 120)}\`` : "";
-    case "read_file":
-    case "write_file":
-      return input.path ? `\`${truncate(String(input.path), 100)}\`` : "";
-    case "read_skill":
-      return input.skill_name ? `\`${String(input.skill_name)}\`` : "";
-    case "send_message":
-      return input.text ? `\`${truncate(String(input.text), 80)}\`` : "";
-    case "evolve_start":
-      return input.reason ? `\`${truncate(String(input.reason), 100)}\`` : "";
-    case "evolve_read":
-    case "evolve_write":
-      return input.path ? `\`${truncate(String(input.path), 100)}\`` : "";
-    case "evolve_bash":
-      return input.command ? `\`${truncate(String(input.command), 120)}\`` : "";
-    case "evolve_propose":
-      return input.summary ? `\`${truncate(String(input.summary), 100)}\`` : "";
-    case "evolve_suggest":
-      return input.what ? `\`${truncate(String(input.what), 100)}\`` : "";
-    default: {
-      // Generic: show first string-valued key
-      const firstKey = Object.keys(input).find((k) => typeof input[k] === "string");
-      if (firstKey) {
-        return `\`${truncate(String(input[firstKey]), 80)}\``;
-      }
-      return "";
-    }
-  }
-}
-
-/**
- * Extract an error message from a tool result, if any.
- * Returns an error string if the tool failed, or null if it succeeded.
- */
-function extractToolError(result: string): string | null {
-  try {
-    const parsed = JSON.parse(result);
-    if (parsed.error) {
-      return truncate(String(parsed.error), 120);
-    }
-  } catch {
-    // Not JSON
-  }
-  // Check for common error patterns in raw text
-  if (result.startsWith("Error:") || result.startsWith("error:")) {
-    return truncate(result, 120);
-  }
-  return null;
-}
-
-/**
- * Build the Discord message text for a tool call progress event.
- * Shows tool name + input only. Appends error info if the tool failed.
- * Returns null if this tool call should be silently skipped.
- */
-function formatToolCallMessage(progress: ToolCallProgress): string | null {
-  const emoji = TOOL_EMOJI[progress.toolName] || "\u{1f527}";
-  const inputPreview = formatToolInput(progress.toolName, progress.toolInput);
-  const inputPart = inputPreview ? ` ${inputPreview}` : "";
-
-  if (progress.phase === "start") {
-    return `-# ${emoji} **${progress.toolName}**${inputPart}`;
-  }
-
-  // phase === "result" — show tool name + input, append error only if failed
-  if (progress.result !== undefined) {
-    const error = extractToolError(progress.result);
-    if (error) {
-      return `-# ${emoji} **${progress.toolName}**${inputPart} \u2014 \u274c ${error}`;
-    }
-    // Success — just show tool name + input (no result preview)
-    return `-# ${emoji} **${progress.toolName}**${inputPart}`;
-  }
-
-  return null;
-}
-
-
-// ---------------------------------------------------------------------------
-// Rate-limited tool call progress sender
-// ---------------------------------------------------------------------------
-
-/**
- * Creates an onToolCallProgress callback that sends tool call updates
- * to a Discord channel as separate messages.
- *
- * Batches rapid tool calls to respect Discord rate limits (~5 msgs / 5s).
- * Only sends "result" phase messages (start + result would double the noise).
- */
-function createToolCallProgressHandler(
-  replyTarget: DiscordMessage["channel"] | ThreadChannel,
-): (progress: ToolCallProgress) => Promise<void> {
-  // Rate limiting: track messages sent in the current window
-  let messagesSentInWindow = 0;
-  let windowStart = Date.now();
-  const MAX_MESSAGES_PER_WINDOW = 4; // Leave headroom for the final response
-  const WINDOW_MS = 5000; // 5 second window
-
-  // Batch buffer for when rate limited
-  let pendingBatch: string[] = [];
-  let batchFlushTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const sendToDiscord = async (text: string) => {
-    if (!("send" in replyTarget)) return;
-
-    // Ensure within Discord's 2000 char limit
-    const truncatedText = text.length > DISCORD_MAX_LENGTH
-      ? text.slice(0, DISCORD_MAX_LENGTH - 3) + "..."
-      : text;
-
-    try {
-      await (replyTarget as TextChannel | ThreadChannel).send(truncatedText);
-    } catch (err) {
-      console.error("[bot] Failed to send tool progress message:", err);
-    }
-  };
-
-  const flushBatch = async () => {
-    if (pendingBatch.length === 0) return;
-    const combined = pendingBatch.join("\n");
-    pendingBatch = [];
-    batchFlushTimer = null;
-    await sendToDiscord(combined);
-    messagesSentInWindow++;
-  };
-
-  return async (progress: ToolCallProgress) => {
-    // Only send "result" phase to reduce noise — shows both input and output in one message
-    if (progress.phase !== "result") return;
-
-    const msgText = formatToolCallMessage(progress);
-    if (!msgText) return;
-
-    // Reset rate limit window if enough time has passed
-    const now = Date.now();
-    if (now - windowStart > WINDOW_MS) {
-      messagesSentInWindow = 0;
-      windowStart = now;
-    }
-
-    // If under rate limit, send immediately (flushing any pending batch first)
-    if (messagesSentInWindow < MAX_MESSAGES_PER_WINDOW) {
-      if (pendingBatch.length > 0) {
-        pendingBatch.push(msgText);
-        await flushBatch();
-      } else {
-        await sendToDiscord(msgText);
-        messagesSentInWindow++;
-      }
-    } else {
-      // Over rate limit — batch the message
-      pendingBatch.push(msgText);
-
-      // Set a flush timer if not already set
-      if (!batchFlushTimer) {
-        const timeToWindowEnd = WINDOW_MS - (now - windowStart);
-        batchFlushTimer = setTimeout(async () => {
-          messagesSentInWindow = 0;
-          windowStart = Date.now();
-          await flushBatch();
-        }, timeToWindowEnd + 100); // Small buffer after window resets
-      }
-    }
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Main message handler
@@ -1186,7 +435,6 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
   const hasDocuments = hasTextFiles || hasPdfs;
   const inBotThread = isBotCreatedThread(message);
   const inMonitoredChannel = !isDM && isMonitoredChannel(message);
-  const inPilotChannel = isPilotChannel(message);
 
   console.log(
     `[bot] Message from ${message.author.tag} isDM=${isDM} isVoice=${isVoice} hasAudio=${hasAudio} hasImages=${hasImages} hasTextFiles=${hasTextFiles} hasPdfs=${hasPdfs} inBotThread=${inBotThread} monitored=${inMonitoredChannel} content="${message.content.slice(0, 80)}"`,
@@ -1204,7 +452,6 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
     if (
       !inBotThread &&
       !inMonitoredChannel &&
-      !inPilotChannel &&
       !message.mentions.has(botUser)
     ) {
       console.log("[bot] Skipping — bot not mentioned and not in bot thread or monitored channel");
@@ -1261,7 +508,7 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
   // Strip bot mention from content before sending to the agent
   let cleanContent = message.content.replace(/<@!?\d+>/g, "").trim();
 
-  // 6b. Handle voice messages — transcribe audio and use as message content
+  // 6a. Handle voice messages — transcribe audio and use as message content
   if (isVoice || hasAudio) {
     // Show typing while we transcribe
     if ("sendTyping" in message.channel) {
@@ -1316,10 +563,10 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
     }
   }
 
-  // 6e. Pilot mode pre-check — bail out before thread creation when there is
-  // nothing a pilot session could act on, so we never leave an empty thread
-  // behind. Placed after transcription so voice messages still work.
-  if (inPilotChannel && !cleanContent && message.attachments.size === 0) {
+  // 6b. Bail out before thread creation when there is nothing the session could
+  // act on, so we never leave an empty thread behind. Placed after
+  // transcription so voice messages still work.
+  if (!cleanContent && message.attachments.size === 0) {
     return;
   }
 
@@ -1335,493 +582,89 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
     // If thread creation fails, fall back to replying in channel directly
   }
 
-  // 7b. Pilot mode — hand the conversation over to a Claude Agent SDK session
-  // instead of our own agent loop. Runs *after* thread creation so pilot uses
-  // exactly the same threading behaviour as every other channel: a top-level
-  // message spawns a thread via createThreadForReply, and the pilot session is
-  // keyed to that thread id. One isolated SDK session per thread; mid-turn
-  // message injection still works inside a thread. If thread creation failed,
-  // replyTarget is still the channel, so we degrade to an in-channel session.
-  if (inPilotChannel) {
-    // A Discord thread already carries `parentId`, and PilotChannelTarget now
-    // declares it — the session needs that link because it is keyed to the
-    // thread while channel settings and channel-level commands live on the
-    // parent. Cast, don't clone: cloning would drop the channel's own methods.
-    const target = replyTarget as unknown as PilotChannelTarget;
+  // 7b. Hand the conversation to the Claude Agent SDK session for this channel.
+  // Runs *after* thread creation so the session is keyed to the thread id: one
+  // isolated session per thread, with mid-turn message injection inside it. If
+  // thread creation failed, replyTarget is still the channel, so we degrade to
+  // an in-channel session.
+  //
+  // A Discord thread already carries `parentId`, and SdkChannelTarget declares
+  // it — the session needs that link because it is keyed to the thread while
+  // channel settings and channel-level commands live on the parent. Cast, don't
+  // clone: cloning would drop the channel's own methods.
+  const target = replyTarget as unknown as SdkChannelTarget;
 
-    // A pilot session takes plain text, not content blocks, but it has its own
-    // Read tool — so attachments are downloaded into its workspace and handed
-    // over as absolute paths. Skipped ones are named, never silently dropped.
-    let pilotText = cleanContent;
-    if (message.attachments.size > 0) {
-      if ("sendTyping" in message.channel) {
-        message.channel.sendTyping().catch(() => {});
-      }
-      const result = await savePilotAttachments(
-        message.id,
-        [...message.attachments.values()].map((a) => ({
-          name: a.name,
-          url: a.url,
-          size: a.size,
-          contentType: a.contentType,
-        })),
-      );
-      const block = formatAttachmentBlock(result);
-      if (block) pilotText = pilotText ? `${pilotText}\n${block}` : block.trim();
-      console.log(
-        `[bot] Pilot attachments for ${target.id}: ${result.saved.length} saved, ${result.skipped.length} skipped`,
-      );
-    }
-
-    // Log the human side into the normal conversation tables so a pilot thread
-    // is visible to /history, the archive and get_conversation_history. The
-    // assistant side is written by the session itself, once per turn.
-    const pilotChannelName =
-      "name" in message.channel && message.channel.name ? message.channel.name : "DM";
-    let pilotLogSessionId: string | undefined;
-    try {
-      const pilotSessionRow = resolveSession({
-        threadId: sessionThreadId,
-        channelId: message.channelId,
-        userId: message.author.id,
-        guildId: message.guildId || undefined,
-        isDM,
-      });
-      pilotLogSessionId = pilotSessionRow.id;
-      addMessage({
-        sessionId: pilotSessionRow.id,
-        role: "user",
-        content: pilotText,
-        discordMessageId: message.id,
-      });
-      broadcastLog({
-        type: "message",
-        sessionId: pilotSessionRow.id,
-        role: "user",
-        content: pilotText,
-        channel: pilotChannelName,
-        user: message.author.username,
-        timestamp: Date.now(),
-      });
-    } catch (err) {
-      console.error(
-        `[bot] Failed to log pilot message for ${target.id}:`,
-        err instanceof Error ? err.message : err,
-      );
-    }
-
-    submitToPilotSession(target, {
-      text: pilotText,
-      userId: message.author.id,
-      userName: message.author.displayName ?? message.author.username,
-      logSessionId: pilotLogSessionId,
-      channelName: pilotChannelName,
-      react: (emoji) => message.react(emoji),
-    });
-    console.log(
-      `[bot] Routed message to pilot session ${target.id} (channel ${message.channelId})`,
-    );
-    return;
-  }
-
-  // 8. Now resolve session with the correct thread ID
-  const session = resolveSession({
-    threadId: sessionThreadId,
-    channelId: message.channelId,
-    userId: message.author.id,
-    guildId: message.guildId || undefined,
-    isDM,
-  });
-
-  // 6c. Handle image attachments — build Claude vision content blocks
-  // (Now done AFTER session resolution so we can register artifacts)
-  let imageBlocks: Anthropic.Messages.ImageBlockParam[] = [];
-  if (hasImages) {
-    // Show typing while we fetch images
+  // A session takes plain text, not content blocks, but it has its own Read
+  // tool — so attachments are downloaded into its workspace and handed over as
+  // absolute paths. Skipped ones are named, never silently dropped.
+  let text = cleanContent;
+  if (message.attachments.size > 0) {
     if ("sendTyping" in message.channel) {
       message.channel.sendTyping().catch(() => {});
     }
-
-    imageBlocks = await buildImageContentBlocks(message, session.id);
-
-    if (imageBlocks.length > 0) {
-      console.log(
-        `[bot] Prepared ${imageBlocks.length} image(s) for vision`,
-      );
-    }
-  }
-
-  // 6d. Handle text file & PDF attachments — build Claude document content blocks
-  // (Now done AFTER session resolution so we can register artifacts)
-  let documentBlocks: Anthropic.Messages.DocumentBlockParam[] = [];
-  if (hasDocuments) {
-    // Show typing while we fetch documents
-    if ("sendTyping" in message.channel) {
-      message.channel.sendTyping().catch(() => {});
-    }
-
-    const [textBlocks, pdfBlocks] = await Promise.all([
-      hasTextFiles ? buildTextFileContentBlocks(message, session.id) : Promise.resolve([]),
-      hasPdfs ? buildPdfContentBlocks(message, session.id) : Promise.resolve([]),
-    ]);
-
-    documentBlocks = [...textBlocks, ...pdfBlocks];
-
-    if (documentBlocks.length > 0) {
-      console.log(
-        `[bot] Prepared ${documentBlocks.length} document(s) (${textBlocks.length} text, ${pdfBlocks.length} PDF)`,
-      );
-    }
-  }
-
-  // If no text, no images, and no documents — nothing to send
-  if (!cleanContent && imageBlocks.length === 0 && documentBlocks.length === 0) return;
-
-  // Build the message content — either a plain string or content blocks with media
-  let messageContent: string | Anthropic.Messages.ContentBlockParam[];
-  const hasContentBlocks = imageBlocks.length > 0 || documentBlocks.length > 0;
-
-  if (hasContentBlocks) {
-    // Build content block array: documents first, then images, then text
-    const blocks: Anthropic.Messages.ContentBlockParam[] = [
-      ...documentBlocks,
-      ...imageBlocks,
-    ];
-    if (cleanContent) {
-      blocks.push({ type: "text", text: cleanContent });
-    } else if (imageBlocks.length > 0 && documentBlocks.length === 0) {
-      // Images with no text and no documents — add a prompt so Claude knows to describe/analyze
-      blocks.push({ type: "text", text: "What do you see in this image?" });
-    } else {
-      // Documents with no text — add a neutral prompt
-      const fileNames = message.attachments
-        .filter((att) => isTextFileAttachment(att) || isPdfAttachment(att))
-        .map((att) => att.name)
-        .filter(Boolean)
-        .join(", ");
-      blocks.push({
-        type: "text",
-        text: `I've uploaded the following file(s): ${fileNames}. Please review ${documentBlocks.length === 1 ? "it" : "them"}.`,
-      });
-    }
-    messageContent = blocks;
-  } else {
-    messageContent = cleanContent;
-  }
-
-  // 8b. Acquire session lock — if another message is being processed for this
-  // session, we wait here until it finishes before proceeding.
-  let signal: AbortSignal;
-  let releaseLock: () => void;
-
-  try {
-    const lock = await acquireSessionLock(session.id);
-    signal = lock.signal;
-    releaseLock = lock.release;
-  } catch (err) {
-    if (err instanceof SessionAbortedError) {
-      console.log(`[bot] Session ${session.id} was aborted while waiting in queue`);
-      return; // Silently drop — the /stop command already notified the user
-    }
-    throw err;
-  }
-
-  // If the session was aborted while we were waiting in the queue
-  if (signal.aborted) {
-    console.log(`[bot] Session ${session.id} aborted before processing started`);
-    return;
-  }
-
-  // 8c. Get conversation history — always use Discord thread history for threads
-  let history: DbMessage[];
-
-  if (isThread) {
-    // Always fetch the thread's message history directly from Discord.
-    // The thread IS the conversation — this ensures we always have the full
-    // context regardless of DB session state (restarts, expiry, etc.).
-    const thread = message.channel as ThreadChannel;
-    const discordHistory = await fetchDiscordThreadHistory(
-      thread,
+    const result = await saveSdkAttachments(
       message.id,
-      session.id,
+      [...message.attachments.values()].map((a) => ({
+        name: a.name,
+        url: a.url,
+        size: a.size,
+        contentType: a.contentType,
+      })),
     );
-
-    // Merge Discord's view with the cached + stored history for this thread.
-    // Discord's fetch can fail or be incomplete (rate limits, permissions,
-    // embed-only bot replies, >50 message threads) — merging guarantees the
-    // agent still receives the full conversation.
-    history = buildThreadHistory({
-      threadId: thread.id,
-      discordHistory,
-      sessionHistory: getSessionHistory(session.id),
-      currentMessageId: message.id,
-      limit: MAX_THREAD_HISTORY_MESSAGES,
-    });
-
+    const block = formatAttachmentBlock(result);
+    if (block) text = text ? `${text}\n${block}` : block.trim();
     console.log(
-      `[bot] Thread ${thread.id} history: ${discordHistory.length} from Discord, ` +
-        `${history.length} after merge with cache/DB`,
+      `[bot] Attachments for ${target.id}: ${result.saved.length} saved, ${result.skipped.length} skipped`,
     );
-  } else {
-    // For DMs and non-thread channels, use the DB session history
-    history = getSessionHistory(session.id);
   }
 
-  // Resolve context details
-  const guildName = message.guild?.name;
+  // Log the human side into the normal conversation tables so the thread is
+  // visible to /history, the archive and get_conversation_history. The assistant
+  // side is written by the session itself, once per turn.
   const channelName =
-    "name" in message.channel && message.channel.name
-      ? message.channel.name
-      : "DM";
-
-  // 9. Show typing indicator in the reply target — refresh every 8s
-  let typingInterval: ReturnType<typeof setInterval> | null = null;
-  const startTyping = () => {
-    if (!("sendTyping" in replyTarget)) return;
-    (replyTarget as { sendTyping: () => Promise<void> }).sendTyping().catch(() => {});
-    typingInterval = setInterval(() => {
-      (replyTarget as { sendTyping: () => Promise<void> }).sendTyping().catch(() => {});
-    }, 8_000);
-  };
-  const stopTyping = () => {
-    if (typingInterval) {
-      clearInterval(typingInterval);
-      typingInterval = null;
-    }
-  };
-
-  startTyping();
-
-  // For DB logging, use the text portion only (attachments are noted as counts)
-  const attachmentParts: string[] = [];
-  if (imageBlocks.length > 0) attachmentParts.push(`${imageBlocks.length} image(s)`);
-  if (documentBlocks.length > 0) attachmentParts.push(`${documentBlocks.length} document(s)`);
-  const attachmentNote = attachmentParts.length > 0 ? `\n\n[${attachmentParts.join(", ")} attached]` : "";
-
-  const logContent = cleanContent
-    ? `${cleanContent}${attachmentNote}`
-    : (attachmentNote ? attachmentNote.trim() : "");
-
-  // 9b. Create tool call progress handler for live Discord updates
-  const onToolCallProgress = createToolCallProgressHandler(replyTarget);
-
+    "name" in message.channel && message.channel.name ? message.channel.name : "DM";
+  let logSessionId: string | undefined;
   try {
-    // 10. Agent dispatch — track latency
-    const startTime = Date.now();
-    const response: AgentResponse = await processMessage({
-      message: messageContent,
-      sessionId: session.id,
-      context: {
-        guildName,
-        channelName,
-        channelId: configChannelId,
-        threadId: sessionThreadId,
-        userName: message.author.displayName ?? message.author.username,
-        userId: message.author.id,
-      },
-      history,
-      channelConfig,
-      onToolCallProgress,
+    const sessionRow = resolveSession({
       threadId: sessionThreadId,
-      signal,
+      channelId: message.channelId,
+      userId: message.author.id,
+      guildId: message.guildId || undefined,
+      isDM,
     });
-    const durationMs = Date.now() - startTime;
-
-    stopTyping();
-
-    // Check if aborted during processing
-    if (signal.aborted) {
-      console.log(`[bot] Session ${session.id} was aborted during processing — discarding response`);
-      releaseLock();
-      return;
-    }
-
-    // 11. Log both messages to DB (store the full text with images for history)
-    const fullResponseText =
-      response.text +
-      (response.images.length > 0
-        ? "\n" +
-          response.images
-            .map((img) => `![${img.alt || ""}](${img.source})`)
-            .join("\n")
-        : "");
-
+    logSessionId = sessionRow.id;
     addMessage({
-      sessionId: session.id,
+      sessionId: sessionRow.id,
       role: "user",
-      content: logContent,
+      content: text,
       discordMessageId: message.id,
     });
-
-    addMessage({
-      sessionId: session.id,
-      role: "assistant",
-      content: fullResponseText,
-      usage: response.usage,
-    });
-
-    // 11b. Broadcast to WebSocket log viewers
     broadcastLog({
       type: "message",
-      sessionId: session.id,
+      sessionId: sessionRow.id,
       role: "user",
-      content: logContent,
+      content: text,
       channel: channelName,
       user: message.author.username,
       timestamp: Date.now(),
     });
-    broadcastLog({
-      type: "message",
-      sessionId: session.id,
-      role: "assistant",
-      content: fullResponseText,
-      channel: channelName,
-      timestamp: Date.now(),
-    });
-
-    // 12. Build image embeds and attachments
-    const embeds = buildImageEmbeds(response.images);
-    const files = buildImageAttachments(response.images);
-    const hasMedia = embeds.length > 0 || files.length > 0;
-
-    // 12b. Append usage line to the display text (with latency)
-    let displayText = response.text;
-    if (response.usage) {
-      const usageLine = formatUsageLine(response.usage, durationMs);
-      displayText = displayText ? `${displayText}\n${usageLine}` : usageLine;
-    }
-
-    // 13. Send reply — in thread if we created one, otherwise reply to original message
-    const chunks = splitMessage(displayText);
-    const sendInTarget = "send" in replyTarget;
-    const sentMessageIds: string[] = [];
-
-    for (let i = 0; i < chunks.length; i++) {
-      if (i === 0) {
-        const replyPayload: {
-          content: string;
-          embeds?: EmbedBuilder[];
-          files?: AttachmentBuilder[];
-        } = { content: chunks[i] };
-
-        if (hasMedia) {
-          if (embeds.length > 0) replyPayload.embeds = embeds;
-          if (files.length > 0) replyPayload.files = files;
-        }
-
-        let sent: DiscordMessage | undefined;
-        if (shouldCreateThread && sendInTarget) {
-          // Send in thread (not as a reply — we're already in the thread context)
-          sent = await (replyTarget as TextChannel | ThreadChannel).send(replyPayload);
-        } else if (isThread && sendInTarget) {
-          // In an existing thread, send directly (not as a reply to avoid clutter)
-          sent = await (replyTarget as TextChannel | ThreadChannel).send(replyPayload);
-        } else {
-          // DMs or fallback: use message.reply
-          sent = await message.reply(replyPayload);
-        }
-        if (sent) sentMessageIds.push(sent.id);
-      } else {
-        if (sendInTarget) {
-          const sent = await (replyTarget as TextChannel | ThreadChannel).send(chunks[i]);
-          sentMessageIds.push(sent.id);
-        }
-      }
-    }
-
-    // Edge case: if there's no text but there are images, send images alone
-    if (!displayText && hasMedia) {
-      const replyPayload: {
-        embeds?: EmbedBuilder[];
-        files?: AttachmentBuilder[];
-      } = {};
-      if (embeds.length > 0) replyPayload.embeds = embeds;
-      if (files.length > 0) replyPayload.files = files;
-
-      if ((shouldCreateThread || isThread) && sendInTarget) {
-        await (replyTarget as TextChannel | ThreadChannel).send(replyPayload);
-      } else {
-        await message.reply(replyPayload);
-      }
-    }
-
-    // 13b. Warm the thread history cache with this turn, so the next turn has
-    // full context even if Discord's history fetch fails or is incomplete.
-    if (sessionThreadId) {
-      const authorName = message.author.displayName ?? message.author.username;
-      appendThreadMessages(sessionThreadId, [
-        {
-          id: -1,
-          sessionId: session.id,
-          role: "user",
-          content: `${authorName}: ${logContent}`,
-          discordMessageId: message.id,
-          createdAt: message.createdTimestamp,
-        },
-        {
-          id: -2,
-          sessionId: session.id,
-          role: "assistant",
-          content: fullResponseText,
-          discordMessageId: sentMessageIds[0],
-          createdAt: Date.now(),
-        },
-      ]);
-    }
-
-    const imageCount = response.images.length;
-    // Log usage info (with latency)
-    if (response.usage) {
-      const u = response.usage;
-      console.log(
-        `[bot] Usage: model=${u.model} in=${u.inputTokens} out=${u.outputTokens} cache_create=${u.cacheCreationTokens} cache_read=${u.cacheReadTokens} latency=${fmtDuration(durationMs)}`,
-      );
-    }
-    console.log(
-      `[bot] Replied to ${message.author.tag} in ${channelName}${sessionThreadId ? ` (thread ${sessionThreadId})` : ""}${inMonitoredChannel ? " [monitored]" : ""} (session ${session.id})${imageCount > 0 ? ` with ${imageCount} image(s)` : ""}${isVoice ? " [voice]" : ""}${imageBlocks.length > 0 ? ` [${imageBlocks.length} input image(s)]` : ""}${documentBlocks.length > 0 ? ` [${documentBlocks.length} document(s)]` : ""}`,
-    );
   } catch (err) {
-    stopTyping();
-
-    // Don't log/report abort errors — they're intentional
-    if (err instanceof SessionAbortedError || signal.aborted) {
-      console.log(`[bot] Session ${session.id} processing aborted`);
-      releaseLock();
-      return;
-    }
-
-    console.error("[bot] Error processing message:", err);
-
-    // Record error signal for reflection
-    recordSignal({
-      type: "error",
-      source: "messages",
-      detail: `Message processing error: ${err instanceof Error ? err.message : String(err)}`,
-      metadata: {
-        error: err instanceof Error ? err.stack : String(err),
-        channelName,
-        userMessage: logContent.slice(0, 200),
-      },
-      sessionId: session.id,
-      userId: message.author.id,
-    });
-
-    try {
-      // Send error in the thread if we created one, otherwise reply to the original message
-      if ((shouldCreateThread || isThread) && "send" in replyTarget) {
-        await (replyTarget as TextChannel | ThreadChannel).send(
-          "Sorry, I ran into an error processing your message. Please try again.",
-        );
-      } else {
-        await message.reply(
-          "Sorry, I ran into an error processing your message. Please try again.",
-        );
-      }
-    } catch {
-      // If even the error reply fails, just log it
-      console.error("[bot] Failed to send error reply");
-    }
-  } finally {
-    releaseLock();
+    console.error(
+      `[bot] Failed to log message for ${target.id}:`,
+      err instanceof Error ? err.message : err,
+    );
   }
+
+  submitToSdkSession(target, {
+    text,
+    userId: message.author.id,
+    userName: message.author.displayName ?? message.author.username,
+    logSessionId,
+    channelName,
+    react: (emoji) => message.react(emoji),
+  });
+  console.log(
+    `[bot] Routed message to SDK session ${target.id} (channel ${message.channelId})`,
+  );
+
 }

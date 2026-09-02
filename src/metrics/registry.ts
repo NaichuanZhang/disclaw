@@ -56,10 +56,10 @@ export const P = {
   agentLoopDuplicateBreak: "agent.loop.duplicate_break",
   agentImagesExtracted: "agent.images.extracted",
 
-  // Pilot mode
-  pilotTurnSubmit: "pilot.turn.submit",
-  pilotSessionInterrupt: "pilot.session.interrupt",
-  pilotSessionStop: "pilot.session.stop",
+  // SDK sessions
+  sdkTurnSubmit: "sdk.turn.submit",
+  sdkSessionInterrupt: "sdk.session.interrupt",
+  sdkSessionStop: "sdk.session.stop",
 
   // Memory
   memorySearchLocal: "memory.search.local",
@@ -120,14 +120,14 @@ export const FEATURE_PATHS: PathSpec[] = [
     description: "Agent reply contained markdown images that were rendered",
   },
 
-  // --- Pilot mode ---
-  { path: P.pilotTurnSubmit, kind: "feature", description: "Message submitted to a pilot session" },
+  // --- SDK sessions ---
+  { path: P.sdkTurnSubmit, kind: "feature", description: "Message submitted to an SDK session" },
   {
-    path: P.pilotSessionInterrupt,
+    path: P.sdkSessionInterrupt,
     kind: "feature",
-    description: "Pilot session turn interrupted (/interrupt)",
+    description: "SDK session turn interrupted (/interrupt)",
   },
-  { path: P.pilotSessionStop, kind: "feature", description: "Pilot session stopped" },
+  { path: P.sdkSessionStop, kind: "feature", description: "SDK session stopped" },
 
   // --- Memory ---
   { path: P.memorySearchLocal, kind: "feature", description: "Local FTS5 memory search" },

@@ -2,8 +2,8 @@
 // Self-evolution instructions
 //
 // Shared prompt text describing the evolve_* tools and the mandatory
-// plan-approval gate. Used by both the main agent (src/agent/agent.ts) and
-// pilot mode (src/pilot/session.ts) so the rules stay identical in both.
+// plan-approval gate. Lives apart from the session prompt that embeds it
+// (src/sdk/session.ts) so the rules can be read and changed on their own.
 // ---------------------------------------------------------------------------
 
 export const EVOLUTION_INSTRUCTIONS = `## Self-Evolution

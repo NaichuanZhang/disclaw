@@ -1,20 +1,19 @@
 // ---------------------------------------------------------------------------
-// Prompt fragments shared between the main agent and pilot mode
+// Prompt fragments shared across runtimes
 //
 // These strings are part of the bot's identity, not of one runtime's plumbing:
-// how it uses memory, and how it talks when /caveman is on. Both the main agent
-// (src/agent/agent.ts) and the pilot SDK session (src/pilot/session.ts) build a
-// system prompt, and when the text lived in only one of them the two runtimes
-// drifted — a pilot channel silently lost memory habits and caveman mode. Keep
-// new cross-runtime prompt text here rather than in either caller.
+// how it uses memory, and how it talks when /caveman is on. The SDK session
+// (src/sdk/session.ts) builds them into its system prompt and the slash commands
+// read the same definitions, so a level set by /caveman means the same thing in
+// both. Keep new cross-runtime prompt text here rather than in a caller.
 // ---------------------------------------------------------------------------
 
 import type { ChannelConfig } from "../db/index.js";
 
 /**
- * How to use the memory system. Tool names are unprefixed here; pilot's bridge
- * exposes the same tools as `mcp__discordclaw__memory_search` etc. and its
- * prompt already explains that mapping once.
+ * How to use the memory system. Tool names are unprefixed here; the session's
+ * MCP bridge exposes the same tools as `mcp__discordclaw__memory_search` etc.
+ * and its prompt already explains that mapping once.
  */
 export const MEMORY_RECALL_INSTRUCTIONS = `## Memory
 

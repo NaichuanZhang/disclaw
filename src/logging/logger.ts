@@ -31,7 +31,6 @@ export type LogCategory =
   | "models"
   | "reflection"
   | "registry"
-  | "session-lock"
   | "skills"
   | "soul"
   | "voice"

@@ -1,11 +1,10 @@
 // ---------------------------------------------------------------------------
-// Pilot mode — outbound relay queue
+// SDK sessions — outbound relay queue
 //
-// A pilot turn can emit a dozen tool-call lines in a second. Discord allows
+// A turn can emit a dozen tool-call lines in a second. Discord allows
 // roughly 5 messages per 5 seconds per channel, so relaying each block as its
-// own message earns 429s and silently loses lines. The main agent path solves
-// this with a batching progress handler (see bot/messages.ts); this is the
-// pilot equivalent.
+// own message earns 429s and silently loses lines. This queue is what keeps a
+// chatty turn inside that ceiling.
 //
 // Two knobs, both order-preserving:
 //   - coalescing: consecutive low-priority lines (tool-call markers) are merged
@@ -30,7 +29,7 @@ const DEFAULT_WINDOW_MS = 5_000;
  */
 const DEFAULT_MAX_MERGED_CHARS = 1_900;
 
-export interface PilotRelayQueueOptions {
+export interface SdkRelayQueueOptions {
   /** Performs the actual send. May chunk internally. */
   send: (text: string) => Promise<unknown>;
   /** How long to wait for more coalescing lines before flushing. */
@@ -54,7 +53,7 @@ interface Entry {
   coalesce: boolean;
 }
 
-export class PilotRelayQueue {
+export class SdkRelayQueue {
   private buffer: Entry[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private chain: Promise<void> = Promise.resolve();
@@ -70,7 +69,7 @@ export class PilotRelayQueue {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly onError?: (err: unknown) => void;
 
-  constructor(options: PilotRelayQueueOptions) {
+  constructor(options: SdkRelayQueueOptions) {
     this.send = options.send;
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.maxSendsPerWindow = options.maxSendsPerWindow ?? DEFAULT_MAX_SENDS;
