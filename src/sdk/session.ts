@@ -1,24 +1,33 @@
 // ---------------------------------------------------------------------------
-// Pilot mode — Claude Agent SDK sessions bound to a Discord channel
+// Claude Agent SDK sessions bound to a Discord channel
 //
-// One long-lived SDK session per pilot channel. The prompt is an async
+// This is the bot's only agent runtime: every channel, thread and DM is served
+// by one long-lived SDK session, as is every cron agent turn. The prompt is an
+// async
 // iterable (streaming input mode), which is what lets a new Discord message be
 // injected while a turn is already running — the thing our own agent loop
 // cannot do today.
 //
 // Boundaries: effectively none, by operator choice.
-//   - cwd is data/pilot/workspace/, but nothing confines the session to it
+//   - cwd is data/sdk/workspace/, but nothing confines the session to it
 //   - the child inherits the full process environment, secrets included
-//     (see env.ts) — a pilot session can read DISCORD_BOT_TOKEN, GH_TOKEN and
+//     (see env.ts) — an SDK session can read DISCORD_BOT_TOKEN, GH_TOKEN and
 //     every provider key straight out of its own env
 //   - permissionMode is 'bypassPermissions' (allowDangerouslySkipPermissions):
 //     tool calls are NOT gated by permission prompts or a canUseTool hook, so
-//     a pilot session can reach the repo, git and credential files.
+//     an SDK session can reach the repo, git and credential files.
 //   To restore guard rails: filter the child env in env.ts, and set
 //   permissionMode 'default' with a canUseTool gate or a PreToolUse hook.
 // ---------------------------------------------------------------------------
 
-import { existsSync, mkdirSync, readlinkSync, readFileSync, readdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readlinkSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+} from "node:fs";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type {
@@ -34,9 +43,9 @@ import { resolveModel } from "../shared/models.js";
 import { broadcastLog } from "../gateway/server.js";
 import { sendChunked } from "../shared/discord-utils.js";
 import { fmtDuration, fmtTokens } from "../shared/format.js";
-import { buildPilotEnv } from "./env.js";
-import { createPilotMcpServer } from "./bridge.js";
-import { PilotRelayQueue } from "./relay-queue.js";
+import { buildSdkEnv, pickSdkEnv } from "./env.js";
+import { createBridgeMcpServer } from "./bridge.js";
+import { SdkRelayQueue } from "./relay-queue.js";
 import { getSkillService } from "../skills/service.js";
 import { getSoul } from "../soul/soul.js";
 import { recordSignal } from "../reflection/signals.js";
@@ -53,14 +62,14 @@ import { P } from "../metrics/registry.js";
 // Paths & constants
 // ---------------------------------------------------------------------------
 
-/** Root for pilot mode state. */
-export const PILOT_DIR = path.join(DATA_DIR, "pilot");
+/** Root for SDK session state. */
+export const SDK_DIR = path.join(DATA_DIR, "sdk");
 
 /** Sandboxed working directory handed to SDK sessions. */
-export const PILOT_WORKSPACE_DIR = path.join(PILOT_DIR, "workspace");
+export const SDK_WORKSPACE_DIR = path.join(SDK_DIR, "workspace");
 
 /** Idle timeout — a session with no traffic for this long is torn down. */
-const PILOT_IDLE_MS = Number(process.env.PILOT_IDLE_MS || 30 * 60 * 1000);
+const SDK_IDLE_MS = Number(pickSdkEnv(process.env, "IDLE_MS") || 30 * 60 * 1000);
 
 /** How often to check for idle sessions. */
 const IDLE_SWEEP_INTERVAL_MS = 60_000;
@@ -73,15 +82,15 @@ const TOOL_PREVIEW_CHARS = 160;
  * to hang forever with the typing indicator on and no way back except /stop.
  * Interrupt, not kill: the child and its context survive, so "continue" works.
  */
-const PILOT_TURN_TIMEOUT_MS = Number(
-  process.env.PILOT_TURN_TIMEOUT_MS || 15 * 60 * 1000,
+const SDK_TURN_TIMEOUT_MS = Number(
+  pickSdkEnv(process.env, "TURN_TIMEOUT_MS") || 15 * 60 * 1000,
 );
 
 /**
- * Soft per-turn spend warning (USD). 0 disables. Purely advisory — pilot never
- * refuses to run because of cost, it just says so in the channel.
+ * Soft per-turn spend warning (USD). 0 disables. Purely advisory — a session
+ * never refuses to run because of cost, it just says so in the channel.
  */
-const PILOT_TURN_MAX_COST_USD = Number(process.env.PILOT_TURN_MAX_COST_USD || 0);
+const SDK_TURN_MAX_COST_USD = Number(pickSdkEnv(process.env, "TURN_MAX_COST_USD") || 0);
 
 /** Reaction dropped on a message that steered a turn already in flight. */
 const STEER_EMOJI = "↩️";
@@ -99,35 +108,18 @@ const TOOL_NAME_CACHE_LIMIT = 64;
 const REPLAY_LIMIT = 20;
 
 // ---------------------------------------------------------------------------
-// Channel config helpers — pilot mode is data, not code
+// Channel config helpers
 // ---------------------------------------------------------------------------
 
-/** True when the given channel is flagged as a pilot channel. */
-export function isPilotChannelId(channelId: string): boolean {
-  const config = getChannelConfig(channelId);
-  return config?.settings?.pilot === true;
-}
-
-/**
- * Which channel id decides pilot mode for a message, or null if pilot can
- * never apply. Threads inherit the flag from their parent channel; DMs never
- * run in pilot mode. Pure so the routing rule is testable without Discord.
- */
-export function pilotConfigChannelId(input: {
-  channelId: string;
-  isDM: boolean;
-  isThread: boolean;
-  parentId?: string | null;
-}): string | null {
-  if (input.isDM) return null;
-  if (input.isThread) return input.parentId ?? null;
-  return input.channelId;
-}
-
 /** Persist the SDK session id so we can `resume` after a restart. */
-function savePilotSessionId(channelId: string, sdkSessionId: string): void {
+function saveSdkSessionId(channelId: string, sdkSessionId: string): void {
   const config = getChannelConfig(channelId);
-  const settings = { ...(config?.settings ?? {}), pilotSessionId: sdkSessionId };
+  const settings: Record<string, unknown> = {
+    ...(config?.settings ?? {}),
+    sdkSessionId,
+  };
+  // The pre-rename key would otherwise shadow this one on the next read.
+  delete settings.pilotSessionId;
   setChannelConfig(channelId, { settings });
 }
 
@@ -136,16 +128,22 @@ function savePilotSessionId(channelId: string, sdkSessionId: string): void {
  * otherwise the stale id is passed forever and every turn in that thread dies
  * on the same error.
  */
-function clearPilotSessionId(channelId: string): void {
+function clearSdkSessionId(channelId: string): void {
   const config = getChannelConfig(channelId);
-  const settings = { ...(config?.settings ?? {}) };
+  const settings: Record<string, unknown> = { ...(config?.settings ?? {}) };
+  delete settings.sdkSessionId;
+  // Drop the pre-rename key too, or it resurrects the dead id on the next read.
   delete settings.pilotSessionId;
   setChannelConfig(channelId, { settings });
 }
 
-/** Read a previously stored SDK session id for this channel. */
-function loadPilotSessionId(channelId: string): string | undefined {
-  const value = getChannelConfig(channelId)?.settings?.pilotSessionId;
+/**
+ * Read a previously stored SDK session id for this channel. Falls back to the
+ * pre-rename `pilotSessionId` key so sessions live at deploy time still resume.
+ */
+function loadSdkSessionId(channelId: string): string | undefined {
+  const settings = getChannelConfig(channelId)?.settings;
+  const value = settings?.sdkSessionId ?? settings?.pilotSessionId;
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
@@ -153,26 +151,26 @@ function loadPilotSessionId(channelId: string): string | undefined {
 // Minimal Discord channel surface we need
 // ---------------------------------------------------------------------------
 
-export interface PilotChannelTarget {
+export interface SdkChannelTarget {
   id: string;
   send: (content: string) => Promise<unknown>;
   sendTyping?: () => Promise<void>;
   /**
    * Parent channel when this target is a thread. A session is keyed to the
-   * thread, but every channel-level command (`/clear`, `/interrupt`, `/pilot
-   * off`) and every channel-level setting lives on the parent — without this
-   * link those commands could only find a session when typed inside the thread.
+   * thread, but every channel-level command (`/clear`, `/interrupt`) and every
+   * channel-level setting lives on the parent — without this link those
+   * commands could only find a session when typed inside the thread.
    */
   parentId?: string | null;
 }
 
-export interface PilotIncomingMessage {
+export interface SdkIncomingMessage {
   text: string;
   userId: string;
   userName: string;
   /**
    * Conversation-row id (from `resolveSession`) this turn belongs to. When set,
-   * the session writes one assistant row per turn so pilot conversations land in
+   * the session writes one assistant row per turn so these conversations land in
    * the same archive/history as every other channel. Absent = no logging.
    */
   logSessionId?: string;
@@ -192,8 +190,8 @@ export interface PilotIncomingMessage {
   modelOverride?: string;
 }
 
-/** Outcome of interrupting a pilot session's current turn. */
-export interface PilotInterruptResult {
+/** Outcome of interrupting an SDK session's current turn. */
+export interface SdkInterruptResult {
   /** True when the SDK accepted the interrupt. */
   ok: boolean;
   /** How many of our own queued messages were discarded. */
@@ -256,14 +254,14 @@ function summariseToolResult(content: unknown): string {
 // Session
 // ---------------------------------------------------------------------------
 
-export class PilotSession {
+export class SdkSession {
   readonly channelId: string;
   /** Parent channel when this session is keyed to a thread. */
   parentId: string | null;
   /** Model for the child, captured from the first message (see submit()). */
   private modelOverride: string | undefined;
 
-  private target: PilotChannelTarget;
+  private target: SdkChannelTarget;
   private abortController = new AbortController();
 
   private queue: SDKUserMessage[] = [];
@@ -272,7 +270,7 @@ export class PilotSession {
   private started = false;
 
   private turnActive = false;
-  /** Watchdog for the turn in flight — see PILOT_TURN_TIMEOUT_MS. */
+  /** Watchdog for the turn in flight — see SDK_TURN_TIMEOUT_MS. */
   private turnTimer: ReturnType<typeof setTimeout> | null = null;
   private typingTimer: ReturnType<typeof setInterval> | null = null;
   private lastActivityAt = Date.now();
@@ -307,19 +305,19 @@ export class PilotSession {
   private lastCostUsd = 0;
 
   /** Order-preserving, rate-limited outbound relay to the channel. */
-  private outbound: PilotRelayQueue;
+  private outbound: SdkRelayQueue;
 
-  constructor(target: PilotChannelTarget) {
+  constructor(target: SdkChannelTarget) {
     this.channelId = target.id;
     this.parentId = target.parentId ?? null;
     this.target = target;
     // Reads this.target on every send, so a re-fetched channel object is picked
     // up without rebuilding the queue.
-    this.outbound = new PilotRelayQueue({
+    this.outbound = new SdkRelayQueue({
       send: (text) => sendChunked(this.target, text),
       onError: (err) =>
         console.error(
-          `[pilot] failed to send to ${this.channelId}:`,
+          `[sdk] failed to send to ${this.channelId}:`,
           err instanceof Error ? err.message : err,
         ),
     });
@@ -342,7 +340,7 @@ export class PilotSession {
   }
 
   /** Refresh the channel object (it can be re-fetched between messages). */
-  setTarget(target: PilotChannelTarget): void {
+  setTarget(target: SdkChannelTarget): void {
     this.target = target;
     if (target.parentId !== undefined) this.parentId = target.parentId;
   }
@@ -351,7 +349,7 @@ export class PilotSession {
    * Enqueue a Discord message for the session. Safe to call while a turn is
    * already running — that's the mid-conversation injection path.
    */
-  submit(message: PilotIncomingMessage): void {
+  submit(message: SdkIncomingMessage): void {
     if (this.closed) return;
     this.lastActivityAt = Date.now();
     this.lastUserId = message.userId;
@@ -389,7 +387,7 @@ export class PilotSession {
     if (!this.started) {
       this.started = true;
       this.loop = this.run().catch((err) => {
-        console.error("[pilot] session loop crashed:", err);
+        console.error("[sdk] session loop crashed:", err);
       });
     }
   }
@@ -399,7 +397,7 @@ export class PilotSession {
    * subtle marker line so the transcript shows where the course changed and
    * what was in flight at the time.
    */
-  private async markSteer(message: PilotIncomingMessage): Promise<void> {
+  private async markSteer(message: SdkIncomingMessage): Promise<void> {
     try {
       await message.react?.(STEER_EMOJI);
     } catch {
@@ -421,8 +419,8 @@ export class PilotSession {
    * not implement `cancel_queued`, so anything we already handed over may
    * still run and is reported back via `stillQueued`.
    */
-  async interrupt(): Promise<PilotInterruptResult> {
-    count(P.pilotSessionInterrupt);
+  async interrupt(): Promise<SdkInterruptResult> {
+    count(P.sdkSessionInterrupt);
     const dropped = this.queue.length;
     const lastTool = this.lastToolName;
     this.queue = [];
@@ -445,7 +443,7 @@ export class PilotSession {
       return { ok: true, dropped, stillQueued, lastTool };
     } catch (err) {
       console.error(
-        `[pilot] interrupt failed for ${this.channelId}:`,
+        `[sdk] interrupt failed for ${this.channelId}:`,
         err instanceof Error ? err.message : err,
       );
       return { ok: false, dropped, stillQueued: [], lastTool };
@@ -467,19 +465,19 @@ export class PilotSession {
    */
   private armTurnWatchdog(): void {
     this.clearTurnWatchdog();
-    if (!(PILOT_TURN_TIMEOUT_MS > 0)) return;
+    if (!(SDK_TURN_TIMEOUT_MS > 0)) return;
     this.turnTimer = setTimeout(() => {
       this.turnTimer = null;
       if (this.closed || !this.turnActive) return;
-      const minutes = Math.round(PILOT_TURN_TIMEOUT_MS / 60_000);
+      const minutes = Math.round(SDK_TURN_TIMEOUT_MS / 60_000);
       console.warn(
-        `[pilot] turn in ${this.channelId} exceeded ${minutes}m — interrupting`,
+        `[sdk] turn in ${this.channelId} exceeded ${minutes}m — interrupting`,
       );
       this.say(
         `-# ⏱️ turn ran past ${minutes}m — interrupting it. The session keeps its context, so say "continue" to resume.`,
       );
       void this.interrupt();
-    }, PILOT_TURN_TIMEOUT_MS);
+    }, SDK_TURN_TIMEOUT_MS);
     // Never hold the process open for a watchdog.
     this.turnTimer.unref?.();
   }
@@ -512,7 +510,7 @@ export class PilotSession {
    */
   async stop(reason = "stopped", notice?: string): Promise<void> {
     if (this.closed) return;
-    count(P.pilotSessionStop);
+    count(P.sdkSessionStop);
     this.closed = true;
     this.stopTyping();
     this.clearTurnWatchdog();
@@ -529,7 +527,7 @@ export class PilotSession {
       // already aborted
     }
 
-    console.log(`[pilot] session for channel ${this.channelId} ${reason}`);
+    console.log(`[sdk] session for channel ${this.channelId} ${reason}`);
     if (this.loop) {
       await this.loop.catch(() => {});
     }
@@ -564,19 +562,19 @@ export class PilotSession {
    *
    * The child used to take whatever `ANTHROPIC_MODEL` the bot happened to have,
    * so `/model` (and a cron job's per-job model) applied to every runtime
-   * except this one. `PILOT_ANTHROPIC_MODEL` still wins — it is the explicit
-   * "pin pilot to its own model" escape hatch — so we only override when it is
+   * except this one. `SDK_ANTHROPIC_MODEL` still wins — it is the explicit
+   * "pin sessions to their own model" escape hatch — so we only override when it is
    * unset.
    */
   private modelEnvOverrides(): Record<string, string> {
-    if (process.env.PILOT_ANTHROPIC_MODEL) return {};
+    if (pickSdkEnv(process.env, "ANTHROPIC_MODEL")) return {};
     const model = resolveModel(this.modelOverride);
     return model ? { ANTHROPIC_MODEL: model } : {};
   }
 
   /**
    * SOUL.md and the memory-recall rules — the bot's identity and habits, shared
-   * verbatim with the main agent. Without them a pilot channel answered as a
+   * verbatim with the voice agent. Without them a channel answered as a
    * generic Claude Code session and never searched memory unasked.
    */
   private buildIdentityPrompt(): string {
@@ -614,9 +612,8 @@ export class PilotSession {
   }
 
   /**
-   * The channel's own system prompt from `/config set-prompt`. The main agent
-   * has always injected this; pilot ignored it, so the command replied
-   * "updated" and changed nothing in a pilot channel.
+   * The channel's own system prompt from `/config set-prompt`, injected into
+   * every session.
    */
   private buildChannelPrompt(): string {
     const prompt = this.channelSettings((config) => config?.systemPrompt);
@@ -625,7 +622,7 @@ export class PilotSession {
   }
 
   /**
-   * Skills are shared with the main agent: the same metadata listing, loaded
+   * The skill library: the same metadata listing the voice agent reads, loaded
    * on demand through the bridged read_skill / list_skill_files tools. The SDK
    * prefixes MCP tool names, so the prompt points at the prefixed forms.
    */
@@ -637,7 +634,7 @@ export class PilotSession {
       "",
       section,
       "",
-      "In pilot mode these skill tools are named `mcp__discordclaw__read_skill`",
+      "Here these skill tools are named `mcp__discordclaw__read_skill`",
       "and `mcp__discordclaw__list_skill_files`. Skill instructions may refer to",
       "the host bot's tool names (e.g. `bash`, `write_file`, `send_message`) —",
       "use the closest equivalent available to you: the native Bash/Read/Write",
@@ -646,8 +643,8 @@ export class PilotSession {
   }
 
   /**
-   * Self-evolution rules, shared verbatim with the main agent, plus the pilot
-   * tool-name mapping. The plan-approval gate applies identically here.
+   * Self-evolution rules, plus the bridged tool-name mapping. The
+   * plan-approval gate applies exactly as written.
    */
   private buildEvolutionPrompt(): string {
     return [
@@ -655,7 +652,7 @@ export class PilotSession {
       "",
       EVOLUTION_INSTRUCTIONS,
       "",
-      "In pilot mode these tools are named `mcp__discordclaw__evolve_start`,",
+      "Here these tools are named `mcp__discordclaw__evolve_start`,",
       "`mcp__discordclaw__evolve_read`, `mcp__discordclaw__evolve_write`,",
       "`mcp__discordclaw__evolve_bash`, `mcp__discordclaw__evolve_propose`,",
       "`mcp__discordclaw__evolve_suggest`, `mcp__discordclaw__evolve_cancel`,",
@@ -672,10 +669,10 @@ export class PilotSession {
   }
 
   private buildOptions(): Options {
-    const resume = loadPilotSessionId(this.channelId);
+    const resume = loadSdkSessionId(this.channelId);
     return {
-      cwd: PILOT_WORKSPACE_DIR,
-      env: buildPilotEnv({ overrides: this.modelEnvOverrides() }),
+      cwd: SDK_WORKSPACE_DIR,
+      env: buildSdkEnv({ overrides: this.modelEnvOverrides() }),
       // Unguarded by operator choice: no permission prompts, no canUseTool.
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
@@ -684,7 +681,7 @@ export class PilotSession {
       // Isolation: don't inherit the operator's own ~/.claude settings.
       settingSources: [],
       mcpServers: {
-        discordclaw: createPilotMcpServer({
+        discordclaw: createBridgeMcpServer({
           channelId: this.channelId,
           // A getter, not a value: the server is built once but the person
           // talking changes, and ask_user / evolve_* must follow them.
@@ -705,12 +702,12 @@ export class PilotSession {
         type: "preset",
         preset: "claude_code",
         append: [
-          "You are running in DiscordClaw 'pilot mode': a Claude Agent SDK session",
+          "You are DiscordClaw, running as a Claude Agent SDK session",
           `wired directly to Discord channel ${this.channelId}. Your normal text output`,
           "is relayed to that channel, so answer conversationally and concisely, with",
           "Discord markdown. Keep replies short unless asked for depth.",
           "",
-          `Your default working directory is ${PILOT_WORKSPACE_DIR}. Tool calls are not`,
+          `Your default working directory is ${SDK_WORKSPACE_DIR}. Tool calls are not`,
           "gated: prefer the workspace, and be careful with anything outside it. Use the",
           "mcp__discordclaw__ tools for Discord actions (send_message, send_file,",
           "ask_user) and memory.",
@@ -727,7 +724,7 @@ export class PilotSession {
       ...(resume ? { resume } : {}),
       stderr: (data: string) => {
         const trimmed = data.trim();
-        if (trimmed) console.error(`[pilot:cli] ${trimmed.slice(0, 500)}`);
+        if (trimmed) console.error(`[sdk:cli] ${trimmed.slice(0, 500)}`);
       },
     };
   }
@@ -743,7 +740,7 @@ export class PilotSession {
    * and start fresh.
    */
   private async run(): Promise<void> {
-    ensurePilotDirs();
+    ensureSdkDirs();
 
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -758,7 +755,7 @@ export class PilotSession {
         }
 
         console.log(
-          `[pilot] starting SDK session for channel ${this.channelId} (cwd=${PILOT_WORKSPACE_DIR}${options.resume ? `, resume=${options.resume}` : ""})`,
+          `[sdk] starting SDK session for channel ${this.channelId} (cwd=${SDK_WORKSPACE_DIR}${options.resume ? `, resume=${options.resume}` : ""})`,
         );
 
         try {
@@ -772,13 +769,13 @@ export class PilotSession {
         } catch (err) {
           if (this.closed) return;
           const detail = err instanceof Error ? err.message : String(err);
-          console.error(`[pilot] session error for ${this.channelId}: ${detail}`);
-          // Feed the reflection daemon the same way agent errors do, so pilot
-          // failures are visible to self-improvement instead of console-only.
+          console.error(`[sdk] session error for ${this.channelId}: ${detail}`);
+          // Feed the reflection daemon, so session failures are visible to
+          // self-improvement instead of console-only.
           recordSignal({
             type: "error",
-            source: "pilot",
-            detail: `Pilot session error: ${detail.slice(0, 300)}`,
+            source: "sdk",
+            detail: `SDK session error: ${detail.slice(0, 300)}`,
             metadata: { channelId: this.channelId, resumed, attempt },
             sessionId: this.sdkSessionId,
             userId: this.lastUserId,
@@ -786,21 +783,21 @@ export class PilotSession {
 
           if (resumed && !this.sawInit && attempt === 0) {
             console.log(
-              `[pilot] resume failed for ${this.channelId} — clearing stored session id and starting fresh`,
+              `[sdk] resume failed for ${this.channelId} — clearing stored session id and starting fresh`,
             );
-            clearPilotSessionId(this.channelId);
+            clearSdkSessionId(this.channelId);
             this.sdkSessionId = undefined;
             // Drop the abandoned generator's waker so a message arriving during
             // the retry can't be yielded into the dead stream.
             this.wake = null;
             this.requeueForReplay();
             this.say(
-              "-# ⚠️ couldn't resume the previous pilot session — starting a fresh one (earlier context is gone)",
+              "-# ⚠️ couldn't resume the previous SDK session — starting a fresh one (earlier context is gone)",
             );
             continue;
           }
 
-          this.say(`⚠️ Pilot session error: ${detail.slice(0, 500)}`);
+          this.say(`⚠️ SDK session error: ${detail.slice(0, 500)}`);
           return;
         } finally {
           this.stream = null;
@@ -843,8 +840,8 @@ export class PilotSession {
           : [];
         if (sessionId) {
           this.sdkSessionId = sessionId;
-          savePilotSessionId(this.channelId, sessionId);
-          console.log(`[pilot] session id ${sessionId} for ${this.channelId}`);
+          saveSdkSessionId(this.channelId, sessionId);
+          console.log(`[sdk] session id ${sessionId} for ${this.channelId}`);
         }
       }
       return;
@@ -914,7 +911,7 @@ export class PilotSession {
           typeof result.result === "string" && result.result
             ? result.result
             : (result.subtype ?? "unknown error");
-        this.say(`⚠️ Pilot turn ended with an error: ${detail.slice(0, 500)}`);
+        this.say(`⚠️ Turn ended with an error: ${detail.slice(0, 500)}`);
       }
       const usageLine = this.formatUsage(message as Record<string, unknown>);
       if (usageLine) this.say(usageLine);
@@ -924,7 +921,7 @@ export class PilotSession {
   }
 
   /**
-   * Persist this turn's assistant text as one conversation row, so pilot output
+   * Persist this turn's assistant text as one conversation row, so session output
    * is visible to /history, the archive and `get_conversation_history` like any
    * other channel. Best-effort: logging must never break a turn.
    *
@@ -951,7 +948,7 @@ export class PilotSession {
       });
     } catch (err) {
       console.error(
-        `[pilot] failed to log turn for ${this.channelId}:`,
+        `[sdk] failed to log turn for ${this.channelId}:`,
         err instanceof Error ? err.message : err,
       );
     }
@@ -987,14 +984,14 @@ export class PilotSession {
     const turnCost = Math.max(0, totalCost - this.lastCostUsd);
     if (totalCost > 0) this.lastCostUsd = totalCost;
 
-    const model = primaryModel(result.modelUsage) ?? "pilot";
+    const model = primaryModel(result.modelUsage) ?? "sdk";
     const durationMs = num(result.duration_ms);
     const cached = cacheRead > 0 ? ` (${fmtTokens(cacheRead)} cached)` : "";
     const durationPart = durationMs > 0 ? ` · ${fmtDuration(durationMs)}` : "";
 
     const footer = `-# 📊 ${model} · ${fmtTokens(inTokens + cacheRead + cacheCreate)} in${cached} / ${fmtTokens(outTokens)} out · $${turnCost.toFixed(4)}${durationPart}`;
-    if (PILOT_TURN_MAX_COST_USD > 0 && turnCost > PILOT_TURN_MAX_COST_USD) {
-      return `${footer}\n-# 💸 that turn cost $${turnCost.toFixed(4)}, over the $${PILOT_TURN_MAX_COST_USD.toFixed(2)} soft cap`;
+    if (SDK_TURN_MAX_COST_USD > 0 && turnCost > SDK_TURN_MAX_COST_USD) {
+      return `${footer}\n-# 💸 that turn cost $${turnCost.toFixed(4)}, over the $${SDK_TURN_MAX_COST_USD.toFixed(2)} soft cap`;
     }
     return footer;
   }
@@ -1061,69 +1058,91 @@ export class PilotSession {
 // Registry
 // ---------------------------------------------------------------------------
 
-const sessions = new Map<string, PilotSession>();
+const sessions = new Map<string, SdkSession>();
 
-function removeSession(channelId: string, session: PilotSession): void {
+function removeSession(channelId: string, session: SdkSession): void {
   if (sessions.get(channelId) === session) {
     sessions.delete(channelId);
   }
 }
 
-/** Ensure the pilot data directories exist. */
-export function ensurePilotDirs(): void {
-  for (const dir of [PILOT_DIR, PILOT_WORKSPACE_DIR]) {
+/**
+ * Move the pre-rename `data/pilot/` state to `data/sdk/`, once.
+ *
+ * The workspace holds real work — checkouts, notes, downloaded attachments — so
+ * it is moved rather than abandoned. Only runs when the new directory does not
+ * exist yet, and a failure is non-fatal: ensureSdkDirs() then just creates an
+ * empty one.
+ */
+function migrateLegacyDataDir(): void {
+  const legacy = path.join(DATA_DIR, "pilot");
+  if (existsSync(SDK_DIR) || !existsSync(legacy)) return;
+  try {
+    renameSync(legacy, SDK_DIR);
+    console.log(`[sdk] migrated ${legacy} -> ${SDK_DIR}`);
+  } catch (err) {
+    console.error(
+      `[sdk] could not migrate ${legacy} to ${SDK_DIR}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+/** Ensure the SDK data directories exist. */
+export function ensureSdkDirs(): void {
+  migrateLegacyDataDir();
+  for (const dir of [SDK_DIR, SDK_WORKSPACE_DIR]) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
 }
 
-/** Get (or create) the pilot session for a channel and hand it a message. */
-export function submitToPilotSession(
-  target: PilotChannelTarget,
-  message: PilotIncomingMessage,
-): PilotSession {
+/** Get (or create) the SDK session for a channel and hand it a message. */
+export function submitToSdkSession(
+  target: SdkChannelTarget,
+  message: SdkIncomingMessage,
+): SdkSession {
   let session = sessions.get(target.id);
   if (!session || session.isClosed) {
-    session = new PilotSession(target);
+    session = new SdkSession(target);
     sessions.set(target.id, session);
   } else {
     session.setTarget(target);
   }
-  count(P.pilotTurnSubmit);
+  count(P.sdkTurnSubmit);
   session.submit(message);
   return session;
 }
 
 /**
- * True when a live (non-closed) pilot session is keyed to this exact channel id.
+ * True when a live (non-closed) SDK session is keyed to this exact channel id.
  *
- * Message routing needs this because a session can now exist in a channel that
- * was never pilot-flagged: cron runs every agent turn on the SDK, so a reply to
- * a cron report inside its own thread has to reach the session that wrote it
- * rather than the main agent loop, which has none of its context.
+ * Routing keys a reply to the session that owns the channel it landed in, so a
+ * reply to a cron report inside its own thread reaches the session that wrote
+ * it rather than starting a second one with none of that context.
  */
-export function hasLivePilotSession(channelId: string): boolean {
+export function hasLiveSdkSession(channelId: string): boolean {
   const session = sessions.get(channelId);
   return session !== undefined && !session.isClosed;
 }
 
-/** Number of live pilot sessions. */
-export function activePilotSessionCount(): number {
+/** Number of live SDK sessions. */
+export function activeSdkSessionCount(): number {
   return sessions.size;
 }
 
-/** Channel ids with a live pilot session. */
-export function activePilotChannelIds(): string[] {
+/** Channel ids with a live SDK session. */
+export function activeSdkChannelIds(): string[] {
   return [...sessions.keys()];
 }
 
 /**
  * Live session ids a channel owns: itself, plus every thread under it.
  *
- * Sessions are keyed to threads while `/clear`, `/interrupt` and `/pilot off`
- * are usually typed in the parent channel. Without this lookup those commands
+ * Sessions are keyed to threads while `/clear` and `/interrupt` are usually
+ * typed in the parent channel. Without this lookup those commands
  * reported "no active session here" while a turn was streaming one level down.
  */
-export function pilotSessionChannelIdsUnder(channelId: string): string[] {
+export function sdkSessionChannelIdsUnder(channelId: string): string[] {
   const ids: string[] = [];
   for (const [id, session] of sessions) {
     if (session.isClosed) continue;
@@ -1134,42 +1153,42 @@ export function pilotSessionChannelIdsUnder(channelId: string): string[] {
 
 /**
  * Interrupt every live session a channel owns (see
- * `pilotSessionChannelIdsUnder`). Returns one entry per session interrupted.
+ * `sdkSessionChannelIdsUnder`). Returns one entry per session interrupted.
  */
-export async function interruptPilotSessionsUnder(
+export async function interruptSdkSessionsUnder(
   channelId: string,
-): Promise<Array<{ channelId: string; result: PilotInterruptResult }>> {
-  const out: Array<{ channelId: string; result: PilotInterruptResult }> = [];
-  for (const id of pilotSessionChannelIdsUnder(channelId)) {
-    const result = await interruptPilotSession(id);
+): Promise<Array<{ channelId: string; result: SdkInterruptResult }>> {
+  const out: Array<{ channelId: string; result: SdkInterruptResult }> = [];
+  for (const id of sdkSessionChannelIdsUnder(channelId)) {
+    const result = await interruptSdkSession(id);
     if (result) out.push({ channelId: id, result });
   }
   return out;
 }
 
 /** Stop every live session a channel owns. Returns how many were stopped. */
-export async function stopPilotSessionsUnder(channelId: string): Promise<number> {
+export async function stopSdkSessionsUnder(channelId: string): Promise<number> {
   let stopped = 0;
-  for (const id of pilotSessionChannelIdsUnder(channelId)) {
-    if (await stopPilotSession(id)) stopped += 1;
+  for (const id of sdkSessionChannelIdsUnder(channelId)) {
+    if (await stopSdkSession(id)) stopped += 1;
   }
   return stopped;
 }
 
 /**
- * Interrupt the current turn of one channel's pilot session, keeping the
+ * Interrupt the current turn of one channel's SDK session, keeping the
  * session (and its context) alive. Returns null when no session is running.
  */
-export async function interruptPilotSession(
+export async function interruptSdkSession(
   channelId: string,
-): Promise<PilotInterruptResult | null> {
+): Promise<SdkInterruptResult | null> {
   const session = sessions.get(channelId);
   if (!session || session.isClosed) return null;
   return session.interrupt();
 }
 
-/** Stop the pilot session for one channel. Returns true if one was running. */
-export async function stopPilotSession(channelId: string): Promise<boolean> {
+/** Stop the SDK session for one channel. Returns true if one was running. */
+export async function stopSdkSession(channelId: string): Promise<boolean> {
   const session = sessions.get(channelId);
   if (!session) return false;
   await session.stop("stopped by request");
@@ -1178,17 +1197,17 @@ export async function stopPilotSession(channelId: string): Promise<boolean> {
 }
 
 /**
- * Forget everything pilot remembers about a channel: stop the live session and
- * drop the stored SDK session id, so the next message starts a genuinely fresh
- * session instead of resuming. This is what `/clear` means in a pilot channel —
- * clearing our own conversation rows does nothing, because a pilot session
- * keeps its context inside the CLI, not in our DB.
+ * Forget everything we remember about a channel: stop the live session and drop
+ * the stored SDK session id, so the next message starts a genuinely fresh
+ * session instead of resuming. This is what `/clear` means — clearing our own
+ * conversation rows does nothing, because an SDK session keeps its context
+ * inside the CLI, not in our DB.
  *
  * Returns whether a live session was stopped.
  */
-export async function resetPilotSession(channelId: string): Promise<boolean> {
-  const stopped = await stopPilotSession(channelId);
-  clearPilotSessionId(channelId);
+export async function resetSdkSession(channelId: string): Promise<boolean> {
+  const stopped = await stopSdkSession(channelId);
+  clearSdkSessionId(channelId);
   return stopped;
 }
 
@@ -1198,21 +1217,21 @@ export async function resetPilotSession(channelId: string): Promise<boolean> {
  * id even when nothing is running there. Returns how many live sessions were
  * stopped and how many stored ids were dropped.
  */
-export async function resetPilotSessionScope(
+export async function resetSdkSessionScope(
   channelId: string,
 ): Promise<{ stopped: number; cleared: number }> {
-  const ids = pilotSessionChannelIdsUnder(channelId);
+  const ids = sdkSessionChannelIdsUnder(channelId);
   let stopped = 0;
   for (const id of ids) {
-    if (await stopPilotSession(id)) stopped += 1;
-    clearPilotSessionId(id);
+    if (await stopSdkSession(id)) stopped += 1;
+    clearSdkSessionId(id);
   }
-  if (!ids.includes(channelId)) clearPilotSessionId(channelId);
+  if (!ids.includes(channelId)) clearSdkSessionId(channelId);
   return { stopped, cleared: ids.includes(channelId) ? ids.length : ids.length + 1 };
 }
 
-/** Stop every pilot session. Returns how many were stopped. */
-export async function stopAllPilotSessions(): Promise<number> {
+/** Stop every SDK session. Returns how many were stopped. */
+export async function stopAllSdkSessions(): Promise<number> {
   const all = [...sessions.values()];
   sessions.clear();
   await Promise.all(all.map((s) => s.stop("stopped (shutdown/stop-all)")));
@@ -1229,12 +1248,12 @@ function startIdleReaper(): void {
   if (idleTimer) return;
   idleTimer = setInterval(() => {
     for (const [channelId, session] of [...sessions.entries()]) {
-      if (session.idleMs > PILOT_IDLE_MS) {
+      if (session.idleMs > SDK_IDLE_MS) {
         const idleMinutes = Math.round(session.idleMs / 60_000);
         sessions.delete(channelId);
         void session.stop(
           `reaped after ${Math.round(session.idleMs / 1000)}s idle`,
-          `-# 💤 pilot session closed after ${idleMinutes}m idle — the next message resumes it`,
+          `-# 💤 SDK session closed after ${idleMinutes}m idle — the next message resumes it`,
         );
       }
     }
@@ -1246,13 +1265,13 @@ function startIdleReaper(): void {
 // Orphan sweep
 //
 // If we were SIGKILLed, SDK child processes can outlive us. We identify them
-// precisely — and safely — by looking for processes whose cwd is the pilot
+// precisely — and safely — by looking for processes whose cwd is the SDK
 // workspace directory. Nothing else on the machine uses that directory, so
 // there is no risk of killing an unrelated `claude` session.
 // ---------------------------------------------------------------------------
 
-/** Kill leftover pilot child processes from a previous run. */
-export function sweepOrphanPilotProcesses(): number {
+/** Kill leftover SDK child processes from a previous run. */
+export function sweepOrphanSdkProcesses(): number {
   if (process.platform !== "linux" || !existsSync("/proc")) return 0;
 
   let killed = 0;
@@ -1274,7 +1293,7 @@ export function sweepOrphanPilotProcesses(): number {
     } catch {
       continue; // not ours / no permission
     }
-    if (path.resolve(cwd) !== path.resolve(PILOT_WORKSPACE_DIR)) continue;
+    if (path.resolve(cwd) !== path.resolve(SDK_WORKSPACE_DIR)) continue;
 
     let cmdline = "";
     try {
@@ -1287,7 +1306,7 @@ export function sweepOrphanPilotProcesses(): number {
     try {
       process.kill(pid, "SIGTERM");
       killed += 1;
-      console.log(`[pilot] swept orphan pilot process ${pid}: ${cmdline.slice(0, 120)}`);
+      console.log(`[sdk] swept orphan SDK process ${pid}: ${cmdline.slice(0, 120)}`);
     } catch {
       // already gone
     }
@@ -1303,20 +1322,21 @@ export function sweepOrphanPilotProcesses(): number {
 let shutdownHooksInstalled = false;
 
 /**
- * Initialise pilot mode: create directories, sweep orphaned children from a
- * previous run, start the idle reaper and install shutdown hooks.
+ * Initialise the SDK runtime: migrate the legacy data dir, create directories,
+ * sweep orphaned children from a previous run, start the idle reaper and
+ * install shutdown hooks.
  * Safe to call more than once.
  */
-export function initPilot(): void {
-  ensurePilotDirs();
-  sweepOrphanPilotProcesses();
+export function initSdk(): void {
+  ensureSdkDirs();
+  sweepOrphanSdkProcesses();
   startIdleReaper();
 
   if (shutdownHooksInstalled) return;
   shutdownHooksInstalled = true;
 
   const shutdown = () => {
-    void stopAllPilotSessions();
+    void stopAllSdkSessions();
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);

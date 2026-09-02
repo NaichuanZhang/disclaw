@@ -1,11 +1,11 @@
 // ---------------------------------------------------------------------------
-// Pilot mode — parity with the main agent
+// Session prompt and bridged tools
 //
-// The two runtimes build their own system prompts and their own tool lists, so
-// they drift silently. These tests pin the pieces that are meant to be shared:
-// the memory + caveman prompt fragments (exercised directly), and the pilot
-// wiring that consumes them (asserted against source, since building the real
-// prompt would spawn an SDK child and touch the live DB).
+// The session builds its own system prompt and its own tool list, so pieces the
+// rest of the bot relies on can quietly fall out of it. These tests pin the
+// shared prompt fragments (exercised directly) and the wiring that consumes them
+// (asserted against source, since building the real prompt would spawn an SDK
+// child and touch the live DB).
 // ---------------------------------------------------------------------------
 
 import { describe, it, expect } from "vitest";
@@ -19,15 +19,11 @@ import {
 } from "../../src/shared/prompt-fragments.js";
 
 const sessionSrc = readFileSync(
-  new URL("../../src/pilot/session.ts", import.meta.url),
+  new URL("../../src/sdk/session.ts", import.meta.url),
   "utf8",
 );
 const bridgeSrc = readFileSync(
-  new URL("../../src/pilot/bridge.ts", import.meta.url),
-  "utf8",
-);
-const agentSrc = readFileSync(
-  new URL("../../src/agent/agent.ts", import.meta.url),
+  new URL("../../src/sdk/bridge.ts", import.meta.url),
   "utf8",
 );
 
@@ -40,7 +36,7 @@ function config(settings: Record<string, unknown>): ChannelConfig {
 // ---------------------------------------------------------------------------
 
 describe("shared prompt fragments", () => {
-  it("names both memory tools so either runtime knows how to recall", () => {
+  it("names both memory tools so the session knows how to recall", () => {
     expect(MEMORY_RECALL_INSTRUCTIONS).toContain("memory_search");
     expect(MEMORY_RECALL_INSTRUCTIONS).toContain("memory_get");
   });
@@ -64,19 +60,19 @@ describe("shared prompt fragments", () => {
     expect(text).toContain("caveman-speak");
   });
 
-  it("is the single definition — the main agent imports rather than copies", () => {
-    expect(agentSrc).toContain('from "../shared/prompt-fragments.js"');
-    // A second literal `## Memory` heading here would mean the copy came back.
-    expect(agentSrc).not.toContain("const MEMORY_RECALL_INSTRUCTIONS = ");
-    expect(agentSrc).not.toContain("function buildCavemanInstructions");
+  it("is the single definition — the session imports rather than copies", () => {
+    expect(sessionSrc).toContain('from "../shared/prompt-fragments.js"');
+    // A local copy of either would drift from what /caveman writes.
+    expect(sessionSrc).not.toContain("const MEMORY_RECALL_INSTRUCTIONS = ");
+    expect(sessionSrc).not.toContain("function buildCavemanInstructions");
   });
 });
 
 // ---------------------------------------------------------------------------
-// Pilot prompt wiring
+// Prompt wiring
 // ---------------------------------------------------------------------------
 
-describe("pilot system prompt", () => {
+describe("session system prompt", () => {
   it("injects soul and the shared memory instructions", () => {
     expect(sessionSrc).toContain("this.buildIdentityPrompt()");
     expect(sessionSrc).toContain("getSoul()");
@@ -90,8 +86,7 @@ describe("pilot system prompt", () => {
     expect(sessionSrc).toMatch(/channelSettings\(\(config\) => getCavemanLevel\(config\)\)/);
   });
 
-  it("records pilot turn failures as reflection signals", () => {
-    expect(sessionSrc).toContain('source: "pilot"');
+  it("records turn failures as reflection signals", () => {
     expect(sessionSrc).toContain("recordSignal({");
   });
 });
@@ -100,7 +95,7 @@ describe("pilot system prompt", () => {
 // Bridged context tools
 // ---------------------------------------------------------------------------
 
-describe("pilot context tools", () => {
+describe("bridged context tools", () => {
   const CONTEXT_TOOLS = [
     "get_channel_history",
     "create_thread",
@@ -108,15 +103,15 @@ describe("pilot context tools", () => {
     "get_conversation_stats",
   ];
 
-  it("exposes the main agent's history and thread tools", () => {
+  it("exposes the history and thread tools", () => {
     for (const name of CONTEXT_TOOLS) {
       expect(bridgeSrc).toContain(`tool(\n        "${name}"`);
     }
   });
 
-  it("defaults channel-scoped tools to the pilot channel", () => {
-    // Both take channel_id optionally; a pilot session that omits it must hit
-    // its own channel, not fail or guess.
+  it("defaults channel-scoped tools to the session's own channel", () => {
+    // Both take channel_id optionally; a session that omits it must hit its own
+    // channel, not fail or guess.
     expect(bridgeSrc).toContain("args.channel_id ?? channelId");
     expect(bridgeSrc).toContain('runDiscordTool("get_channel_history"');
     expect(bridgeSrc).toContain('runDiscordTool("create_thread"');

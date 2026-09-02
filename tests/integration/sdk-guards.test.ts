@@ -1,21 +1,17 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import {
-  PilotSession,
-  interruptPilotSession,
-  pilotConfigChannelId,
-} from "../../src/pilot/session.js";
-import { buildPilotEnv } from "../../src/pilot/env.js";
+import { SdkSession, interruptSdkSession } from "../../src/sdk/session.js";
+import { buildSdkEnv } from "../../src/sdk/env.js";
 
 // ---------------------------------------------------------------------------
-// child process env — pilot is unrestricted: the child inherits everything,
+// child process env — the child is unrestricted: it inherits everything,
 // secrets included. The old allowlist (and the unenforced tool-call policy in
 // policy.ts) were removed by operator request.
 // ---------------------------------------------------------------------------
 
-describe("buildPilotEnv", () => {
+describe("buildSdkEnv", () => {
   it("forwards the whole source env, secrets included", () => {
-    const env = buildPilotEnv({
+    const env = buildSdkEnv({
       source: {
         PATH: "/usr/bin",
         HOME: "/home/bot",
@@ -34,13 +30,13 @@ describe("buildPilotEnv", () => {
     expect(env.DATABASE_URL).toBe("postgres://x");
   });
 
-  it("marks the child process as a pilot child", () => {
-    const env = buildPilotEnv({ source: { PATH: "/usr/bin" } });
-    expect(env.DISCORDCLAW_PILOT).toBe("1");
+  it("marks the child process as an SDK child", () => {
+    const env = buildSdkEnv({ source: { PATH: "/usr/bin" } });
+    expect(env.DISCORDCLAW_SDK).toBe("1");
   });
 
   it("forwards model auth so the session can reach a model", () => {
-    const env = buildPilotEnv({
+    const env = buildSdkEnv({
       source: {
         PATH: "/usr/bin",
         ANTHROPIC_BASE_URL: "https://proxy.example",
@@ -53,101 +49,26 @@ describe("buildPilotEnv", () => {
     expect(env.ANTHROPIC_MODEL).toBe("some-model");
   });
 
-  it("lets a pilot-only API key replace the inherited proxy token", () => {
-    const env = buildPilotEnv({
+  it("lets an SDK-only API key replace the inherited proxy token", () => {
+    const env = buildSdkEnv({
       source: {
         PATH: "/usr/bin",
         ANTHROPIC_AUTH_TOKEN: "proxy-token",
-        PILOT_ANTHROPIC_API_KEY: "sk-pilot",
+        SDK_ANTHROPIC_API_KEY: "sk-sdk",
       },
     });
-    expect(env.ANTHROPIC_API_KEY).toBe("sk-pilot");
+    expect(env.ANTHROPIC_API_KEY).toBe("sk-sdk");
     expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
   });
 
   it("lets explicit overrides win over the inherited value", () => {
-    const env = buildPilotEnv({
+    const env = buildSdkEnv({
       source: { PATH: "/usr/bin", ANTHROPIC_MODEL: "inherited" },
       overrides: { ANTHROPIC_MODEL: "override" },
     });
     expect(env.ANTHROPIC_MODEL).toBe("override");
   });
 });
-// ---------------------------------------------------------------------------
-// pilot channel resolution (thread inheritance)
-// ---------------------------------------------------------------------------
-
-describe("pilotConfigChannelId", () => {
-  it("uses the channel itself for a top-level guild channel", () => {
-    expect(
-      pilotConfigChannelId({
-        channelId: "chan-1",
-        isDM: false,
-        isThread: false,
-      }),
-    ).toBe("chan-1");
-  });
-
-  it("uses the parent channel for a thread, so threads inherit pilot mode", () => {
-    expect(
-      pilotConfigChannelId({
-        channelId: "thread-9",
-        isDM: false,
-        isThread: true,
-        parentId: "chan-1",
-      }),
-    ).toBe("chan-1");
-  });
-
-  it("never applies pilot mode to DMs", () => {
-    expect(
-      pilotConfigChannelId({ channelId: "dm-1", isDM: true, isThread: false }),
-    ).toBeNull();
-    expect(
-      pilotConfigChannelId({
-        channelId: "dm-thread",
-        isDM: true,
-        isThread: true,
-        parentId: "chan-1",
-      }),
-    ).toBeNull();
-  });
-
-  it("returns null for a thread with no resolvable parent", () => {
-    expect(
-      pilotConfigChannelId({
-        channelId: "thread-9",
-        isDM: false,
-        isThread: true,
-        parentId: null,
-      }),
-    ).toBeNull();
-    expect(
-      pilotConfigChannelId({ channelId: "thread-9", isDM: false, isThread: true }),
-    ).toBeNull();
-  });
-
-  it("resolves sibling threads to the same parent config but keeps distinct ids", () => {
-    const a = pilotConfigChannelId({
-      channelId: "thread-a",
-      isDM: false,
-      isThread: true,
-      parentId: "chan-1",
-    });
-    const b = pilotConfigChannelId({
-      channelId: "thread-b",
-      isDM: false,
-      isThread: true,
-      parentId: "chan-1",
-    });
-    // Same pilot flag source...
-    expect(a).toBe("chan-1");
-    expect(b).toBe("chan-1");
-    // ...but sessions are keyed by the thread id, not this value.
-    expect("thread-a").not.toBe("thread-b");
-  });
-});
-
 // ---------------------------------------------------------------------------
 // interrupt
 // ---------------------------------------------------------------------------
@@ -156,13 +77,13 @@ function makeTarget(id: string) {
   return { id, send: async () => undefined };
 }
 
-describe("pilot interrupt", () => {
+describe("session interrupt", () => {
   it("returns null when no session is running for the channel", async () => {
-    await expect(interruptPilotSession("no-such-channel")).resolves.toBeNull();
+    await expect(interruptSdkSession("no-such-channel")).resolves.toBeNull();
   });
 
   it("does not throw when there is no live SDK stream yet", async () => {
-    const session = new PilotSession(makeTarget("chan-int-1"));
+    const session = new SdkSession(makeTarget("chan-int-1"));
     const result = await session.interrupt();
     expect(result.ok).toBe(false);
     expect(result.dropped).toBe(0);
@@ -170,7 +91,7 @@ describe("pilot interrupt", () => {
   });
 
   it("drops our own queued messages and reports the count", async () => {
-    const session = new PilotSession(makeTarget("chan-int-2"));
+    const session = new SdkSession(makeTarget("chan-int-2"));
     // Reach into the queue directly: submit() would spawn a real SDK session.
     const internals = session as unknown as { queue: unknown[] };
     internals.queue.push({}, {}, {});
@@ -182,7 +103,7 @@ describe("pilot interrupt", () => {
   });
 
   it("reports stillQueued from the receipt only when the CLI advertises it", async () => {
-    const session = new PilotSession(makeTarget("chan-int-3"));
+    const session = new SdkSession(makeTarget("chan-int-3"));
     const internals = session as unknown as {
       stream: { interrupt: () => Promise<{ still_queued: string[] }> } | null;
       capabilities: string[];
@@ -205,7 +126,7 @@ describe("pilot interrupt", () => {
   });
 
   it("surfaces ok:false when the SDK interrupt rejects", async () => {
-    const session = new PilotSession(makeTarget("chan-int-4"));
+    const session = new SdkSession(makeTarget("chan-int-4"));
     const internals = session as unknown as {
       stream: { interrupt: () => Promise<never> } | null;
     };
@@ -220,16 +141,16 @@ describe("pilot interrupt", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Evolution tools are bridged into pilot sessions
+// Evolution tools are bridged into SDK sessions
 // ---------------------------------------------------------------------------
 
-describe("pilot evolution access", () => {
+describe("evolution access", () => {
   const bridgeSrc = readFileSync(
-    new URL("../../src/pilot/bridge.ts", import.meta.url),
+    new URL("../../src/sdk/bridge.ts", import.meta.url),
     "utf8",
   );
   const sessionSrc = readFileSync(
-    new URL("../../src/pilot/session.ts", import.meta.url),
+    new URL("../../src/sdk/session.ts", import.meta.url),
     "utf8",
   );
 
@@ -257,7 +178,7 @@ describe("pilot evolution access", () => {
     expect(bridgeSrc).toContain("setEvolutionContext(ctx.channelId, ctx.getUserId?.())");
   });
 
-  it("appends the shared evolution instructions to the pilot system prompt", () => {
+  it("appends the shared evolution instructions to the system prompt", () => {
     expect(sessionSrc).toContain("EVOLUTION_INSTRUCTIONS");
     expect(sessionSrc).toContain("this.buildEvolutionPrompt()");
   });

@@ -8,19 +8,18 @@ import {
   declareSkillPaths,
 } from "./metrics/counters.js";
 import {
-  cronAgentRuntime,
-  initPilot,
-  planPilotCronRoute,
-  stopAllPilotSessions,
-  submitToPilotSession,
-} from "./pilot/index.js";
+  initSdk,
+  planSdkCronRoute,
+  stopAllSdkSessions,
+  submitToSdkSession,
+} from "./sdk/index.js";
 import { expireStalePendingQuestions } from "./agent/questions.js";
 import { initSoul, stopSoulWatcher } from "./soul/soul.js";
 import { initMemory, stopMemoryWatcher } from "./memory/memory.js";
 import { isMem9Enabled } from "./memory/mem9.js";
 import { CronService, type CronAgentTurnContext } from "./cron/service.js";
 import { SkillService } from "./skills/service.js";
-import { processAgentTurn, declareAgentToolPaths } from "./agent/agent.js";
+import { declareAgentToolPaths } from "./agent/tool-paths.js";
 import { createClient, startBot, stopBot } from "./bot/client.js";
 import { setCommandsSkillService, setCommandsCronService, slashCommands } from "./bot/commands.js";
 import { startGateway } from "./gateway/server.js";
@@ -61,99 +60,80 @@ let discordClient: any = null;
 /**
  * Run a cron `agentTurn` job on a Claude Agent SDK session.
  *
- * Cron used to be the one place with two runtimes: a pilot-flagged channel got
- * an SDK session and everything else silently fell back to the in-process agent
- * loop — different tools, different workspace, none of the session context. The
- * channel flag no longer decides. Every agent turn runs on the SDK, in a fresh
- * thread per run (or in the thread itself when delivery already points at one,
- * or in the DM when it points there), which also means every job gets a clean
- * session. `CRON_RUNTIME=main` forces the old loop back if that goes wrong.
- *
- * The main loop stays reachable as a fallback for the two cases the SDK path
- * cannot serve — a job with no delivery channel to host a session, and a route
- * that throws — because a scheduled job must never silently stop running.
+ * Every agent turn runs on the SDK, in a fresh thread per run (or in the thread
+ * itself when delivery already points at one, or in the DM when it points
+ * there), which also means every job gets a clean session.
  *
  * Submission is fire-and-forget: the session relays its own output to the
- * channel and the run record just says where it went, so cron history no longer
- * holds the job's output or its real pass/fail. It also means the cron per-job
- * timeout does not bound the work — the pilot turn watchdog
- * (`PILOT_TURN_TIMEOUT_MS`) does. A per-job `model` override is honoured, since
- * a fresh thread means a session that has not started yet.
+ * channel and the run record just says where it went, so cron history holds
+ * neither the job's output nor its real pass/fail. It also means the cron
+ * per-job timeout does not bound the work — the turn watchdog
+ * (`SDK_TURN_TIMEOUT_MS`) does. A per-job `model` override is honoured, since a
+ * fresh thread means a session that has not started yet.
+ *
+ * There is no second runtime to fall back to, so a job that cannot be routed —
+ * no delivery channel to host a session, no Discord client, or a route that
+ * throws — fails loudly and is recorded as a failed run.
  */
 async function runCronAgentTurn(
   message: string,
   model?: string,
   context?: CronAgentTurnContext,
 ): Promise<string> {
+  if (!discordClient) {
+    throw new Error("Discord client not ready; cannot host an SDK session");
+  }
+
   // Read the delivery channel from the client cache (no API call) so a job
   // pointed at a thread keeps its session in that thread, and a DM target is
   // recognised as one (it can hold a session but not a thread). An uncached
   // channel is treated as a plain channel, which is what a configured cron
   // delivery target almost always is; `ensureThread` no-ops off-guild anyway.
   const cached: any = context?.channelId
-    ? discordClient?.channels?.cache?.get(context.channelId)
+    ? discordClient.channels?.cache?.get(context.channelId)
     : null;
   const cachedIsThread =
     cached && typeof cached.isThread === "function" ? cached.isThread() : false;
-  const route =
-    cronAgentRuntime() === "main"
-      ? null
-      : planPilotCronRoute({
-          channelId: context?.channelId,
-          isThread: cachedIsThread,
-          parentId: cachedIsThread ? cached.parentId : null,
-          isDM: cached ? cached.isDMBased?.() === true : false,
-        });
+  const route = planSdkCronRoute({
+    channelId: context?.channelId,
+    isThread: cachedIsThread,
+    parentId: cachedIsThread ? cached.parentId : null,
+    isDM: cached ? cached.isDMBased?.() === true : false,
+  });
 
-  if (route && discordClient) {
-    try {
-      const channel: any =
-        cached ?? (await discordClient.channels.fetch(route.sessionChannelId));
-      if (!channel) throw new Error(`channel ${route.sessionChannelId} not found`);
-
-      // Cron output is thread-only by policy, and each thread is its own pilot
-      // session — so a scheduled job gets a clean session per run.
-      const target = route.needsThread
-        ? await ensureThread(
-            channel,
-            context?.jobName ? `cron: ${context.jobName}` : "cron job",
-            "cron",
-          )
-        : channel;
-
-      submitToPilotSession(target, {
-        text: message,
-        userId: ADMIN_USER_ID,
-        userName: "cron",
-        channelName: context?.jobName ? `cron:${context.jobName}` : "cron",
-        // A fresh thread means a fresh session, so a per-job model override is
-        // applied for real rather than logged and dropped.
-        modelOverride: model,
-      });
-      console.log(
-        `[cron] Routed agentTurn "${context?.jobName}" to pilot session ${target.id}`,
-      );
-      return `Routed to pilot session ${target.id}`;
-    } catch (err) {
-      // A broken pilot route must not stop a scheduled job from running at all.
-      console.error(
-        `[cron] Pilot routing failed for "${context?.jobName}", falling back to the main agent:`,
-        err instanceof Error ? err.message : err,
-      );
-    }
-  } else {
-    const reason =
-      cronAgentRuntime() === "main"
-        ? "CRON_RUNTIME=main"
-        : !route
-          ? "no delivery channel to host a session"
-          : "Discord client not ready";
-    console.log(
-      `[cron] Running agentTurn "${context?.jobName}" on the main agent loop (${reason})`,
+  if (!route) {
+    throw new Error(
+      "no delivery channel configured; an agentTurn job needs one to host a session",
     );
   }
 
-  return processAgentTurn({ message, model });
+  const channel: any =
+    cached ?? (await discordClient.channels.fetch(route.sessionChannelId));
+  if (!channel) throw new Error(`channel ${route.sessionChannelId} not found`);
+
+  // Cron output is thread-only by policy, and each thread is its own session —
+  // so a scheduled job gets a clean session per run.
+  const target = route.needsThread
+    ? await ensureThread(
+        channel,
+        context?.jobName ? `cron: ${context.jobName}` : "cron job",
+        "cron",
+      )
+    : channel;
+
+  submitToSdkSession(target, {
+    text: message,
+    userId: ADMIN_USER_ID,
+    userName: "cron",
+    channelName: context?.jobName ? `cron:${context.jobName}` : "cron",
+    // A fresh thread means a fresh session, so a per-job model override is
+    // applied for real rather than logged and dropped.
+    modelOverride: model,
+  });
+  console.log(
+    `[cron] Routed agentTurn "${context?.jobName}" to SDK session ${target.id}`,
+  );
+  return `Routed to SDK session ${target.id}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,11 +192,11 @@ async function main(): Promise<void> {
     soulPath: join(DATA_DIR, "SOUL.md"),
   });
 
-  // 3.65 Initialize pilot mode (Claude Agent SDK sessions for pilot channels)
+  // 3.65 Initialize the Claude Agent SDK runtime (workspace dirs, orphan sweep)
   try {
-    initPilot();
+    initSdk();
   } catch (err) {
-    console.warn("[discordclaw] Pilot mode init failed (non-fatal):", err);
+    console.warn("[discordclaw] SDK runtime init failed (non-fatal):", err);
   }
 
   // 3.7 Check gh CLI availability
@@ -488,12 +468,12 @@ async function main(): Promise<void> {
       stopMemoryWatcher();
       skillService.stop();
       gateway.close();
-      // process.exit() runs neither SIGTERM nor beforeExit, so the pilot
-      // teardown hooks never fire — without this, every pilot child is orphaned
+      // process.exit() runs neither SIGTERM nor beforeExit, so the session
+      // teardown hooks never fire — without this, every SDK child is orphaned
       // until the next boot's sweep.
-      const stoppedPilots = await stopAllPilotSessions();
-      if (stoppedPilots > 0) {
-        console.log(`[discordclaw] Stopped ${stoppedPilots} pilot session(s)`);
+      const stoppedSessions = await stopAllSdkSessions();
+      if (stoppedSessions > 0) {
+        console.log(`[discordclaw] Stopped ${stoppedSessions} SDK session(s)`);
       }
       await stopBot(client);
 

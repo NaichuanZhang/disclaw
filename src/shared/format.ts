@@ -1,9 +1,9 @@
 // ---------------------------------------------------------------------------
-// Small display formatters shared by the two runtimes
+// Small display formatters
 //
-// Both the main agent path (bot/messages.ts) and pilot mode post a `-# 📊`
-// usage footer. Keeping the number formatting here means the two lines can't
-// drift apart.
+// A finished turn posts a `-# 📊` usage footer. Keeping the number formatting
+// out of the session code means the same shapes are reused wherever else a
+// count or a duration is rendered.
 // ---------------------------------------------------------------------------
 
 /** Format token count: 1234 → "1.2k", 123456 → "123.5k" */

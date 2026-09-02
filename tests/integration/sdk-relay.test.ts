@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Pilot mode — outbound relay behaviour
+// Outbound relay behaviour
 //
 // Covers the send queue (coalescing, ordering, throttling, flush-on-close) and
 // the session's relay of SDK messages into channel lines: the usage footer,
@@ -10,8 +10,8 @@
 // ---------------------------------------------------------------------------
 
 import { describe, it, expect } from "vitest";
-import { PilotRelayQueue } from "../../src/pilot/relay-queue.js";
-import { PilotSession } from "../../src/pilot/session.js";
+import { SdkRelayQueue } from "../../src/sdk/relay-queue.js";
+import { SdkSession } from "../../src/sdk/session.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -46,14 +46,14 @@ function makeClock() {
 
 interface SessionInternals {
   relay: (message: unknown) => Promise<void>;
-  outbound: PilotRelayQueue;
+  outbound: SdkRelayQueue;
   lastUserId: string | undefined;
   currentUserId: () => string | undefined;
 }
 
 function makeSession(id: string) {
   const recorder = makeRecorder();
-  const session = new PilotSession({ id, send: recorder.send });
+  const session = new SdkSession({ id, send: recorder.send });
   return {
     session,
     sent: recorder.sent,
@@ -65,10 +65,10 @@ function makeSession(id: string) {
 // Send queue
 // ---------------------------------------------------------------------------
 
-describe("PilotRelayQueue", () => {
+describe("SdkRelayQueue", () => {
   it("merges consecutive progress lines into one message", async () => {
     const { sent, send } = makeRecorder();
-    const queue = new PilotRelayQueue({ send, debounceMs: 10_000 });
+    const queue = new SdkRelayQueue({ send, debounceMs: 10_000 });
 
     queue.pushCoalescing("-# a");
     queue.pushCoalescing("-# b");
@@ -80,7 +80,7 @@ describe("PilotRelayQueue", () => {
 
   it("keeps a prompt line separate but in order", async () => {
     const { sent, send } = makeRecorder();
-    const queue = new PilotRelayQueue({ send, debounceMs: 10_000 });
+    const queue = new SdkRelayQueue({ send, debounceMs: 10_000 });
 
     queue.pushCoalescing("-# tool one");
     queue.pushCoalescing("-# tool two");
@@ -92,7 +92,7 @@ describe("PilotRelayQueue", () => {
 
   it("starts a new batch rather than exceeding the merge cap", async () => {
     const { sent, send } = makeRecorder();
-    const queue = new PilotRelayQueue({
+    const queue = new SdkRelayQueue({
       send,
       debounceMs: 10_000,
       maxMergedChars: 12,
@@ -109,7 +109,7 @@ describe("PilotRelayQueue", () => {
   it("waits instead of exceeding the per-window send cap", async () => {
     const { sent, send } = makeRecorder();
     const clock = makeClock();
-    const queue = new PilotRelayQueue({
+    const queue = new SdkRelayQueue({
       send,
       debounceMs: 10_000,
       maxSendsPerWindow: 2,
@@ -131,7 +131,7 @@ describe("PilotRelayQueue", () => {
   it("does not wait when sends are spread across windows", async () => {
     const { send } = makeRecorder();
     const clock = makeClock();
-    const queue = new PilotRelayQueue({
+    const queue = new SdkRelayQueue({
       send,
       debounceMs: 10_000,
       maxSendsPerWindow: 2,
@@ -152,7 +152,7 @@ describe("PilotRelayQueue", () => {
 
   it("flushes what is buffered when closed", async () => {
     const { sent, send } = makeRecorder();
-    const queue = new PilotRelayQueue({ send, debounceMs: 10_000 });
+    const queue = new SdkRelayQueue({ send, debounceMs: 10_000 });
 
     queue.pushCoalescing("-# tail of the turn");
     await queue.close();
@@ -167,7 +167,7 @@ describe("PilotRelayQueue", () => {
   it("reports a failed send and keeps draining", async () => {
     const sent: string[] = [];
     const errors: unknown[] = [];
-    const queue = new PilotRelayQueue({
+    const queue = new SdkRelayQueue({
       send: async (text) => {
         if (text === "boom") throw new Error("429");
         sent.push(text);
@@ -189,7 +189,7 @@ describe("PilotRelayQueue", () => {
 // Session relay
 // ---------------------------------------------------------------------------
 
-describe("pilot session relay", () => {
+describe("session relay", () => {
   it("relays assistant text as its own message", async () => {
     const { sent, internals } = makeSession("chan-relay-1");
 

@@ -1,17 +1,17 @@
 // ---------------------------------------------------------------------------
-// Pilot mode — in-process MCP bridge
+// SDK sessions — in-process MCP bridge
 //
 // Re-exports a curated subset of this bot's own tools to the Claude Agent SDK
 // session via `createSdkMcpServer`, so they run in our process (no stdio
 // subprocess, no extra auth).
 //
-// Includes the full `evolve_*` tool set, so pilot sessions self-modify through
+// Includes the full `evolve_*` tool set, so sessions self-modify through
 // the same worktree -> PR -> CI -> auto-merge path as the main agent. The
 // plan-approval gate still applies and is enforced in code: evolve_start
 // refuses to run without an approved plan of at least 80 characters.
 //
 // Deliberately NOT exposed: bash/read_file/write_file — the SDK session already
-// has its own native Bash/Read/Write (ungated — pilot runs with
+// has its own native Bash/Read/Write (ungated — sessions run with
 // bypassPermissions).
 // ---------------------------------------------------------------------------
 
@@ -23,8 +23,8 @@ import { handleSkillTool } from "../skills/tools.js";
 import { handleConversationHistoryTool } from "../shared/conversation-history.js";
 import { handleEvolutionTool, setEvolutionContext } from "../evolution/tools.js";
 
-export interface PilotBridgeOptions {
-  /** Channel the pilot session lives in — used as the default target. */
+export interface SdkBridgeOptions {
+  /** Channel the session lives in — used as the default target. */
   channelId: string;
   /**
    * Who the session is talking to *right now*, as a getter rather than a value.
@@ -36,7 +36,7 @@ export interface PilotBridgeOptions {
 }
 
 /** MCP server name; tools appear to the model as `mcp__discordclaw__<name>`. */
-export const PILOT_MCP_SERVER_NAME = "discordclaw";
+export const BRIDGE_MCP_SERVER_NAME = "discordclaw";
 
 function textResult(text: string) {
   return { content: [{ type: "text" as const, text }] };
@@ -103,7 +103,7 @@ function runHistoryTool(
 async function runEvolutionTool(
   name: string,
   input: Record<string, unknown>,
-  ctx: PilotBridgeOptions,
+  ctx: SdkBridgeOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   try {
     setEvolutionContext(ctx.channelId, ctx.getUserId?.());
@@ -120,13 +120,13 @@ async function runEvolutionTool(
 
 /**
  * Build the in-process MCP server exposing our Discord + memory tools to a
- * pilot session.
+ * session.
  */
-export function createPilotMcpServer(options: PilotBridgeOptions) {
+export function createBridgeMcpServer(options: SdkBridgeOptions) {
   const { channelId } = options;
 
   return createSdkMcpServer({
-    name: PILOT_MCP_SERVER_NAME,
+    name: BRIDGE_MCP_SERVER_NAME,
     version: "1.0.0",
     instructions:
       "Tools from the host Discord bot. Use send_message to post to a channel, " +
@@ -141,13 +141,13 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
     tools: [
       tool(
         "send_message",
-        "Send a message to a Discord channel. Defaults to the current pilot channel.",
+        "Send a message to a Discord channel. Defaults to the current channel.",
         {
           text: z.string().describe("Message text to send"),
           channel_id: z
             .string()
             .optional()
-            .describe("Discord channel ID (defaults to the pilot channel)"),
+            .describe("Discord channel ID (defaults to the current channel)"),
         },
         async (args) =>
           runDiscordTool("send_message", {
@@ -158,13 +158,13 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
 
       tool(
         "send_file",
-        "Send a file from disk as a Discord attachment. Defaults to the current pilot channel.",
+        "Send a file from disk as a Discord attachment. Defaults to the current channel.",
         {
           file_path: z.string().describe("Absolute path to the file on disk"),
           channel_id: z
             .string()
             .optional()
-            .describe("Discord channel ID (defaults to the pilot channel)"),
+            .describe("Discord channel ID (defaults to the current channel)"),
           message: z
             .string()
             .optional()
@@ -192,7 +192,7 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
           channel_id: z
             .string()
             .optional()
-            .describe("Discord channel ID (defaults to the pilot channel)"),
+            .describe("Discord channel ID (defaults to the current channel)"),
         },
         async (args) =>
           runDiscordTool("add_reaction", {
@@ -222,11 +222,11 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
           channel_id: z
             .string()
             .optional()
-            .describe("Channel ID to ask in (defaults to the pilot channel)"),
+            .describe("Channel ID to ask in (defaults to the current channel)"),
           user_id: z
             .string()
             .optional()
-            .describe("User ID to mention (defaults to the pilot user)"),
+            .describe("User ID to mention (defaults to the current user)"),
         },
         async (args) =>
           runDiscordTool("ask_user", {
@@ -344,19 +344,19 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
       ),
 
       // ---------------------------------------------------------------------
-      // Read-only context tools — same handlers the main agent uses, so a pilot
+      // Read-only context tools — same handlers the voice agent uses, so a
       // session can look past its own SDK transcript (older scrollback, other
       // channels, cross-session history) instead of guessing.
       // ---------------------------------------------------------------------
 
       tool(
         "get_channel_history",
-        "Read recent Discord messages from a channel. Use for scrollback that is not already in this session's context: messages older than what you have seen, or a different channel. Defaults to the current pilot channel.",
+        "Read recent Discord messages from a channel. Use for scrollback that is not already in this session's context: messages older than what you have seen, or a different channel. Defaults to the current channel.",
         {
           channel_id: z
             .string()
             .optional()
-            .describe("Discord channel ID (defaults to the pilot channel)"),
+            .describe("Discord channel ID (defaults to the current channel)"),
           limit: z
             .number()
             .optional()
@@ -377,7 +377,7 @@ export function createPilotMcpServer(options: PilotBridgeOptions) {
           channel_id: z
             .string()
             .optional()
-            .describe("Parent channel ID (defaults to the pilot channel)"),
+            .describe("Parent channel ID (defaults to the current channel)"),
           message: z
             .string()
             .optional()

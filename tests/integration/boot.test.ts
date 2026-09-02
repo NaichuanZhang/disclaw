@@ -162,67 +162,7 @@ describe("Skills", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Image extraction (pure function — no deps)
-// ---------------------------------------------------------------------------
-describe("extractImages", () => {
-  it("extracts URL images from markdown", async () => {
-    const { extractImages } = await import("../../src/agent/agent.js");
-
-    const text = "Here is an image: ![alt text](https://example.com/image.png)";
-    const { cleanText, images } = extractImages(text);
-
-    expect(images).toHaveLength(1);
-    expect(images[0].source).toBe("https://example.com/image.png");
-    expect(images[0].type).toBe("url");
-    expect(images[0].alt).toBe("alt text");
-    expect(cleanText).not.toContain("![");
-  });
-
-  it("extracts local file images", async () => {
-    const { extractImages } = await import("../../src/agent/agent.js");
-
-    const text = "Check this: ![chart](/tmp/output/chart.png)";
-    const { cleanText, images } = extractImages(text);
-
-    expect(images).toHaveLength(1);
-    expect(images[0].source).toBe("/tmp/output/chart.png");
-    expect(images[0].type).toBe("file");
-  });
-
-  it("leaves non-image markdown links intact", async () => {
-    const { extractImages } = await import("../../src/agent/agent.js");
-
-    const text = "Here is a ![doc](/tmp/readme.md) link";
-    const { cleanText, images } = extractImages(text);
-
-    expect(images).toHaveLength(0);
-    expect(cleanText).toContain("![doc]");
-  });
-
-  it("handles text with no images", async () => {
-    const { extractImages } = await import("../../src/agent/agent.js");
-
-    const text = "Just a normal message with no images.";
-    const { cleanText, images } = extractImages(text);
-
-    expect(images).toHaveLength(0);
-    expect(cleanText).toBe(text);
-  });
-
-  it("extracts multiple images", async () => {
-    const { extractImages } = await import("../../src/agent/agent.js");
-
-    const text = "First: ![a](https://a.com/1.png) and second: ![b](https://b.com/2.jpg)";
-    const { images } = extractImages(text);
-
-    expect(images).toHaveLength(2);
-    expect(images[0].source).toBe("https://a.com/1.png");
-    expect(images[1].source).toBe("https://b.com/2.jpg");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 6. Tool registration (all tools importable without crash)
+// 5. Tool registration (all tools importable without crash)
 // ---------------------------------------------------------------------------
 describe("Tool Registration", () => {
   it("memory tools export correctly", async () => {

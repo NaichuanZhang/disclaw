@@ -1,15 +1,15 @@
 // ---------------------------------------------------------------------------
-// Pilot mode — Discord attachments
+// SDK sessions — Discord attachments
 //
 // The main agent turns attachments into Claude vision/document content blocks.
-// A pilot session can't take content blocks: its prompt is plain text and it
-// has its own native Read tool. So pilot goes the other way — the attachment is
+// An SDK session can't take content blocks: its prompt is plain text and it
+// has its own native Read tool. So we go the other way — the attachment is
 // downloaded into the session's own workspace and the *path* is handed over, and
 // the model reads (or ignores) it like any other local file.
 //
 // Files land in <workspace>/inbox/<messageId>/<name>. Names are sanitised,
 // downloads are size-capped, and the inbox is pruned on a rolling window so a
-// busy pilot channel can't fill the disk.
+// busy channel can't fill the disk.
 // ---------------------------------------------------------------------------
 
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -17,37 +17,37 @@ import path from "node:path";
 import { DATA_DIR } from "../shared/paths.js";
 
 /**
- * Where downloaded attachments land, inside the pilot workspace.
+ * Where downloaded attachments land, inside the session workspace.
  *
  * Derived from DATA_DIR rather than imported from session.ts on purpose: this
  * module is loaded from bot/messages.ts alongside session.ts, and importing the
  * constant across the cycle evaluated to `undefined`. A test asserts this stays
- * equal to `<PILOT_WORKSPACE_DIR>/inbox`.
+ * equal to `<SDK_WORKSPACE_DIR>/inbox`.
  */
-export const PILOT_INBOX_DIR = path.join(DATA_DIR, "pilot", "workspace", "inbox");
+export const SDK_INBOX_DIR = path.join(DATA_DIR, "sdk", "workspace", "inbox");
 
 /** Per-file download cap. Discord's own limit is 25 MB for most uploads. */
 const DEFAULT_MAX_BYTES = Number(
-  process.env.PILOT_ATTACHMENT_MAX_BYTES || 25 * 1024 * 1024,
+  process.env.SDK_ATTACHMENT_MAX_BYTES || 25 * 1024 * 1024,
 );
 
 /** How long a message's inbox directory is kept before pruning. */
 const DEFAULT_MAX_AGE_MS = Number(
-  process.env.PILOT_INBOX_MAX_AGE_MS || 24 * 60 * 60 * 1000,
+  process.env.SDK_INBOX_MAX_AGE_MS || 24 * 60 * 60 * 1000,
 );
 
 /** Longest filename we write, before the extension is preserved. */
 const MAX_NAME_CHARS = 120;
 
 /** The subset of a Discord attachment we need — plain data, easy to fabricate. */
-export interface PilotAttachmentInput {
+export interface SdkAttachmentInput {
   name: string;
   url: string;
   size?: number;
   contentType?: string | null;
 }
 
-export interface SavedPilotAttachment {
+export interface SavedSdkAttachment {
   /** Name as written to disk (sanitised, possibly de-duplicated). */
   name: string;
   /** Absolute path handed to the session. */
@@ -56,22 +56,22 @@ export interface SavedPilotAttachment {
   contentType?: string;
 }
 
-export interface SkippedPilotAttachment {
+export interface SkippedSdkAttachment {
   name: string;
   reason: string;
 }
 
-export interface PilotAttachmentResult {
-  saved: SavedPilotAttachment[];
-  skipped: SkippedPilotAttachment[];
+export interface SdkAttachmentResult {
+  saved: SavedSdkAttachment[];
+  skipped: SkippedSdkAttachment[];
 }
 
-export interface SavePilotAttachmentsOptions {
+export interface SaveSdkAttachmentsOptions {
   /** Override the per-file cap (bytes). */
   maxBytes?: number;
   /** Injected for tests. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
-  /** Injected for tests. Defaults to PILOT_INBOX_DIR. */
+  /** Injected for tests. Defaults to SDK_INBOX_DIR. */
   inboxDir?: string;
   /** Skip the rolling prune (tests). */
   prune?: boolean;
@@ -119,21 +119,21 @@ function fmtBytes(bytes: number): string {
 }
 
 /**
- * Download a message's attachments into the pilot inbox.
+ * Download a message's attachments into the session inbox.
  *
  * Never throws: a failed or oversized attachment becomes a `skipped` entry so
  * the session is told about it rather than silently losing it.
  */
-export async function savePilotAttachments(
+export async function saveSdkAttachments(
   messageId: string,
-  attachments: PilotAttachmentInput[],
-  options: SavePilotAttachmentsOptions = {},
-): Promise<PilotAttachmentResult> {
-  const result: PilotAttachmentResult = { saved: [], skipped: [] };
+  attachments: SdkAttachmentInput[],
+  options: SaveSdkAttachmentsOptions = {},
+): Promise<SdkAttachmentResult> {
+  const result: SdkAttachmentResult = { saved: [], skipped: [] };
   if (attachments.length === 0) return result;
 
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
-  const inboxRoot = options.inboxDir ?? PILOT_INBOX_DIR;
+  const inboxRoot = options.inboxDir ?? SDK_INBOX_DIR;
   const doFetch = options.fetchImpl ?? fetch;
   const dir = path.join(inboxRoot, sanitizeAttachmentName(messageId) || "message");
 
@@ -198,7 +198,7 @@ export async function savePilotAttachments(
 
   if (options.prune !== false) {
     try {
-      prunePilotInbox({ inboxDir: inboxRoot });
+      pruneSdkInbox({ inboxDir: inboxRoot });
     } catch {
       // Pruning is housekeeping; never let it affect the turn.
     }
@@ -212,7 +212,7 @@ export async function savePilotAttachments(
  * model can Read them without guessing the workspace layout. Returns "" when
  * there was nothing to report.
  */
-export function formatAttachmentBlock(result: PilotAttachmentResult): string {
+export function formatAttachmentBlock(result: SdkAttachmentResult): string {
   const lines: string[] = [];
 
   if (result.saved.length > 0) {
@@ -236,7 +236,7 @@ export function formatAttachmentBlock(result: PilotAttachmentResult): string {
   return lines.length > 0 ? lines.join("\n") : "";
 }
 
-export interface PrunePilotInboxOptions {
+export interface PruneSdkInboxOptions {
   maxAgeMs?: number;
   inboxDir?: string;
   /** Injected for tests. */
@@ -247,8 +247,8 @@ export interface PrunePilotInboxOptions {
  * Delete inbox directories older than the window. Returns how many were
  * removed. Best-effort per directory: one unreadable entry doesn't stop the rest.
  */
-export function prunePilotInbox(options: PrunePilotInboxOptions = {}): number {
-  const dir = options.inboxDir ?? PILOT_INBOX_DIR;
+export function pruneSdkInbox(options: PruneSdkInboxOptions = {}): number {
+  const dir = options.inboxDir ?? SDK_INBOX_DIR;
   const maxAgeMs = options.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
   const now = options.now?.() ?? Date.now();
   if (!existsSync(dir)) return 0;

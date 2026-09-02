@@ -101,11 +101,10 @@ export const discordTools = [
     name: "get_channel_history",
     description:
       "FALLBACK for Discord scrollback that is NOT already in your context. " +
-      "Thread/DM history is loaded into your conversation automatically — see " +
-      "'Messages already in context' in Current Context. Only call this when " +
-      "that count is 0/unknown, when you need messages older than the loaded " +
-      "window, or when reading a DIFFERENT channel than the current one. " +
-      "Calling it on the current conversation duplicates history you already have.",
+      "The current conversation is already in your context, so call this only " +
+      "for messages from before it started, messages older than what you have " +
+      "seen, or a DIFFERENT channel. Calling it on the current conversation " +
+      "duplicates history you already have.",
     input_schema: {
       type: "object" as const,
       properties: {
