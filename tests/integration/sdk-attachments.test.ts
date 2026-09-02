@@ -29,6 +29,7 @@ import {
   pruneSdkInbox,
 } from "../../src/sdk/attachments.js";
 import { SDK_INBOX_DIR } from "../../src/sdk/attachments.js";
+import { SDK_SESSIONS_DIR } from "../../src/sdk/session-dirs.js";
 import { SDK_WORKSPACE_DIR } from "../../src/sdk/session.js";
 
 let dir: string;
@@ -61,6 +62,15 @@ describe("SDK_INBOX_DIR", () => {
     // attachments.ts derives this from DATA_DIR to avoid an import cycle with
     // session.ts, so the two definitions have to be kept in agreement here.
     expect(SDK_INBOX_DIR).toBe(path.join(SDK_WORKSPACE_DIR, "inbox"));
+  });
+});
+
+describe("SDK_SESSIONS_DIR", () => {
+  it("sits inside the session workspace", () => {
+    // session-dirs.ts derives this from DATA_DIR for the same reason
+    // attachments.ts does — importing session.ts would drag the db graph in —
+    // so the two definitions are kept in agreement here.
+    expect(SDK_SESSIONS_DIR).toBe(path.join(SDK_WORKSPACE_DIR, "sessions"));
   });
 });
 

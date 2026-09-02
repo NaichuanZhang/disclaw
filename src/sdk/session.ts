@@ -44,6 +44,11 @@ import { broadcastLog } from "../gateway/server.js";
 import { sendChunked } from "../shared/discord-utils.js";
 import { fmtDuration, fmtTokens } from "../shared/format.js";
 import { buildSdkEnv, pickSdkEnv } from "./env.js";
+import {
+  SDK_SESSIONS_DIR,
+  ensureSdkSessionDir,
+  sdkSessionDir,
+} from "./session-dirs.js";
 import { createBridgeMcpServer } from "./bridge.js";
 import { SdkRelayQueue } from "./relay-queue.js";
 import { getSkillService } from "../skills/service.js";
@@ -67,6 +72,10 @@ export const SDK_DIR = path.join(DATA_DIR, "sdk");
 
 /** Sandboxed working directory handed to SDK sessions. */
 export const SDK_WORKSPACE_DIR = path.join(SDK_DIR, "workspace");
+
+// Per-session folders live in their own module (pure path helpers, no db
+// import); re-exported here so existing callers keep one import site.
+export { SDK_SESSIONS_DIR, ensureSdkSessionDir, sdkSessionDir };
 
 /** Idle timeout — a session with no traffic for this long is torn down. */
 const SDK_IDLE_MS = Number(pickSdkEnv(process.env, "IDLE_MS") || 30 * 60 * 1000);
@@ -329,6 +338,23 @@ export class SdkSession {
    * current speaker instead of freezing on whoever opened the session.
    */
   private currentUserId = (): string | undefined => this.lastUserId;
+
+  /** Absolute path to the folder this session owns. */
+  private sessionDir(): string {
+    return sdkSessionDir(this.channelId, this.parentId);
+  }
+
+  /**
+   * The same folder as a workspace-relative path (`sessions/...`), which is what
+   * the prompt shows: cwd is the workspace root, so a relative path is what the
+   * model actually has to type.
+   */
+  private sessionDirRelative(): string {
+    return path
+      .relative(SDK_WORKSPACE_DIR, this.sessionDir())
+      .split(path.sep)
+      .join("/");
+  }
 
   /** Wall-clock ms since the last message in either direction. */
   get idleMs(): number {
@@ -678,8 +704,11 @@ export class SdkSession {
       allowDangerouslySkipPermissions: true,
       abortController: this.abortController,
       includePartialMessages: false,
-      // Isolation: don't inherit the operator's own ~/.claude settings.
-      settingSources: [],
+      // 'project' loads the workspace CLAUDE.md and .claude/settings.json — the
+      // workspace conventions are written there, and without this the SDK never
+      // reads them. 'user' is still omitted, so the operator's own ~/.claude
+      // settings stay un-inherited.
+      settingSources: ["project"],
       mcpServers: {
         discordclaw: createBridgeMcpServer({
           channelId: this.channelId,
@@ -712,6 +741,15 @@ export class SdkSession {
           "mcp__discordclaw__ tools for Discord actions (send_message, send_file,",
           "ask_user) and memory.",
           "",
+          `This session owns the folder ${this.sessionDirRelative()}, and every artifact`,
+          "it produces belongs in there — notes, reports, generated files, checkouts,",
+          "scratch files. The working directory is the workspace root, not that folder,",
+          "so each write needs the path spelled out:",
+          `  ${this.sessionDirRelative()}/findings.md   # good`,
+          "  findings.md                                # wrong, lands in the root",
+          `Its ${this.sessionDirRelative()}/CLAUDE.md is the durable record of this`,
+          "conversation: keep Status current and log decisions as you go.",
+          "",
           "New user messages can arrive while you are still working. Treat them as",
           "additional instructions from the same person and adapt mid-task.",
         ].join("\n") +
@@ -741,6 +779,7 @@ export class SdkSession {
    */
   private async run(): Promise<void> {
     ensureSdkDirs();
+    ensureSdkSessionDir(this.channelId, this.parentId, this.logChannelName);
 
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -1095,6 +1134,7 @@ export function ensureSdkDirs(): void {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
 }
+
 
 /** Get (or create) the SDK session for a channel and hand it a message. */
 export function submitToSdkSession(
