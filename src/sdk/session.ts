@@ -36,7 +36,7 @@ import type {
   SDKMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { DATA_DIR } from "../shared/paths.js";
+import { DATA_DIR, PROJECT_ROOT } from "../shared/paths.js";
 import { getChannelConfig, setChannelConfig, addMessage } from "../db/index.js";
 import type { ChannelConfig } from "../db/index.js";
 import { resolveModel } from "../shared/models.js";
@@ -46,7 +46,10 @@ import { fmtDuration, fmtTokens } from "../shared/format.js";
 import { buildSdkEnv, pickSdkEnv } from "./env.js";
 import {
   SDK_SESSIONS_DIR,
+  claudeProjectDir,
   ensureSdkSessionDir,
+  isInsideDir,
+  migrateTranscript,
   sdkSessionDir,
 } from "./session-dirs.js";
 import { createBridgeMcpServer } from "./bridge.js";
@@ -345,15 +348,27 @@ export class SdkSession {
   }
 
   /**
-   * The same folder as a workspace-relative path (`sessions/...`), which is what
-   * the prompt shows: cwd is the workspace root, so a relative path is what the
-   * model actually has to type.
+   * Make the stored transcript reachable from this session's cwd.
+   *
+   * The CLI keys transcripts by cwd, so an id saved while every session shared
+   * the workspace root points at a directory the CLI no longer consults. Copy
+   * it across before resuming; if it has already been pruned, say nothing and
+   * let run()'s bad-resume path handle the failure as it always has.
    */
-  private sessionDirRelative(): string {
-    return path
-      .relative(SDK_WORKSPACE_DIR, this.sessionDir())
-      .split(path.sep)
-      .join("/");
+  private ensureTranscriptVisible(sessionId: string): void {
+    const result = migrateTranscript({
+      sessionId,
+      toCwd: this.sessionDir(),
+    });
+    if (result.status === "copied") {
+      console.log(
+        `[sdk] copied transcript ${sessionId} into ${result.to} (from ${result.from})`,
+      );
+    } else if (result.status === "failed") {
+      console.error(
+        `[sdk] could not relocate transcript ${sessionId}: ${result.detail}`,
+      );
+    }
   }
 
   /** Wall-clock ms since the last message in either direction. */
@@ -697,7 +712,7 @@ export class SdkSession {
   private buildOptions(): Options {
     const resume = loadSdkSessionId(this.channelId);
     return {
-      cwd: SDK_WORKSPACE_DIR,
+      cwd: this.sessionDir(),
       env: buildSdkEnv({ overrides: this.modelEnvOverrides() }),
       // Unguarded by operator choice: no permission prompts, no canUseTool.
       permissionMode: "bypassPermissions",
@@ -736,19 +751,21 @@ export class SdkSession {
           "is relayed to that channel, so answer conversationally and concisely, with",
           "Discord markdown. Keep replies short unless asked for depth.",
           "",
-          `Your default working directory is ${SDK_WORKSPACE_DIR}. Tool calls are not`,
-          "gated: prefer the workspace, and be careful with anything outside it. Use the",
-          "mcp__discordclaw__ tools for Discord actions (send_message, send_file,",
-          "ask_user) and memory.",
+          `Your working directory is this session's own folder:`,
+          `  ${this.sessionDir()}`,
+          "Everything you produce belongs in there — notes, reports, generated files,",
+          "checkouts, scratch files. Relative paths already land in it, so",
+          "`findings.md` is correct as written; you only need a full path to reach",
+          "outside. Uploads arrive in `inbox/<message-id>/` inside the same folder.",
+          "Its CLAUDE.md is the durable record of this conversation: keep Status",
+          "current and log decisions as you go.",
           "",
-          `This session owns the folder ${this.sessionDirRelative()}, and every artifact`,
-          "it produces belongs in there — notes, reports, generated files, checkouts,",
-          "scratch files. The working directory is the workspace root, not that folder,",
-          "so each write needs the path spelled out:",
-          `  ${this.sessionDirRelative()}/findings.md   # good`,
-          "  findings.md                                # wrong, lands in the root",
-          `Its ${this.sessionDirRelative()}/CLAUDE.md is the durable record of this`,
-          "conversation: keep Status current and log decisions as you go.",
+          `Above you sit the shared workspace root (${SDK_WORKSPACE_DIR}, with every`,
+          `other session's folder under ${SDK_SESSIONS_DIR}) and the bot's own source`,
+          `checkout (${PROJECT_ROOT}). Tool calls are not gated, so treat anything`,
+          "outside your own folder with care, and don't write into another session's.",
+          "Use the mcp__discordclaw__ tools for Discord actions (send_message,",
+          "send_file, ask_user) and memory.",
           "",
           "New user messages can arrive while you are still working. Treat them as",
           "additional instructions from the same person and adapt mid-task.",
@@ -786,6 +803,7 @@ export class SdkSession {
         const options = this.buildOptions();
         const resumed = Boolean(options.resume);
         this.sawInit = false;
+        if (options.resume) this.ensureTranscriptVisible(options.resume);
 
         // A retry inherits a queue that the previous attempt's endTurn() just
         // marked idle, so re-arm the turn state before handing it over.
@@ -794,7 +812,7 @@ export class SdkSession {
         }
 
         console.log(
-          `[sdk] starting SDK session for channel ${this.channelId} (cwd=${SDK_WORKSPACE_DIR}${options.resume ? `, resume=${options.resume}` : ""})`,
+          `[sdk] starting SDK session for channel ${this.channelId} (cwd=${options.cwd}${options.resume ? `, resume=${options.resume}` : ""})`,
         );
 
         try {
@@ -849,6 +867,25 @@ export class SdkSession {
   }
 
   /**
+   * Cross-check where the CLI actually put this session's transcript.
+   *
+   * `claudeProjectKey()` encodes a rule confirmed by observation, not by any
+   * documented contract, so a CLI change could silently break the transcript
+   * relocation above — and the symptom would be a session quietly losing its
+   * history, which is exactly the failure that is hardest to notice. The
+   * handshake tells us the real path, so compare and complain loudly.
+   */
+  private checkTranscriptLocation(message: { transcript_path?: unknown }): void {
+    const actual = message.transcript_path;
+    if (typeof actual !== "string" || actual.length === 0) return;
+    const expected = claudeProjectDir(this.sessionDir());
+    if (path.resolve(path.dirname(actual)) === path.resolve(expected)) return;
+    console.error(
+      `[sdk] transcript path mismatch for ${this.channelId}: CLI wrote ${actual}, expected it under ${expected} — session-dirs.ts#claudeProjectKey may be stale`,
+    );
+  }
+
+  /**
    * Put messages the CLI never answered back at the front of the queue, so a
    * fresh session after a failed resume still does the work that was asked for.
    * The stored session_id is dropped — the new session assigns its own.
@@ -882,6 +919,7 @@ export class SdkSession {
           saveSdkSessionId(this.channelId, sessionId);
           console.log(`[sdk] session id ${sessionId} for ${this.channelId}`);
         }
+        this.checkTranscriptLocation(message as { transcript_path?: unknown });
       }
       return;
     }
@@ -1306,8 +1344,12 @@ function startIdleReaper(): void {
 //
 // If we were SIGKILLed, SDK child processes can outlive us. We identify them
 // precisely — and safely — by looking for processes whose cwd is the SDK
-// workspace directory. Nothing else on the machine uses that directory, so
-// there is no risk of killing an unrelated `claude` session.
+// workspace directory *or anything beneath it*: sessions each run in their own
+// folder under `sessions/`, so an exact match would miss every one of them and
+// let orphans survive a restart. The separator in the prefix is what keeps it
+// safe — a sibling directory like `<workspace>-old` must not match. Nothing
+// else on the machine works under that root, so no unrelated `claude` session
+// is at risk.
 // ---------------------------------------------------------------------------
 
 /** Kill leftover SDK child processes from a previous run. */
@@ -1333,7 +1375,7 @@ export function sweepOrphanSdkProcesses(): number {
     } catch {
       continue; // not ours / no permission
     }
-    if (path.resolve(cwd) !== path.resolve(SDK_WORKSPACE_DIR)) continue;
+    if (!isInsideDir(SDK_WORKSPACE_DIR, cwd)) continue;
 
     let cmdline = "";
     try {

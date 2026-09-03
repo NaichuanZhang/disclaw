@@ -17,7 +17,12 @@ import path from "node:path";
 import { DATA_DIR } from "../shared/paths.js";
 
 /**
- * Where downloaded attachments land, inside the session workspace.
+ * Fallback inbox at the workspace root.
+ *
+ * Live traffic no longer uses it: bot/messages.ts passes a per-session
+ * `inboxDir` (`sdkSessionInboxDir()`), so an upload lands in the folder of the
+ * conversation it belongs to. This stays as the default for callers that have no
+ * session in hand, and for the leftovers of earlier runs.
  *
  * Derived from DATA_DIR rather than imported from session.ts on purpose: this
  * module is loaded from bot/messages.ts alongside session.ts, and importing the

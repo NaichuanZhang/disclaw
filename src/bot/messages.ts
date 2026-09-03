@@ -22,6 +22,7 @@ import { isRestarting } from "../restart.js";
 import { transcribeAudio, getLastTranscriptionFailureSummary } from "../audio/transcribe.js";
 import { recordSignal } from "../reflection/signals.js";
 import {
+  sdkSessionInboxDir,
   submitToSdkSession,
   type SdkChannelTarget,
 } from "../sdk/index.js";
@@ -595,8 +596,10 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
   const target = replyTarget as unknown as SdkChannelTarget;
 
   // A session takes plain text, not content blocks, but it has its own Read
-  // tool — so attachments are downloaded into its workspace and handed over as
-  // absolute paths. Skipped ones are named, never silently dropped.
+  // tool — so attachments are downloaded into the session's own folder and
+  // handed over as absolute paths. Skipped ones are named, never silently
+  // dropped. The inbox is per-session, which is also why it has to be passed
+  // here: attachments.ts is resolved before the session exists.
   let text = cleanContent;
   if (message.attachments.size > 0) {
     if ("sendTyping" in message.channel) {
@@ -610,6 +613,7 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
         size: a.size,
         contentType: a.contentType,
       })),
+      { inboxDir: sdkSessionInboxDir(target.id, target.parentId) },
     );
     const block = formatAttachmentBlock(result);
     if (block) text = text ? `${text}\n${block}` : block.trim();
