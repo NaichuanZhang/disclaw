@@ -47,7 +47,16 @@ export {
 } from "./cron-route.js";
 
 export {
+  CLAUDE_PROJECTS_DIR,
   SDK_SESSIONS_DIR,
+  claudeProjectDir,
+  claudeProjectKey,
   ensureSdkSessionDir,
+  isInsideDir,
+  migrateTranscript,
   sdkSessionDir,
+  sdkSessionInboxDir,
+  type MigrateTranscriptOptions,
+  type TranscriptMigrationResult,
+  type TranscriptMigrationStatus,
 } from "./session-dirs.js";
