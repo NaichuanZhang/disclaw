@@ -37,6 +37,7 @@ import {
   describeModelResolution,
   getCachedSelectableModelIds,
   invalidateModelCache,
+  getSelectedModel,
   listModels,
   rankModelIds,
   resolveModel,
@@ -44,6 +45,13 @@ import {
   setSelectedModel,
   warmModelCache,
 } from "../shared/models.js";
+import {
+  getRouterBias,
+  getRouterModels,
+  isModelRouterEnabled,
+  setModelRouterEnabled,
+  shortModelName,
+} from "../shared/model-router.js";
 import type { SkillService } from "../skills/service.js";
 import type { CronService } from "../cron/service.js";
 import type { CronJob, CronSchedule, CronPayload, CronDelivery } from "../cron/types.js";
@@ -148,6 +156,12 @@ export const slashCommands: ApplicationCommandData[] = [
       {
         name: "refresh",
         description: "Re-fetch the model list from the proxy",
+        type: ApplicationCommandOptionType.Boolean,
+        required: false,
+      },
+      {
+        name: "router",
+        description: "Turn automatic per-thread routing (coding vs common tier) on or off",
         type: ApplicationCommandOptionType.Boolean,
         required: false,
       },
@@ -628,6 +642,21 @@ function describeSource(source: string): string {
   }
 }
 
+function routerTierSummary(): string {
+  const m = getRouterModels();
+  return `\`${shortModelName(m.coding)}\` for coding, \`${shortModelName(m.common)}\` for everything else`;
+}
+
+/** The router field of the /model embed — what the next new thread will do. */
+function routerStatusLine(pinned: boolean): string {
+  const m = getRouterModels();
+  const tiers =
+    `coding → \`${m.coding}\`\ncommon → \`${m.common}\`\njudge → \`${m.judge}\` · bias: ${getRouterBias()}`;
+  if (!isModelRouterEnabled()) return `Off — every new thread uses the Active model above.\n${tiers}`;
+  if (pinned) return `Standing down: the saved selection is pinned. \`/model reset:true\` re-enables routing.\n${tiers}`;
+  return `New threads are routed per message; "use a smarter model" mid-thread escalates.\n${tiers}`;
+}
+
 async function handleModel(
   interaction: import("discord.js").ChatInputCommandInteraction,
 ): Promise<void> {
@@ -637,14 +666,32 @@ async function handleModel(
   const name = interaction.options.getString("name");
   const reset = interaction.options.getBoolean("reset") ?? false;
   const refresh = interaction.options.getBoolean("refresh") ?? false;
+  const router = interaction.options.getBoolean("router");
+
+  if (router !== null) {
+    setModelRouterEnabled(router);
+    const pinned = getSelectedModel();
+    await interaction.editReply({
+      content: router
+        ? `✅ Model router **on** — new threads start on ${routerTierSummary()}.` +
+          (pinned
+            ? `\n-# \`${pinned}\` is still pinned via /model, so the router stands down until \`/model reset:true\`.`
+            : "")
+        : `✅ Model router **off** — new threads use \`${describeModelResolution().model}\` ` +
+          `(${describeSource(describeModelResolution().source).toLowerCase()}).`,
+    });
+    return;
+  }
 
   if (reset) {
     clearSelectedModel();
     const after = describeModelResolution();
     await interaction.editReply({
       content:
-        `✅ Cleared the saved selection. Now using \`${after.model}\` ` +
-        `(${describeSource(after.source).toLowerCase()}).`,
+        `✅ Cleared the saved selection. ` +
+        (isModelRouterEnabled()
+          ? `New threads are routed automatically (${routerTierSummary()}); cron jobs without their own model use \`${after.model}\`.`
+          : `Now using \`${after.model}\` (${describeSource(after.source).toLowerCase()}).`),
     });
     return;
   }
@@ -679,6 +726,9 @@ async function handleModel(
         `threads, and DMs${result.warning ? ` — ${result.warning}` : ""}.\n` +
         `-# Takes effect on the next message — replies already in flight keep the previous model. ` +
         `A running session keeps its model until it restarts (\`/clear\` in the channel forces that). ` +
+        (isModelRouterEnabled()
+          ? `The model router stands down while a selection is pinned — \`/model reset:true\` hands control back to it. `
+          : "") +
         `Voice and the cycling coach are configured separately.`,
     });
     return;
@@ -714,10 +764,15 @@ async function handleModel(
         inline: false,
       },
       { name: "Available", value: availability, inline: false },
+      {
+        name: `Router (${isModelRouterEnabled() ? "on" : "off"})`,
+        value: routerStatusLine(Boolean(resolution.saved)),
+        inline: false,
+      },
     )
     .setColor(resolution.healed || envUnknown ? 0xfee75c : 0x5865f2)
     .setFooter({
-      text: "/model name:<model> to change · applies to every channel, thread, and DM",
+      text: "/model name:<model> to pin · /model router:false for one model everywhere · cron jobs keep their own override",
     });
 
   if (active?.maxInputTokens) {

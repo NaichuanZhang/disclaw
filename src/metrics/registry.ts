@@ -88,6 +88,13 @@ export const P = {
   modelsCacheWarm: "models.cache.warm",
   modelsCacheInvalidate: "models.cache.invalidate",
 
+  // Model router
+  routerHeuristic: "router.heuristic",
+  routerJudge: "router.judge",
+  routerJudgeFallback: "router.judge_fallback",
+  routerEscalate: "router.escalate",
+  routerBypassedPin: "router.bypassed_pin",
+
   // Cron
   cronJobRun: "cron.job.run",
   cronJobForceRun: "cron.job.force_run",
@@ -174,6 +181,22 @@ export const FEATURE_PATHS: PathSpec[] = [
     path: P.modelsCacheInvalidate,
     kind: "branch",
     description: "Model cache invalidated (/model refresh)",
+  },
+
+  // --- Model router ---
+  { path: P.routerHeuristic, kind: "feature", description: "Session model chosen by router heuristics" },
+  { path: P.routerJudge, kind: "feature", description: "Session model chosen by the router's LLM judge" },
+  {
+    path: P.routerJudgeFallback,
+    kind: "branch",
+    description: "Router judge failed or timed out — bias fallback used",
+    rare: true,
+  },
+  { path: P.routerEscalate, kind: "feature", description: "User asked for a stronger model" },
+  {
+    path: P.routerBypassedPin,
+    kind: "branch",
+    description: "Router stood down because /model pins a selection",
   },
 
   // --- Cron ---

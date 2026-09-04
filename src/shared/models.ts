@@ -322,8 +322,10 @@ export function clearSelectedModel(): void {
 /**
  * Resolve the model to use and report which tier won.
  *
- * Precedence: explicit override (per-cron-job) > persisted selection > the
- * ANTHROPIC_MODEL env var > DEFAULT_MODEL.
+ * Precedence: explicit override (per-cron-job, or the model router's pick for
+ * a new interactive session — see shared/model-router.ts, which itself yields
+ * to a persisted selection) > persisted selection > the ANTHROPIC_MODEL env
+ * var > DEFAULT_MODEL.
  *
  * The persisted selection deliberately outranks the env var: a runtime choice
  * that a deploy-time value could override would not be a runtime choice, and a
