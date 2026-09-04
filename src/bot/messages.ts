@@ -22,10 +22,13 @@ import { isRestarting } from "../restart.js";
 import { transcribeAudio, getLastTranscriptionFailureSummary } from "../audio/transcribe.js";
 import { recordSignal } from "../reflection/signals.js";
 import {
+  hasLiveSdkSession,
   sdkSessionInboxDir,
+  stopSdkSession,
   submitToSdkSession,
   type SdkChannelTarget,
 } from "../sdk/index.js";
+import { describeDecision, planSessionModel } from "../shared/model-router.js";
 import type Anthropic from "@anthropic-ai/sdk";
 
 // ---------------------------------------------------------------------------
@@ -659,6 +662,40 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
     );
   }
 
+  // 7c. Model routing. A child keeps its model for life, so this only bites when
+  // the session is about to be created — or when the user asks for a stronger
+  // model mid-thread, in which case the child is stopped and the next submit
+  // resumes the same transcript on the new model. Precedence (env pin, /model
+  // pin, router toggle) is applied inside planSessionModel, and every branch
+  // is logged there. Never lets a routing failure block the message.
+  let modelOverride: string | undefined;
+  const note = (line: string) => {
+    if ("send" in replyTarget) {
+      (replyTarget as TextChannel | ThreadChannel).send(line).catch(() => {});
+    }
+  };
+  try {
+    const plan = await planSessionModel({
+      text,
+      channelId: target.id,
+      hasLiveSession: hasLiveSdkSession(target.id),
+      attachmentNames: [...message.attachments.values()].map((a) => a.name),
+    });
+    if (plan.action === "route") {
+      modelOverride = plan.decision.model;
+      note(`-# 🧭 ${describeDecision(plan.decision)}`);
+    } else if (plan.action === "escalate_restart") {
+      modelOverride = plan.decision.model;
+      await stopSdkSession(target.id);
+      note(`-# 🧭 switching to ${describeDecision(plan.decision)} — context kept`);
+    }
+  } catch (err) {
+    console.error(
+      `[bot] Model routing failed for ${target.id}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   submitToSdkSession(target, {
     text,
     userId: message.author.id,
@@ -666,6 +703,7 @@ export async function handleMessage(message: DiscordMessage): Promise<void> {
     logSessionId,
     channelName,
     react: (emoji) => message.react(emoji),
+    ...(modelOverride ? { modelOverride } : {}),
   });
   console.log(
     `[bot] Routed message to SDK session ${target.id} (channel ${message.channelId})`,
