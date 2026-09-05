@@ -20,6 +20,7 @@ import {
   planSessionModel,
   routeModel,
   setModelRouterEnabled,
+  modelFamilyEmoji,
   shortModelName,
 } from "../../src/shared/model-router.js";
 
@@ -184,6 +185,23 @@ describe("configuration", () => {
 // ---------------------------------------------------------------------------
 // Precedence
 // ---------------------------------------------------------------------------
+
+describe("modelFamilyEmoji", () => {
+  it("maps each family to one glyph, keyed on the handshake-reported id", () => {
+    expect(modelFamilyEmoji("bedrock-claude-fable-5-1")).toBe("🟣");
+    expect(modelFamilyEmoji("claude-mythos-5")).toBe("🟣");
+    expect(modelFamilyEmoji("bedrock-claude-opus-5-1m")).toBe("🔵");
+    expect(modelFamilyEmoji("bedrock-claude-sonnet-5")).toBe("🟢");
+    expect(modelFamilyEmoji("claude-haiku-4-5-20251001")).toBe("⚪");
+    expect(modelFamilyEmoji("gpt-5")).toBe("⚫");
+  });
+
+  it("is honest about an unknown model rather than guessing", () => {
+    expect(modelFamilyEmoji(null)).toBe("❔");
+    expect(modelFamilyEmoji(undefined)).toBe("❔");
+    expect(modelFamilyEmoji("")).toBe("❔");
+  });
+});
 
 describe("planSessionModel", () => {
   const base = { channelId: "t1", hasLiveSession: false, judge: async () => "common" };

@@ -19,6 +19,7 @@ import {
   activeSdkChannelIds,
   interruptSdkSession,
   activeSdkSessionCount,
+  activeSdkSessions,
   interruptSdkSessionsUnder,
   resetSdkSessionScope,
   stopAllSdkSessions,
@@ -49,6 +50,7 @@ import {
   getRouterBias,
   getRouterModels,
   isModelRouterEnabled,
+  modelFamilyEmoji,
   setModelRouterEnabled,
   shortModelName,
 } from "../shared/model-router.js";
@@ -944,7 +946,7 @@ async function handlePing(
         ? [
             {
               name: "Sessions",
-              value: `${activeSdkSessionCount()} live SDK session(s)`,
+              value: describeLiveSessions(),
               inline: false,
             },
           ]
@@ -1256,6 +1258,22 @@ function sessionPromptNote(): string {
  * Skills are global, so this is keyed on live sessions rather than the invoking
  * channel — and stays empty when none are running.
  */
+/**
+ * Live sessions with the model each child *reported* in its handshake — read
+ * from the session instance, never from `/model` or the env, so it shows what is
+ * actually running. `pending` means the child has not handshaked yet.
+ */
+function describeLiveSessions(): string {
+  const live = activeSdkSessions();
+  if (live.length === 0) return "none";
+  const lines = live.slice(0, 15).map((s) => {
+    const model = s.model ? `\`${shortModelName(s.model)}\`` : "pending";
+    return `${modelFamilyEmoji(s.model)} <#${s.channelId}> — ${model}`;
+  });
+  if (live.length > 15) lines.push(`… and ${live.length - 15} more`);
+  return lines.join("\n");
+}
+
 function sessionSkillsNote(): string {
   const live = activeSdkSessionCount();
   return live > 0

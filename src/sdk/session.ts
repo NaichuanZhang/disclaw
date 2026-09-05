@@ -40,6 +40,7 @@ import { DATA_DIR, PROJECT_ROOT } from "../shared/paths.js";
 import { getChannelConfig, setChannelConfig, addMessage } from "../db/index.js";
 import type { ChannelConfig } from "../db/index.js";
 import { resolveModel } from "../shared/models.js";
+import { modelFamilyEmoji, shortModelName } from "../shared/model-router.js";
 import { broadcastLog } from "../gateway/server.js";
 import { sendChunked } from "../shared/discord-utils.js";
 import { fmtDuration, fmtTokens } from "../shared/format.js";
@@ -304,6 +305,18 @@ export class SdkSession {
 
   /** True once the CLI has handshaked — tells a resume failure from a real one. */
   private sawInit = false;
+  /**
+   * Model the child reports in its `system/init` handshake — what is actually
+   * running, not what we asked for. Null until the handshake lands and reset
+   * whenever a new child spawns, so it can never carry a stale value across a
+   * resume or an escalate-restart. Every model indicator reads this field only.
+   */
+  private activeModel: string | null = null;
+  /**
+   * React callbacks for messages submitted before the handshake reported the
+   * model. Drained (and reacted) the moment `activeModel` is known.
+   */
+  private pendingModelReacts: Array<(emoji: string) => Promise<unknown>> = [];
   /** Messages handed to the CLI but not yet answered, for resume replay. */
   private pendingReplay: SDKUserMessage[] = [];
   /** Conversation row + channel name for logging, from the latest message. */
@@ -415,6 +428,7 @@ export class SdkSession {
     } as SDKUserMessage);
 
     this.beginTurn();
+    this.markModel(message.react);
 
     const wake = this.wake;
     this.wake = null;
@@ -431,6 +445,44 @@ export class SdkSession {
         console.error("[sdk] session loop crashed:", err);
       });
     }
+  }
+
+  /**
+   * Mark the user's message with the glyph of the model handling it. The glyph
+   * comes from `activeModel` — the handshake-reported id — never from config.
+   * Before the first handshake the model is genuinely unknown, so the react is
+   * parked and applied by `reportModel()` once the child says what it is.
+   */
+  private markModel(react: SdkIncomingMessage["react"]): void {
+    if (!react) return;
+    if (this.activeModel === null) {
+      this.pendingModelReacts.push(react);
+      return;
+    }
+    void react(modelFamilyEmoji(this.activeModel)).catch(() => {
+      // Reactions are cosmetic — a missing permission must not break the turn.
+    });
+  }
+
+  /**
+   * Called on every `system/init`: record the model the child reports, tell the
+   * channel, and flush any reactions parked before the handshake.
+   */
+  private reportModel(model: unknown): void {
+    this.activeModel = typeof model === "string" && model ? model : null;
+    const label = this.activeModel ? `\`${shortModelName(this.activeModel)}\`` : "unknown";
+    this.say(`-# ${modelFamilyEmoji(this.activeModel)} running on ${label}`);
+    console.log(`[sdk] ${this.channelId} running on ${this.activeModel ?? "unknown"}`);
+    const parked = this.pendingModelReacts;
+    this.pendingModelReacts = [];
+    for (const react of parked) {
+      void react(modelFamilyEmoji(this.activeModel)).catch(() => {});
+    }
+  }
+
+  /** Model the running child reported, or null before/without a handshake. */
+  get model(): string | null {
+    return this.activeModel;
   }
 
   /**
@@ -555,6 +607,7 @@ export class SdkSession {
     this.closed = true;
     this.stopTyping();
     this.clearTurnWatchdog();
+    this.pendingModelReacts = [];
 
     if (notice) this.say(notice);
 
@@ -803,6 +856,7 @@ export class SdkSession {
         const options = this.buildOptions();
         const resumed = Boolean(options.resume);
         this.sawInit = false;
+        this.activeModel = null;
         if (options.resume) this.ensureTranscriptVisible(options.resume);
 
         // A retry inherits a queue that the previous attempt's endTurn() just
@@ -909,6 +963,7 @@ export class SdkSession {
       const sessionId = (message as { session_id?: string }).session_id;
       if (subtype === "init") {
         this.sawInit = true;
+        this.reportModel((message as { model?: unknown }).model);
         // Feature-detect from the init handshake rather than sniffing versions.
         const caps = (message as { capabilities?: unknown }).capabilities;
         this.capabilities = Array.isArray(caps)
@@ -1211,6 +1266,23 @@ export function activeSdkSessionCount(): number {
 /** Channel ids with a live SDK session. */
 export function activeSdkChannelIds(): string[] {
   return [...sessions.keys()];
+}
+
+/** One entry per live session, with the model its child reported (null before handshake). */
+export interface SdkLiveSession {
+  channelId: string;
+  parentId: string | null;
+  model: string | null;
+}
+
+/** Live sessions with the model each is actually running. */
+export function activeSdkSessions(): SdkLiveSession[] {
+  const out: SdkLiveSession[] = [];
+  for (const [channelId, session] of sessions) {
+    if (session.isClosed) continue;
+    out.push({ channelId, parentId: session.parentId, model: session.model });
+  }
+  return out;
 }
 
 /**
