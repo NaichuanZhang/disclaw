@@ -14,6 +14,7 @@ import {
   submitToSdkSession,
 } from "./sdk/index.js";
 import { expireStalePendingQuestions } from "./agent/questions.js";
+import { setCronService } from "./agent/tools.js";
 import { initSoul, stopSoulWatcher } from "./soul/soul.js";
 import { initMemory, stopMemoryWatcher } from "./memory/memory.js";
 import { isMem9Enabled } from "./memory/mem9.js";
@@ -244,6 +245,7 @@ async function main(): Promise<void> {
   );
   cronService.start();
   setCommandsCronService(cronService);
+  setCronService(cronService);
 
   // 5. Start Discord bot
   console.log("[discordclaw] Connecting to Discord...");

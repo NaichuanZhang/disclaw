@@ -134,9 +134,11 @@ export function createBridgeMcpServer(options: SdkBridgeOptions) {
       "to recall or store durable facts. read_skill/list_skill_files load the " +
       "host bot's skill library on demand. get_channel_history / " +
       "get_conversation_history / get_conversation_stats read Discord scrollback and " +
-      "cross-session history. The evolve_* tools modify this bot's own " +
-      "source code through an isolated worktree and an auto-merged PR — they " +
-      "require an explicitly approved build plan first.",
+      "cross-session history. schedule_followup schedules a real future agent turn — " +
+      "use it instead of telling the user 'I'll let you know when it's done', since a " +
+      "background job cannot post to Discord once your turn ends. The evolve_* tools " +
+      "modify this bot's own source code through an isolated worktree and an " +
+      "auto-merged PR — they require an explicitly approved build plan first.",
     alwaysLoad: true,
     tools: [
       tool(
@@ -236,6 +238,31 @@ export function createBridgeMcpServer(options: SdkBridgeOptions) {
             wait_seconds: args.wait_seconds,
             channel_id: args.channel_id ?? channelId,
             user_id: args.user_id ?? options.getUserId?.(),
+          }),
+      ),
+
+      tool(
+        "schedule_followup",
+        "Schedule a one-shot agent turn to run later in a Discord channel — the only reliable way to report back after a background job finishes. A background Bash/Monitor process cannot post to Discord once your turn ends; this schedules a real future turn instead of a hope. Defaults to the current channel.",
+        {
+          delay_seconds: z
+            .number()
+            .describe("Seconds from now to run (clamped to 30-86400, i.e. 30s-24h)"),
+          instructions: z
+            .string()
+            .describe(
+              "What the scheduled turn should do — check specific state and report it, not just 'follow up'.",
+            ),
+          channel_id: z
+            .string()
+            .optional()
+            .describe("Channel or thread ID to run in (defaults to the current channel)"),
+        },
+        async (args) =>
+          runDiscordTool("schedule_followup", {
+            delay_seconds: args.delay_seconds,
+            instructions: args.instructions,
+            channel_id: args.channel_id ?? channelId,
           }),
       ),
 
