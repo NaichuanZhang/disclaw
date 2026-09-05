@@ -11,10 +11,13 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import { initDb, deleteConfig } from "../../src/db/index.js";
 import { clearSelectedModel, setSelectedModel } from "../../src/shared/models.js";
 import {
+  AUTO_MODEL_VALUE,
   ROUTER_CONFIG_KEY,
   buildJudgePrompt,
   classifyHeuristic,
+  enableAutoMode,
   getRouterModels,
+  isAutoMode,
   isModelRouterEnabled,
   parseJudgeReply,
   planSessionModel,
@@ -174,6 +177,42 @@ describe("configuration", () => {
     expect(isModelRouterEnabled()).toBe(false);
     setModelRouterEnabled(true);
     expect(isModelRouterEnabled()).toBe(true);
+  });
+
+  it("reports auto mode only when the router is genuinely in charge", () => {
+    expect(AUTO_MODEL_VALUE).toBe("auto");
+    expect(isAutoMode()).toBe(true);
+
+    setSelectedModel("bedrock-claude-opus-5-1m");
+    expect(isAutoMode()).toBe(false);
+    clearSelectedModel();
+
+    setModelRouterEnabled(false);
+    expect(isAutoMode()).toBe(false);
+    setModelRouterEnabled(true);
+
+    process.env.SDK_ANTHROPIC_MODEL = "bedrock-claude-opus-5-1m";
+    expect(isAutoMode()).toBe(false);
+    delete process.env.SDK_ANTHROPIC_MODEL;
+    expect(isAutoMode()).toBe(true);
+  });
+
+  it("enableAutoMode clears the pin and switches routing on together", async () => {
+    setSelectedModel("bedrock-claude-opus-5-1m");
+    setModelRouterEnabled(false);
+    expect(isAutoMode()).toBe(false);
+
+    enableAutoMode();
+    expect(isAutoMode()).toBe(true);
+    expect(isModelRouterEnabled()).toBe(true);
+
+    const plan = await planSessionModel({
+      channelId: "t-auto",
+      hasLiveSession: false,
+      judge: async () => "common",
+      text: "fix the bug in `x`",
+    });
+    expect(plan.action).toBe("route");
   });
 
   it("shortens model ids for the channel line", () => {
