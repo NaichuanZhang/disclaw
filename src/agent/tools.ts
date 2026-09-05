@@ -37,6 +37,11 @@ import {
   updateArtifactDiscordInfo,
   formatFileSize,
 } from "../artifacts/index.js";
+import type { CronService } from "../cron/service.js";
+
+/** Followup scheduling delay bounds, in seconds (30s .. 24h). */
+const MIN_FOLLOWUP_DELAY_SECONDS = 30;
+const MAX_FOLLOWUP_DELAY_SECONDS = 86400;
 
 export const discordTools = [
   {
@@ -188,6 +193,31 @@ export const discordTools = [
       required: ["question"],
     },
   },
+  {
+    name: "schedule_followup",
+    description:
+      "Schedule a one-shot agent turn to run later in a Discord channel. This is the ONLY reliable way to report back after a background job (transcription, download, build, scrape, long-running Bash/Monitor task) finishes — a background process cannot post to Discord once your current turn ends, so promising to 'let you know when it's done' without calling this tool will silently fail. The scheduled run is a full agent turn with normal tool access, not a canned message: give it enough instructions to check the actual result and report it, not just 'follow up'.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        delay_seconds: {
+          type: "number",
+          description: `Seconds from now to run (clamped to ${MIN_FOLLOWUP_DELAY_SECONDS}-${MAX_FOLLOWUP_DELAY_SECONDS}, i.e. 30s to 24h).`,
+        },
+        instructions: {
+          type: "string",
+          description:
+            "What the scheduled turn should do, e.g. 'Check /tmp/job.log for the whisper transcription started earlier, read the result, and post a summary here.'",
+        },
+        channel_id: {
+          type: "string",
+          description:
+            "Channel or thread ID to run in. Defaults to the current conversation.",
+        },
+      },
+      required: ["delay_seconds", "instructions"],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -202,6 +232,16 @@ let discordClient: any = null;
 
 export function setDiscordClient(client: any): void {
   discordClient = client;
+}
+
+// ---------------------------------------------------------------------------
+// Cron service reference — lets schedule_followup create real one-shot jobs
+// ---------------------------------------------------------------------------
+
+let cronService: CronService | null = null;
+
+export function setCronService(service: CronService): void {
+  cronService = service;
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +771,51 @@ export async function handleDiscordTool(
           question_id: record.id,
           channel_id: channelId,
           note: `No answer within ${waitSeconds}s. Do NOT keep waiting — either proceed with a stated default assumption or tell the user you'll wait for their reply.`,
+        });
+      }
+
+      case "schedule_followup": {
+        if (!cronService) {
+          return JSON.stringify({ error: "Cron service not available" });
+        }
+        const channelId = input.channel_id as string;
+        if (!channelId) {
+          return JSON.stringify({
+            error: "channel_id is required (no current conversation context)",
+          });
+        }
+        const instructions = (input.instructions as string)?.trim();
+        if (!instructions) {
+          return JSON.stringify({ error: "instructions is required" });
+        }
+
+        const rawDelay = Number(input.delay_seconds);
+        const safeDelay = Number.isFinite(rawDelay) ? rawDelay : MIN_FOLLOWUP_DELAY_SECONDS;
+        const delaySeconds = Math.min(
+          Math.max(Math.round(safeDelay), MIN_FOLLOWUP_DELAY_SECONDS),
+          MAX_FOLLOWUP_DELAY_SECONDS,
+        );
+        const timestamp = Date.now() + delaySeconds * 1000;
+
+        const job = cronService.add({
+          name: `followup: ${instructions.slice(0, 60)}`,
+          enabled: true,
+          deleteAfterRun: true,
+          schedule: { type: "at", timestamp },
+          payload: { kind: "agentTurn", message: instructions },
+          delivery: { channelId },
+        });
+
+        console.log(
+          `[agent] schedule_followup -> job ${job.id}, channel ${channelId}, in ${delaySeconds}s`,
+        );
+
+        return JSON.stringify({
+          success: true,
+          job_id: job.id,
+          channel_id: channelId,
+          delay_seconds: delaySeconds,
+          runs_at: new Date(timestamp).toISOString(),
         });
       }
 
