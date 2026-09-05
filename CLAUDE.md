@@ -73,6 +73,8 @@ The catalog comes from `GET {ANTHROPIC_BASE_URL}/v1/models` (LiteLLM/OpenAI-shap
 
 Autocomplete for these options is **cache-only** (`getCachedSelectableModelIds()`) and never awaits the network — Discord allows one response within ~3s and has no defer equivalent, while the catalog fetch timeout alone is 5s. A cold cache serves the fallback list and fires a background warm.
 
+**Which model is actually running** is reported from the SDK child, not from any of the above. `session.ts` reads `model` off the `system/init` handshake into `SdkSession.activeModel` (reset to `null` every time a child spawns, so a resume or escalate-restart can never show a stale value) and every indicator reads that field only: a `-# 🟣 running on \`fable-5-1\`` line per child start, a model-family reaction on each user message (🟣 fable/mythos · 🔵 opus · 🟢 sonnet · ⚪ haiku · ⚫ other · ❔ before the handshake — `modelFamilyEmoji()` in `shared/model-router.ts`; a message submitted before the first handshake has its reaction parked in `pendingModelReacts` and applied when `init` lands), the `Sessions` field of `/ping`, and `GET /api/sessions/live` (`activeSdkSessions()`, registered above `/sessions/:id` so the literal path is not swallowed). None of these consult `resolveModel()`, the `config` table or the env — if the CLI ever omits `init.model` they say `unknown`/`pending` rather than echo what was configured.
+
 Voice (`VOICE_MODEL`) and the cycling coach (`COACH_MODEL`) are configured separately and are not affected by `/model`.
 
 ### Thread-Based Replies

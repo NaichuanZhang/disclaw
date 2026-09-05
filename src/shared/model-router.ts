@@ -369,6 +369,21 @@ export function shortModelName(id: string): string {
   return id.replace(/^bedrock-claude-/, "").replace(/^claude-/, "");
 }
 
+/**
+ * One glyph per model family, for the per-turn reaction on the user's message.
+ * Keyed on the id the SDK child reports in its `system/init` handshake, so the
+ * glyph reflects what is actually running rather than what was configured.
+ */
+export function modelFamilyEmoji(id: string | null | undefined): string {
+  const s = (id ?? "").toLowerCase();
+  if (!s) return "❔";
+  if (s.includes("fable") || s.includes("mythos")) return "🟣";
+  if (s.includes("opus")) return "🔵";
+  if (s.includes("sonnet")) return "🟢";
+  if (s.includes("haiku")) return "⚪";
+  return "⚫";
+}
+
 /** One-line rendering for Discord. */
 export function describeDecision(d: RouteDecision): string {
   const via = d.source === "judge" ? "judge" : d.source === "judge_fallback" ? "judge failed, default" : "heuristic";

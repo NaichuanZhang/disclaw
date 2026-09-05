@@ -6,6 +6,7 @@ import { DATA_DIR } from "../shared/paths.js";
 
 import { getDb, getSessionMessages, setChannelConfig, setConfig } from "../db/index.js";
 import { listSessions, clearSession } from "../agent/sessions.js";
+import { activeSdkSessions } from "../sdk/index.js";
 import { getSoul, setSoul } from "../soul/soul.js";
 import type { CronService } from "../cron/service.js";
 import type { CronJobCreate, CronJobPatch } from "../cron/types.js";
@@ -145,6 +146,17 @@ export function createApiRouter(opts: {
       res.json(result);
     } catch (err) {
       log("Error in GET /sessions:", err);
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Live SDK children and the model each one *reported* in its handshake.
+  // Must sit above `/sessions/:id` or that route swallows "live" as an id.
+  router.get("/sessions/live", (_req: Request, res: Response) => {
+    try {
+      res.json({ sessions: activeSdkSessions() });
+    } catch (err) {
+      log("Error in GET /sessions/live:", err);
       res.status(500).json({ error: String(err) });
     }
   });

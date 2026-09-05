@@ -19,6 +19,8 @@ export {
   SdkSession,
   activeSdkChannelIds,
   activeSdkSessionCount,
+  activeSdkSessions,
+  type SdkLiveSession,
   ensureSdkDirs,
   hasLiveSdkSession,
   initSdk,
