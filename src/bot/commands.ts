@@ -47,8 +47,11 @@ import {
   warmModelCache,
 } from "../shared/models.js";
 import {
+  AUTO_MODEL_VALUE,
+  enableAutoMode,
   getRouterBias,
   getRouterModels,
+  isAutoMode,
   isModelRouterEnabled,
   modelFamilyEmoji,
   setModelRouterEnabled,
@@ -144,7 +147,7 @@ export const slashCommands: ApplicationCommandData[] = [
     options: [
       {
         name: "name",
-        description: "Model to use (leave empty to show the current selection)",
+        description: "Model to pin, or `auto` to let the router pick per thread (empty = show current)",
         type: ApplicationCommandOptionType.String,
         required: false,
         autocomplete: true,
@@ -540,7 +543,11 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
       (interaction.commandName === "cron" && focused.name === "model");
 
     if (wantsModel) {
-      await respondWithModelChoices(interaction, focused.value);
+      // `auto` means "the router decides", which only /model has — a cron job
+      // with no model inherits the chain, it is never routed.
+      await respondWithModelChoices(interaction, focused.value, {
+        offerAuto: interaction.commandName === "model",
+      });
       return;
     }
 
@@ -563,19 +570,33 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
 async function respondWithModelChoices(
   interaction: AutocompleteInteraction,
   query: string,
+  opts: { offerAuto?: boolean } = {},
 ): Promise<void> {
   const cached = getCachedSelectableModelIds();
   if (!cached) warmModelCache();
 
-  const current = resolveModel();
-  const choices = rankModelIds(cached ?? FALLBACK_MODEL_IDS, query);
+  // The ● marks what is *pinned*, not what resolveModel() falls back to —
+  // when nothing is pinned the answer is "auto" (or the env/default chain),
+  // and marking the fallback model made auto mode look like a pin.
+  const pinned = getSelectedModel();
+  const q = query.trim().toLowerCase();
+  const auto = isAutoMode();
+  const choices: { name: string; value: string }[] = [];
 
-  await interaction.respond(
-    choices.map((id) => ({
-      name: id === current ? `● ${id}` : id,
-      value: id,
-    })),
-  );
+  if (opts.offerAuto && (q.length === 0 || AUTO_MODEL_VALUE.includes(q))) {
+    const m = getRouterModels();
+    choices.push({
+      name: `${auto ? "● " : ""}auto — router picks ${shortModelName(m.coding)} / ${shortModelName(m.common)} per thread`,
+      value: AUTO_MODEL_VALUE,
+    });
+  }
+
+  for (const id of rankModelIds(cached ?? FALLBACK_MODEL_IDS, query)) {
+    if (choices.length >= AUTOCOMPLETE_LIMIT) break;
+    choices.push({ name: id === pinned ? `● ${id}` : id, value: id });
+  }
+
+  await interaction.respond(choices);
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +676,7 @@ function routerStatusLine(pinned: boolean): string {
   const tiers =
     `coding → \`${m.coding}\`\ncommon → \`${m.common}\`\njudge → \`${m.judge}\` · bias: ${getRouterBias()}`;
   if (!isModelRouterEnabled()) return `Off — every new thread uses the Active model above.\n${tiers}`;
-  if (pinned) return `Standing down: the saved selection is pinned. \`/model reset:true\` re-enables routing.\n${tiers}`;
+  if (pinned) return `Standing down: the saved selection is pinned. \`/model name:auto\` re-enables routing.\n${tiers}`;
   return `New threads are routed per message; "use a smarter model" mid-thread escalates.\n${tiers}`;
 }
 
@@ -677,7 +698,7 @@ async function handleModel(
       content: router
         ? `✅ Model router **on** — new threads start on ${routerTierSummary()}.` +
           (pinned
-            ? `\n-# \`${pinned}\` is still pinned via /model, so the router stands down until \`/model reset:true\`.`
+            ? `\n-# \`${pinned}\` is still pinned via /model, so the router stands down until \`/model name:auto\`.`
             : "")
         : `✅ Model router **off** — new threads use \`${describeModelResolution().model}\` ` +
           `(${describeSource(describeModelResolution().source).toLowerCase()}).`,
@@ -691,8 +712,8 @@ async function handleModel(
     await interaction.editReply({
       content:
         `✅ Cleared the saved selection. ` +
-        (isModelRouterEnabled()
-          ? `New threads are routed automatically (${routerTierSummary()}); cron jobs without their own model use \`${after.model}\`.`
+        (isAutoMode()
+          ? `Auto mode — new threads are routed per message (${routerTierSummary()}); cron jobs without their own model use \`${after.model}\`.`
           : `Now using \`${after.model}\` (${describeSource(after.source).toLowerCase()}).`),
     });
     return;
@@ -709,14 +730,32 @@ async function handleModel(
       return;
     }
 
-    // Sentinel value (`default`, `auto`, …) — same effect as reset:true.
+    // `auto` is a mode, not a clear: it also switches the router on.
+    if (cleanModelName(name).toLowerCase() === AUTO_MODEL_VALUE) {
+      enableAutoMode();
+      const after = describeModelResolution();
+      await interaction.editReply({
+        content: isAutoMode()
+          ? `✅ **Auto mode** — new threads are routed per message: ${routerTierSummary()}. ` +
+            `Cron jobs without their own model use \`${after.model}\`.\n` +
+            `-# Threads already running keep their model; \`/model name:<id>\` pins one again.`
+          : `⚠️ Router switched on and the saved selection cleared, but \`SDK_ANTHROPIC_MODEL\` ` +
+            `is set in the environment and pins every session to \`${after.model}\`. ` +
+            `Unset it and restart to get auto mode.`,
+      });
+      return;
+    }
+
+    // Other sentinel values (`default`, `inherit`, …) — same effect as reset:true.
     if (!result.model) {
       clearSelectedModel();
       const after = describeModelResolution();
       await interaction.editReply({
         content:
-          `✅ Cleared the saved selection. Now using \`${after.model}\` ` +
-          `(${describeSource(after.source).toLowerCase()}).`,
+          `✅ Cleared the saved selection. ` +
+          (isAutoMode()
+            ? `Auto mode — new threads are routed per message (${routerTierSummary()}).`
+            : `Now using \`${after.model}\` (${describeSource(after.source).toLowerCase()}).`),
       });
       return;
     }
@@ -729,7 +768,7 @@ async function handleModel(
         `-# Takes effect on the next message — replies already in flight keep the previous model. ` +
         `A running session keeps its model until it restarts (\`/clear\` in the channel forces that). ` +
         (isModelRouterEnabled()
-          ? `The model router stands down while a selection is pinned — \`/model reset:true\` hands control back to it. `
+          ? `The model router stands down while a selection is pinned — \`/model name:auto\` hands control back to it. `
           : "") +
         `Voice and the cycling coach are configured separately.`,
     });
@@ -748,11 +787,23 @@ async function handleModel(
       ? `⚠️ Proxy unreachable — showing ${selectable.length} built-in fallback models`
       : `${selectable.length} selectable · ${list.models.length} total from proxy`;
 
+  const auto = isAutoMode();
+  const tiers = getRouterModels();
   const embed = new EmbedBuilder()
     .setTitle("🧠 Model")
     .addFields(
-      { name: "Active", value: `\`${resolution.model}\``, inline: true },
-      { name: "Source", value: describeSource(resolution.source), inline: true },
+      {
+        name: "Active",
+        value: auto
+          ? `**auto** — \`${shortModelName(tiers.coding)}\` coding / \`${shortModelName(tiers.common)}\` common`
+          : `\`${resolution.model}\``,
+        inline: true,
+      },
+      {
+        name: "Source",
+        value: auto ? "Router (per thread)" : describeSource(resolution.source),
+        inline: true,
+      },
       {
         name: "Saved selection",
         value: resolution.saved ? `\`${resolution.saved}\`` : "_Not set_",
@@ -774,7 +825,7 @@ async function handleModel(
     )
     .setColor(resolution.healed || envUnknown ? 0xfee75c : 0x5865f2)
     .setFooter({
-      text: "/model name:<model> to pin · /model router:false for one model everywhere · cron jobs keep their own override",
+      text: "/model name:auto to route per thread · /model name:<model> to pin · cron jobs keep their own override",
     });
 
   if (active?.maxInputTokens) {

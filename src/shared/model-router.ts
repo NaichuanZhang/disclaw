@@ -12,13 +12,13 @@
 //   SDK_ANTHROPIC_MODEL pin > /model selection > router > ANTHROPIC_MODEL env
 //   > DEFAULT_MODEL
 // An explicit /model pick is a human decision, so the router stands down while
-// one is set; /model reset hands control back.
+// one is set; /model reset or /model name:auto hands control back.
 // ---------------------------------------------------------------------------
 
 import { anthropicClient } from "./anthropic.js";
 import { createLogger } from "../logging/logger.js";
 import { getConfig, setConfig } from "../db/index.js";
-import { getSelectedModel } from "./models.js";
+import { clearSelectedModel, getSelectedModel } from "./models.js";
 import { count } from "../metrics/counters.js";
 import { P } from "../metrics/registry.js";
 
@@ -91,6 +91,33 @@ export function setModelRouterEnabled(enabled: boolean): void {
 /** The operator pin that bypasses every model choice for SDK sessions. */
 function sdkModelPin(): string | undefined {
   return envValue("SDK_ANTHROPIC_MODEL") ?? envValue("PILOT_ANTHROPIC_MODEL");
+}
+
+/** The `/model name:` value that means "let the router decide". */
+export const AUTO_MODEL_VALUE = "auto";
+
+/**
+ * True when the router is actually in charge of new sessions: switched on,
+ * no `/model` pin, no `SDK_ANTHROPIC_MODEL` pin. This is the single answer
+ * `/model` and its autocomplete show as "auto", so it must agree with the
+ * precedence walk in planSessionModel(). Never throws.
+ */
+export function isAutoMode(): boolean {
+  try {
+    return isModelRouterEnabled() && !getSelectedModel() && !sdkModelPin();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Put the router in charge: clear the `/model` pin and switch routing on in
+ * one step. An env pin is out of reach (it is the operator's), so the caller
+ * should check isAutoMode() afterwards if it needs to promise anything.
+ */
+export function enableAutoMode(): void {
+  clearSelectedModel();
+  setModelRouterEnabled(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +342,9 @@ export async function planSessionModel(input: SessionModelInput): Promise<Sessio
 
   const skip = (reason: Extract<SessionModelPlan, { action: "skip" }>["reason"], extra: Record<string, unknown> = {}) => {
     if (reason === "model_pin") count(P.routerBypassedPin);
-    log.debug(`skipped: ${reason}`, { ...base, ...extra });
+    // info, not debug: the DB sink drops debug, and a skip is the one branch
+    // an operator asks about ("why did this thread get fable?").
+    log.info(`skipped: ${reason}`, { ...base, ...extra });
     return { action: "skip", reason } as const;
   };
 
