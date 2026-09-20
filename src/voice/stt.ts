@@ -10,9 +10,11 @@
  * so that path is gone. Measured on a 2.3s utterance, local whisper.cpp is
  * also *faster* than the remote services it replaced (~1.65s vs ~2.45s).
  *
- * An optional remote fallback (ElevenLabs Scribe) can be enabled with
- * VOICE_STT_REMOTE_FALLBACK=1 for hosts where whisper.cpp cannot be built, or
- * when non-English input matters — `base.en` is English-only.
+ * whisper.cpp defaults to the multilingual ggml-small.bin model with
+ * per-utterance language auto-detection (WHISPER_CPP_LANG=auto), so Chinese,
+ * English and French are all handled — see whispercpp-transcribe.ts. An
+ * optional remote fallback (ElevenLabs Scribe) can still be enabled with
+ * VOICE_STT_REMOTE_FALLBACK=1 for hosts where whisper.cpp cannot be built.
  */
 
 import { VAD_SAMPLE_RATE } from "./receiver.js";

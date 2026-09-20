@@ -13,11 +13,18 @@
  * Setup (one-time, no root required — see scripts/setup-whispercpp.sh):
  *   git clone --depth 1 https://github.com/ggml-org/whisper.cpp data/asr/whisper.cpp
  *   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
- *   ./models/download-ggml-model.sh base.en
+ *   ./models/download-ggml-model.sh small
  *
  * Overrides:
  *   WHISPER_CPP_BIN    — path to the whisper-cli binary
- *   WHISPER_CPP_MODEL  — path to the .bin GGML model
+ *   WHISPER_CPP_MODEL  — path to the .bin GGML model. Defaults to the
+ *                         multilingual ggml-small.bin when present, else
+ *                         falls back to the English-only ggml-base.en.bin.
+ *   WHISPER_CPP_LANG   — language code passed to whisper-cli's `-l` flag
+ *                         (default: "auto" — per-utterance detection, so
+ *                         Chinese/English/French can be mixed across turns).
+ *                         Only meaningful with a multilingual model; the
+ *                         `.en` models ignore it.
  *   WHISPER_CPP_THREADS — thread count (default: 4)
  */
 
@@ -36,14 +43,30 @@ const REPO_ROOT = join(__dirname, "..", "..");
 const ASR_DIR = join(REPO_ROOT, "data", "asr", "whisper.cpp");
 
 const DEFAULT_BIN = join(ASR_DIR, "build", "bin", "whisper-cli");
-const DEFAULT_MODEL = join(ASR_DIR, "models", "ggml-base.en.bin");
+const MULTILINGUAL_MODEL = join(ASR_DIR, "models", "ggml-small.bin");
+const ENGLISH_ONLY_MODEL = join(ASR_DIR, "models", "ggml-base.en.bin");
+const DEFAULT_LANG = "auto";
 
 function binPath(): string {
   return process.env.WHISPER_CPP_BIN || DEFAULT_BIN;
 }
 
+/**
+ * Prefer the multilingual model when it's present on disk, so a fresh
+ * install with only the English-only model still works without an env
+ * override, while a host that has downloaded ggml-small.bin gets
+ * Chinese/French support for free.
+ */
+function defaultModelPath(): string {
+  return existsSync(MULTILINGUAL_MODEL) ? MULTILINGUAL_MODEL : ENGLISH_ONLY_MODEL;
+}
+
 function modelPath(): string {
-  return process.env.WHISPER_CPP_MODEL || DEFAULT_MODEL;
+  return process.env.WHISPER_CPP_MODEL || defaultModelPath();
+}
+
+function langCode(): string {
+  return process.env.WHISPER_CPP_LANG || DEFAULT_LANG;
 }
 
 function threadCount(): string {
@@ -173,7 +196,7 @@ export async function ensureWhisperCppReady(): Promise<boolean> {
     }
 
     console.log(
-      `[whispercpp] ready — bin=${bin} model=${model} threads=${threadCount()}`,
+      `[whispercpp] ready — bin=${bin} model=${model} lang=${langCode()} threads=${threadCount()}`,
     );
     return finish(true, null);
   })();
@@ -260,6 +283,8 @@ async function runWhisperCli(
       modelPath(),
       "-f",
       wavPath,
+      "-l",
+      langCode(),
       "-t",
       threadCount(),
       "-nt", // no timestamps — plain text only
