@@ -42,8 +42,8 @@ export interface RouterModels {
 
 const DEFAULT_ROUTER_MODELS: RouterModels = {
   coding: "bedrock-claude-fable-5-1",
-  common: "bedrock-claude-sonnet-5",
-  judge: "bedrock-claude-sonnet-5",
+  common: "bedrock-claude-sonnet-5-5",
+  judge: "bedrock-claude-sonnet-5-5",
 };
 
 /** Text the judge sees for each tier. Kept as prose so it can be tuned without touching code paths. */
