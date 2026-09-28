@@ -28,7 +28,7 @@ const FAILURE_BACKOFF_MS = 30_000; // don't hammer a proxy that is down
  */
 export const FALLBACK_MODEL_IDS: readonly string[] = [
   "bedrock-claude-opus-5-1m",
-  "bedrock-claude-sonnet-5",
+  "bedrock-claude-sonnet-5-5",
   "bedrock-claude-fable-5",
   "bedrock-claude-opus-4-8-1m",
   "bedrock-claude-sonnet-4-6",
