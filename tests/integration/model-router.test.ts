@@ -164,8 +164,8 @@ describe("configuration", () => {
   it("reads tier models from env with sane defaults", () => {
     expect(getRouterModels()).toEqual({
       coding: "bedrock-claude-fable-5-1",
-      common: "bedrock-claude-sonnet-5",
-      judge: "bedrock-claude-sonnet-5",
+      common: "bedrock-claude-sonnet-5-5",
+      judge: "bedrock-claude-sonnet-5-5",
     });
     process.env.ROUTER_MODEL_CODING = "bedrock-claude-opus-5-1m";
     expect(getRouterModels().coding).toBe("bedrock-claude-opus-5-1m");
