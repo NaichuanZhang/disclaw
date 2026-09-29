@@ -45,7 +45,14 @@ function buildDiscordKey(opts: {
 // Expiry check
 // ---------------------------------------------------------------------------
 
+function isThreadKey(discordKey: string): boolean {
+  return discordKey.startsWith("thread:");
+}
+
 function isExpired(session: Session): boolean {
+  // Thread sessions never expire — Discord thread messages persist,
+  // so the session should live as long as the thread exists.
+  if (isThreadKey(session.discordKey)) return false;
   return Date.now() - session.lastActive > getSessionTtlMs();
 }
 
@@ -162,6 +169,7 @@ export function listSessions(opts?: {
 
 /**
  * Delete all sessions that have been inactive longer than the TTL.
+ * Thread sessions are exempt — they never expire.
  * Messages are archived to message_history before deletion.
  * Also prunes very old archived messages (30 days).
  * Returns the number of sessions deleted.
@@ -170,8 +178,9 @@ export function cleanExpiredSessions(): number {
   const cutoff = Date.now() - getSessionTtlMs();
   const db = getDb();
 
+  // Only expire non-thread sessions
   const expired = db
-    .prepare("SELECT id FROM sessions WHERE last_active < ?")
+    .prepare("SELECT id FROM sessions WHERE last_active < ? AND discord_key NOT LIKE 'thread:%'")
     .all(cutoff) as { id: string }[];
 
   if (expired.length === 0) {
