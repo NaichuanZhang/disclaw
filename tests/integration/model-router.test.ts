@@ -9,13 +9,14 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 
 import { initDb, deleteConfig } from "../../src/db/index.js";
-import { clearSelectedModel, setSelectedModel } from "../../src/shared/models.js";
+import { clearSelectedModel, invalidateModelCache, listModels, setSelectedModel } from "../../src/shared/models.js";
 import {
   AUTO_MODEL_VALUE,
   ROUTER_CONFIG_KEY,
   buildJudgePrompt,
   classifyHeuristic,
   enableAutoMode,
+  createDecider,
   getRouterModels,
   isAutoMode,
   isModelRouterEnabled,
@@ -33,7 +34,11 @@ const ENV_KEYS = [
   "ROUTER_MODEL_CODING",
   "ROUTER_MODEL_COMMON",
   "ROUTER_MODEL_JUDGE",
+  "ROUTER_FAMILY_CODING",
+  "ROUTER_FAMILY_COMMON",
+  "ROUTER_FAMILY_JUDGE",
   "ROUTER_BIAS",
+  "ANTHROPIC_BASE_URL",
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -161,14 +166,22 @@ describe("judge", () => {
 // ---------------------------------------------------------------------------
 
 describe("configuration", () => {
-  it("reads tier models from env with sane defaults", () => {
+  it("resolves families against the built-in list while the catalog is cold", () => {
+    invalidateModelCache();
     expect(getRouterModels()).toEqual({
-      coding: "bedrock-claude-fable-5-1",
-      common: "bedrock-claude-sonnet-5-5",
-      judge: "bedrock-claude-sonnet-5-5",
+      coding: "anthropic.claude-opus-5-5",
+      common: "anthropic.claude-sonnet-5-5",
+      judge: "anthropic.claude-haiku-5-5",
     });
-    process.env.ROUTER_MODEL_CODING = "bedrock-claude-opus-5-1m";
-    expect(getRouterModels().coding).toBe("bedrock-claude-opus-5-1m");
+  });
+
+  it("honours an exact-id override while cold, and a family override always", () => {
+    invalidateModelCache();
+    process.env.ROUTER_MODEL_CODING = "some-model";
+    expect(getRouterModels().coding).toBe("some-model");
+    delete process.env.ROUTER_MODEL_CODING;
+    process.env.ROUTER_FAMILY_CODING = "haiku";
+    expect(getRouterModels().coding).toBe("anthropic.claude-haiku-5-5");
   });
 
   it("is on by default and toggles through config", () => {
@@ -218,6 +231,7 @@ describe("configuration", () => {
   it("shortens model ids for the channel line", () => {
     expect(shortModelName("bedrock-claude-fable-5-1")).toBe("fable-5-1");
     expect(shortModelName("claude-haiku-4-5-20251001")).toBe("haiku-4-5-20251001");
+    expect(shortModelName("anthropic.claude-opus-5-5")).toBe("opus-5-5");
   });
 });
 
@@ -291,5 +305,126 @@ describe("planSessionModel", () => {
 
   it("skips empty text", async () => {
     expect(await planSessionModel({ ...base, text: "   " })).toEqual({ action: "skip", reason: "empty" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Family resolution against a live catalog
+// ---------------------------------------------------------------------------
+
+describe("tier resolution against the endpoint catalog", () => {
+  let server: import("node:http").Server;
+  let ids: string[] = [];
+  let baseUrl = "";
+
+  beforeAll(async () => {
+    const { createServer } = await import("node:http");
+    server = createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ object: "list", data: ids.map((id) => ({ id, mode: "chat" })) }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    baseUrl = `http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    invalidateModelCache();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  async function warm(catalog: string[]) {
+    ids = catalog;
+    process.env.ANTHROPIC_BASE_URL = baseUrl;
+    invalidateModelCache();
+    await listModels({ force: true });
+  }
+
+  it("takes the newest model of each family the endpoint lists", async () => {
+    await warm([
+      "anthropic.claude-haiku-5-5",
+      "bedrock-claude-opus-4-8-1m",
+      "anthropic.claude-opus-5-5",
+      "anthropic.claude-sonnet-5-5",
+    ]);
+    expect(getRouterModels()).toEqual({
+      coding: "anthropic.claude-opus-5-5",
+      common: "anthropic.claude-sonnet-5-5",
+      judge: "anthropic.claude-haiku-5-5",
+    });
+  });
+
+  it("never returns a model the endpoint does not list", async () => {
+    await warm(["anthropic.claude-sonnet-5-5", "anthropic.claude-haiku-5-5"]);
+    const m = getRouterModels();
+    // opus is missing: the coding tier falls to the closest family that exists
+    expect(m.coding).toBe("anthropic.claude-sonnet-5-5");
+    for (const id of Object.values(m)) expect(ids).toContain(id);
+  });
+
+  it("ignores an exact override the catalog does not list", async () => {
+    await warm(["anthropic.claude-sonnet-5-5", "anthropic.claude-opus-5-5", "anthropic.claude-haiku-5-5"]);
+    process.env.ROUTER_MODEL_CODING = "bedrock-claude-fable-5-1";
+    expect(getRouterModels().coding).toBe("anthropic.claude-opus-5-5");
+    process.env.ROUTER_MODEL_CODING = "anthropic.claude-sonnet-5-5";
+    expect(getRouterModels().coding).toBe("anthropic.claude-sonnet-5-5");
+  });
+
+  it("follows a family switch to one the catalog has", async () => {
+    await warm(["anthropic.claude-sonnet-5-5", "bedrock-claude-fable-5-1"]);
+    process.env.ROUTER_FAMILY_CODING = "fable";
+    expect(getRouterModels().coding).toBe("bedrock-claude-fable-5-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structured decider
+// ---------------------------------------------------------------------------
+
+describe("structured decider", () => {
+  const clientReturning = (content: unknown[]) => {
+    const calls: Array<Record<string, unknown>> = [];
+    const client = {
+      messages: {
+        create: async (params: Record<string, unknown>) => {
+          calls.push(params);
+          return { content };
+        },
+      },
+    } as never;
+    return { client, calls };
+  };
+
+  it("forces a route tool call on the judge model and returns tier + reason", async () => {
+    const { client, calls } = clientReturning([
+      { type: "tool_use", id: "t", name: "route", input: { tier: "coding", reason: "debugging" } },
+    ]);
+    const verdict = await createDecider(client, () => "judge-model")("why does my build fail");
+    expect(verdict).toEqual({ tier: "coding", reason: "debugging" });
+    expect(calls[0].model).toBe("judge-model");
+    expect(calls[0].tool_choice).toEqual({ type: "tool", name: "route" });
+  });
+
+  it("rejects an out-of-schema tier instead of guessing", async () => {
+    const { client } = clientReturning([{ type: "tool_use", id: "t", name: "route", input: { tier: "banana" } }]);
+    await expect(createDecider(client, () => "m")("x")).rejects.toThrow(/invalid/);
+  });
+
+  it("rejects a reply with no tool call", async () => {
+    const { client } = clientReturning([{ type: "text", text: "coding" }]);
+    await expect(createDecider(client, () => "m")("x")).rejects.toThrow(/no tool call/);
+  });
+
+  it("feeds routeModel and surfaces the reason; a failure takes the bias fallback", async () => {
+    const ok = await routeModel("how do I set up a cron for this", {
+      judge: async () => ({ tier: "coding", reason: "devops" }),
+    });
+    expect(ok.source).toBe("judge");
+    expect(ok.tier).toBe("coding");
+    expect(ok.judgeReason).toBe("devops");
+
+    const { client } = clientReturning([]);
+    const bad = await routeModel("how do I set up a cron for this", { judge: createDecider(client, () => "m") });
+    expect(bad.source).toBe("judge_fallback");
+    expect(bad.tier).toBe("common");
   });
 });

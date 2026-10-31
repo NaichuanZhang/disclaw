@@ -10,7 +10,7 @@ import { P } from "../metrics/registry.js";
 const log = createLogger("models");
 
 /** Built-in default when nothing else is configured. */
-export const DEFAULT_MODEL = "bedrock-claude-opus-5-1m";
+export const DEFAULT_MODEL = "anthropic.claude-opus-5-5";
 
 /** Key in the global `config` table holding the persisted selection. */
 export const MODEL_CONFIG_KEY = "selected_model";
@@ -27,13 +27,80 @@ const FAILURE_BACKOFF_MS = 30_000; // don't hammer a proxy that is down
  * fetched so model selection never presents an empty list.
  */
 export const FALLBACK_MODEL_IDS: readonly string[] = [
-  "bedrock-claude-opus-5-1m",
-  "bedrock-claude-sonnet-5-5",
-  "bedrock-claude-fable-5",
-  "bedrock-claude-opus-4-8-1m",
-  "bedrock-claude-sonnet-4-6",
-  "bedrock-claude-haiku-4-5",
+  "anthropic.claude-opus-5-5",
+  "anthropic.claude-sonnet-5-5",
+  "anthropic.claude-haiku-5-5",
 ];
+
+/** Order tried when a model (or its whole family) is gone from the catalog. */
+export const FAMILY_FALLBACK_ORDER: readonly string[] = ["opus", "sonnet", "haiku"];
+
+const KNOWN_FAMILIES = ["opus", "sonnet", "haiku", "fable", "mythos"] as const;
+
+export interface ParsedModelId {
+  family: string;
+  /** [major, minor]; minor is 0 when the id carries none. */
+  version: [number, number];
+}
+
+/**
+ * Read the model family and version out of an id, whatever the provider
+ * prefix: `anthropic.claude-opus-5-5`, `bedrock-claude-opus-5-1m`,
+ * `claude-sonnet-4-20250514`, `claude-3-5-sonnet`. A trailing `-1m` is a
+ * context-window suffix, not a minor version, and an 8-digit date is not
+ * either. Undefined when no known family appears in the id.
+ */
+export function parseModelFamily(id: string): ParsedModelId | undefined {
+  const s = id.toLowerCase();
+  const fam = KNOWN_FAMILIES.join("|");
+
+  const after = new RegExp(`(${fam})-(\\d+)(?:-(\\d{1,2})(?!\\d|m\\b))?`).exec(s);
+  if (after) {
+    return { family: after[1], version: [Number(after[2]), after[3] ? Number(after[3]) : 0] };
+  }
+  const before = new RegExp(`claude-(\\d+)(?:-(\\d{1,2}))?-(${fam})`).exec(s);
+  if (before) {
+    return { family: before[3], version: [Number(before[1]), before[2] ? Number(before[2]) : 0] };
+  }
+  const bare = new RegExp(`(${fam})`).exec(s);
+  return bare ? { family: bare[1], version: [0, 0] } : undefined;
+}
+
+/**
+ * The newest model of a family among `ids` (highest version; the first listed
+ * wins a tie, so the proxy's own ordering decides between 5-5 and 5-5-1m).
+ */
+export function pickByFamily(family: string, ids: readonly string[]): string | undefined {
+  let best: { id: string; version: [number, number] } | undefined;
+  for (const id of ids) {
+    const parsed = parseModelFamily(id);
+    if (!parsed || parsed.family !== family.toLowerCase()) continue;
+    const [maj, min] = parsed.version;
+    if (!best || maj > best.version[0] || (maj === best.version[0] && min > best.version[1])) {
+      best = { id, version: parsed.version };
+    }
+  }
+  return best?.id;
+}
+
+/**
+ * Closest available model to `wanted`: its own family first, then each family
+ * in `order`, then whatever the catalog lists first. Undefined only when `ids`
+ * is empty.
+ */
+export function pickClosestModel(
+  wanted: string | undefined,
+  ids: readonly string[],
+  order: readonly string[] = FAMILY_FALLBACK_ORDER,
+): string | undefined {
+  const own = wanted ? parseModelFamily(wanted)?.family : undefined;
+  const families = own ? [own, ...order.filter((f) => f !== own)] : [...order];
+  for (const f of families) {
+    const hit = pickByFamily(f, ids);
+    if (hit) return hit;
+  }
+  return ids[0];
+}
 
 /** Modes that cannot serve a chat completion. */
 const NON_CHAT_MODES = new Set(["embedding", "image_generation", "rerank"]);
@@ -360,9 +427,13 @@ export function describeModelResolution(override?: string): ModelResolution {
   // catalog — a cold cache must never block a message.
   const cached = getCachedModelIdSet();
   if (cached && !cached.has(model)) {
-    const replacement = cached.has(DEFAULT_MODEL)
-      ? DEFAULT_MODEL
-      : getCachedSelectableModelIds()?.[0];
+    const ids = getCachedSelectableModelIds() ?? [];
+    const sameFamily = (() => {
+      const fam = parseModelFamily(model)?.family;
+      return fam ? pickByFamily(fam, ids) : undefined;
+    })();
+    const replacement =
+      sameFamily ?? (cached.has(DEFAULT_MODEL) ? DEFAULT_MODEL : pickClosestModel(undefined, ids));
     if (replacement && replacement !== model) {
       if (!warnedIds.has(model)) {
         warnedIds.add(model);

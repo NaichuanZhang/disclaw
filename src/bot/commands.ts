@@ -50,6 +50,7 @@ import {
   AUTO_MODEL_VALUE,
   enableAutoMode,
   getRouterBias,
+  getRouterFamilies,
   getRouterModels,
   isAutoMode,
   isModelRouterEnabled,
@@ -673,8 +674,9 @@ function routerTierSummary(): string {
 /** The router field of the /model embed — what the next new thread will do. */
 function routerStatusLine(pinned: boolean): string {
   const m = getRouterModels();
+  const f = getRouterFamilies();
   const tiers =
-    `coding → \`${m.coding}\`\ncommon → \`${m.common}\`\njudge → \`${m.judge}\` · bias: ${getRouterBias()}`;
+    `coding (${f.coding}) → \`${m.coding}\`\ncommon (${f.common}) → \`${m.common}\`\njudge (${f.judge}) → \`${m.judge}\` · bias: ${getRouterBias()}`;
   if (!isModelRouterEnabled()) return `Off — every new thread uses the Active model above.\n${tiers}`;
   if (pinned) return `Standing down: the saved selection is pinned. \`/model name:auto\` re-enables routing.\n${tiers}`;
   return `New threads are routed per message; "use a smarter model" mid-thread escalates.\n${tiers}`;
