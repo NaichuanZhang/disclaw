@@ -16,6 +16,9 @@ import {
   AUTOCOMPLETE_LIMIT,
   DEFAULT_MODEL,
   FALLBACK_MODEL_IDS,
+  parseModelFamily,
+  pickByFamily,
+  pickClosestModel,
   MODEL_CONFIG_KEY,
   cleanModelName,
   clearSelectedModel,
@@ -451,8 +454,9 @@ describe("listModels against a stub proxy", () => {
     const resolution = describeModelResolution();
     expect(resolution.saved).toBe("bedrock-claude-retired-9");
     expect(resolution.healed).toBe(true);
-    expect(resolution.model).toBe(DEFAULT_MODEL);
-    expect(resolveModel()).toBe(DEFAULT_MODEL);
+    // No family in the id and DEFAULT_MODEL is not in this catalog: closest family (opus) wins.
+    expect(resolution.model).toBe("bedrock-claude-opus-5-1m");
+    expect(resolveModel()).toBe("bedrock-claude-opus-5-1m");
   });
 
   it("leaves an advertised selection untouched", async () => {
@@ -467,8 +471,13 @@ describe("listModels against a stub proxy", () => {
   it("self-heals a per-job override too", async () => {
     await listModels({ force: true });
 
-    expect(resolveModel("bedrock-claude-retired-9")).toBe(DEFAULT_MODEL);
+    expect(resolveModel("bedrock-claude-retired-9")).toBe("bedrock-claude-opus-5-1m");
     expect(resolveModel("bedrock-claude-sonnet-5")).toBe("bedrock-claude-sonnet-5");
+  });
+
+  it("heals a retired model to the same family first", async () => {
+    await listModels({ force: true });
+    expect(resolveModel("bedrock-claude-sonnet-4-6")).toBe("bedrock-claude-sonnet-5");
   });
 });
 
@@ -518,5 +527,51 @@ describe("command declarations", () => {
     expect(options.map((o) => o.name)).toEqual(["id", "model"]);
     expect(options.every((o) => o.required === true)).toBe(true);
     expect(options.find((o) => o.name === "model")!.autocomplete).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Family parsing and selection
+// ---------------------------------------------------------------------------
+describe("model families", () => {
+  it("reads family and version out of every id shape the endpoints use", () => {
+    expect(parseModelFamily("anthropic.claude-opus-5-5")).toEqual({ family: "opus", version: [5, 5] });
+    expect(parseModelFamily("bedrock-claude-fable-5-1")).toEqual({ family: "fable", version: [5, 1] });
+    expect(parseModelFamily("claude-3-5-sonnet-latest")).toEqual({ family: "sonnet", version: [3, 5] });
+    expect(parseModelFamily("bedrock-nova-premier")).toBeUndefined();
+  });
+
+  it("treats -1m as a context suffix and an 8-digit date as no minor version", () => {
+    expect(parseModelFamily("bedrock-claude-opus-5-1m")).toEqual({ family: "opus", version: [5, 0] });
+    expect(parseModelFamily("claude-sonnet-4-20250514")).toEqual({ family: "sonnet", version: [4, 0] });
+  });
+
+  it("picks the highest version in a family and ignores the others", () => {
+    const ids = [
+      "bedrock-claude-opus-4-8-1m",
+      "anthropic.claude-sonnet-5-5",
+      "anthropic.claude-opus-5-5",
+      "bedrock-claude-opus-5-1m",
+    ];
+    expect(pickByFamily("opus", ids)).toBe("anthropic.claude-opus-5-5");
+    expect(pickByFamily("OPUS", ids)).toBe("anthropic.claude-opus-5-5");
+    expect(pickByFamily("haiku", ids)).toBeUndefined();
+  });
+
+  it("lets the catalog order break a version tie", () => {
+    expect(pickByFamily("opus", ["a-opus-5-5", "b-opus-5-5"])).toBe("a-opus-5-5");
+  });
+
+  it("finds the closest model when a family is missing", () => {
+    const ids = ["anthropic.claude-haiku-5-5", "anthropic.claude-sonnet-5-5"];
+    expect(pickClosestModel("bedrock-claude-opus-5-1m", ids)).toBe("anthropic.claude-sonnet-5-5");
+    expect(pickClosestModel("claude-haiku-4-5", ids)).toBe("anthropic.claude-haiku-5-5");
+    expect(pickClosestModel(undefined, ["weird-model"])).toBe("weird-model");
+    expect(pickClosestModel(undefined, [])).toBeUndefined();
+  });
+
+  it("keeps the fallback list and default inside known families", () => {
+    for (const id of [...FALLBACK_MODEL_IDS, DEFAULT_MODEL]) expect(parseModelFamily(id)).toBeDefined();
+    expect(FALLBACK_MODEL_IDS).toContain(DEFAULT_MODEL);
   });
 });

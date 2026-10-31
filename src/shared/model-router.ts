@@ -18,7 +18,16 @@
 import { anthropicClient } from "./anthropic.js";
 import { createLogger } from "../logging/logger.js";
 import { getConfig, setConfig } from "../db/index.js";
-import { clearSelectedModel, getSelectedModel } from "./models.js";
+import { z } from "zod";
+import type Anthropic from "@anthropic-ai/sdk";
+import {
+  FALLBACK_MODEL_IDS,
+  clearSelectedModel,
+  getCachedSelectableModelIds,
+  getSelectedModel,
+  pickByFamily,
+  pickClosestModel,
+} from "./models.js";
 import { count } from "../metrics/counters.js";
 import { P } from "../metrics/registry.js";
 
@@ -40,10 +49,22 @@ export interface RouterModels {
   judge: string;
 }
 
-const DEFAULT_ROUTER_MODELS: RouterModels = {
-  coding: "bedrock-claude-fable-5-1",
-  common: "bedrock-claude-sonnet-5-5",
-  judge: "bedrock-claude-sonnet-5-5",
+export type RouterTierKey = keyof RouterModels;
+
+/**
+ * Tiers are configured as model *families*; the concrete id is whatever the
+ * endpoint's catalog lists newest for that family (see getRouterModels()).
+ */
+const DEFAULT_ROUTER_FAMILIES: Record<RouterTierKey, string> = {
+  coding: "opus",
+  common: "sonnet",
+  judge: "haiku",
+};
+
+const FAMILY_ORDER: Record<RouterTierKey, readonly string[]> = {
+  coding: ["opus", "sonnet", "haiku"],
+  common: ["sonnet", "haiku", "opus"],
+  judge: ["haiku", "sonnet", "opus"],
 };
 
 /** Text the judge sees for each tier. Kept as prose so it can be tuned without touching code paths. */
@@ -62,11 +83,56 @@ function envValue(name: string): string | undefined {
   return typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
 }
 
-export function getRouterModels(): RouterModels {
+export function getRouterFamilies(): Record<RouterTierKey, string> {
   return {
-    coding: envValue("ROUTER_MODEL_CODING") ?? DEFAULT_ROUTER_MODELS.coding,
-    common: envValue("ROUTER_MODEL_COMMON") ?? DEFAULT_ROUTER_MODELS.common,
-    judge: envValue("ROUTER_MODEL_JUDGE") ?? DEFAULT_ROUTER_MODELS.judge,
+    coding: envValue("ROUTER_FAMILY_CODING")?.toLowerCase() ?? DEFAULT_ROUTER_FAMILIES.coding,
+    common: envValue("ROUTER_FAMILY_COMMON")?.toLowerCase() ?? DEFAULT_ROUTER_FAMILIES.common,
+    judge: envValue("ROUTER_FAMILY_JUDGE")?.toLowerCase() ?? DEFAULT_ROUTER_FAMILIES.judge,
+  };
+}
+
+const warnedSubstitutions = new Set<string>();
+function warnOnce(key: string, message: string, fields: Record<string, unknown>): void {
+  if (warnedSubstitutions.has(key)) return;
+  warnedSubstitutions.add(key);
+  log.warn(message, fields);
+}
+
+/**
+ * Resolve one tier to a concrete model id. Sync and never throws (it sits on
+ * the message hot path), so it reads the cached catalog only; a cold cache
+ * resolves against FALLBACK_MODEL_IDS until the boot-time warm lands.
+ *
+ * Order: an exact `ROUTER_MODEL_<TIER>` id if the catalog lists it → the
+ * newest model of the tier's family → the closest family that exists.
+ */
+function resolveTierModel(tier: RouterTierKey, ids: readonly string[], cold: boolean): string {
+  const override = envValue(`ROUTER_MODEL_${tier.toUpperCase()}`);
+  if (override) {
+    if (cold || ids.includes(override)) return override;
+    warnOnce(`override:${tier}:${override}`, `ROUTER_MODEL_${tier.toUpperCase()}="${override}" is not in the endpoint catalog — resolving by family`, { tier });
+  }
+  const family = getRouterFamilies()[tier];
+  const exact = pickByFamily(family, ids);
+  if (exact) return exact;
+
+  const order = [family, ...FAMILY_ORDER[tier].filter((f) => f !== family)];
+  const near = pickClosestModel(undefined, ids, order);
+  if (near) {
+    warnOnce(`family:${tier}:${family}:${near}`, `no "${family}" model in the endpoint catalog for the ${tier} tier — using ${near}`, { tier, family });
+    return near;
+  }
+  return override ?? FALLBACK_MODEL_IDS[0];
+}
+
+export function getRouterModels(): RouterModels {
+  const live = getCachedSelectableModelIds();
+  const cold = !live || live.length === 0;
+  const ids = cold ? FALLBACK_MODEL_IDS : live;
+  return {
+    coding: resolveTierModel("coding", ids, cold),
+    common: resolveTierModel("common", ids, cold),
+    judge: resolveTierModel("judge", ids, cold),
   };
 }
 
@@ -198,10 +264,15 @@ export function classifyHeuristic(text: string, opts: HeuristicOptions = {}): He
 // Judge
 // ---------------------------------------------------------------------------
 
-export const JUDGE_TIMEOUT_MS = 3000;
+export const JUDGE_TIMEOUT_MS = 4000;
 const JUDGE_INPUT_CHARS = 2000;
 
-export type JudgeFn = (text: string) => Promise<string>;
+/** A decider may answer with a bare word (tests, legacy) or a structured verdict. */
+export interface JudgeVerdict {
+  tier: string;
+  reason?: string;
+}
+export type JudgeFn = (text: string) => Promise<string | JudgeVerdict>;
 
 function biasHint(bias: RouterBias): string {
   switch (bias) {
@@ -229,22 +300,58 @@ export function parseJudgeReply(reply: string): RouteTier | undefined {
   return m ? (m[1].toLowerCase() as RouteTier) : undefined;
 }
 
-async function defaultJudge(text: string): Promise<string> {
-  const models = getRouterModels();
-  const res = await anthropicClient.messages.create(
-    {
-      model: models.judge,
-      max_tokens: 5,
-      system: buildJudgePrompt(getRouterBias()),
-      messages: [{ role: "user", content: text.slice(0, JUDGE_INPUT_CHARS) }],
-    },
-    { timeout: JUDGE_TIMEOUT_MS, maxRetries: 0 },
-  );
-  return res.content
-    .map((c) => (c.type === "text" ? c.text : ""))
-    .join(" ")
-    .trim();
+const DECIDER_TOOL_NAME = "route";
+
+const DeciderOutput = z.object({
+  tier: z.enum(["coding", "common"]),
+  reason: z.string().max(200).default(""),
+});
+
+/**
+ * Structured-output decider: one forced tool call on the judge-family model,
+ * validated with zod, so a verbose or off-format reply cannot be mis-parsed
+ * into a tier. Throws on anything unusable — routeModel() owns the fallback.
+ */
+export function createDecider(
+  client: Pick<Anthropic, "messages"> = anthropicClient,
+  getModel: () => string = () => getRouterModels().judge,
+): JudgeFn {
+  return async (text) => {
+    const res = await client.messages.create(
+      {
+        model: getModel(),
+        max_tokens: 120,
+        system:
+          buildJudgePrompt(getRouterBias()) +
+          `\n\nCall the ${DECIDER_TOOL_NAME} tool with your decision and a reason of at most 12 words.`,
+        tools: [
+          {
+            name: DECIDER_TOOL_NAME,
+            description: "Record which assistant tier should handle the message.",
+            input_schema: {
+              type: "object",
+              properties: {
+                tier: { type: "string", enum: ["coding", "common"] },
+                reason: { type: "string", description: "At most 12 words." },
+              },
+              required: ["tier", "reason"],
+            },
+          },
+        ],
+        tool_choice: { type: "tool", name: DECIDER_TOOL_NAME },
+        messages: [{ role: "user", content: text.slice(0, JUDGE_INPUT_CHARS) }],
+      },
+      { timeout: JUDGE_TIMEOUT_MS, maxRetries: 0 },
+    );
+    const block = res.content.find((c) => c.type === "tool_use");
+    if (!block || block.type !== "tool_use") throw new Error("decider returned no tool call");
+    const parsed = DeciderOutput.safeParse(block.input);
+    if (!parsed.success) throw new Error(`decider output invalid: ${parsed.error.issues[0]?.message ?? "?"}`);
+    return parsed.data;
+  };
 }
+
+const defaultJudge: JudgeFn = (text) => createDecider()(text);
 
 // ---------------------------------------------------------------------------
 // Decisions
@@ -261,12 +368,14 @@ export interface RouteDecision {
   hits: string[];
   judgeMs?: number;
   judgeError?: string;
+  /** The decider's own one-line justification, when it gave one. */
+  judgeReason?: string;
 }
 
 export interface RouteOptions extends HeuristicOptions {
   /** For the log line only. */
   channelId?: string;
-  /** Injectable for tests; defaults to the Sonnet judge. */
+  /** Injectable for tests; defaults to the structured decider. */
   judge?: JudgeFn;
 }
 
@@ -292,13 +401,23 @@ export async function routeModel(text: string, opts: RouteOptions = {}): Promise
   const judge = opts.judge ?? defaultJudge;
   try {
     const reply = await judge(text);
-    const tier = parseJudgeReply(reply);
+    const raw = typeof reply === "string" ? reply : reply.tier;
+    const judgeReason = typeof reply === "string" ? undefined : reply.reason || undefined;
+    const tier = parseJudgeReply(raw);
     const judgeMs = Date.now() - started;
     if (tier) {
       count(P.routerJudge);
-      return { tier, model: models[tier], source: "judge", escalated: false, hits: h.hits, judgeMs };
+      return {
+        tier,
+        model: models[tier],
+        source: "judge",
+        escalated: false,
+        hits: h.hits,
+        judgeMs,
+        ...(judgeReason ? { judgeReason } : {}),
+      };
     }
-    throw new Error(`judge replied "${reply.slice(0, 40)}"`);
+    throw new Error(`judge replied "${String(raw).slice(0, 40)}"`);
   } catch (err) {
     const judgeMs = Date.now() - started;
     const judgeError = err instanceof Error ? err.message : String(err);
@@ -390,12 +509,13 @@ function decisionFields(d: RouteDecision): Record<string, unknown> {
     hits: d.hits,
     ...(d.judgeMs !== undefined ? { judgeMs: d.judgeMs } : {}),
     ...(d.judgeError ? { judgeError: d.judgeError } : {}),
+    ...(d.judgeReason ? { judgeReason: d.judgeReason } : {}),
   };
 }
 
 /** Short model label for the in-channel `-# 🧭` line. */
 export function shortModelName(id: string): string {
-  return id.replace(/^bedrock-claude-/, "").replace(/^claude-/, "");
+  return id.replace(/^(?:bedrock|anthropic)[-.]claude-/, "").replace(/^claude-/, "");
 }
 
 /**
