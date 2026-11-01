@@ -770,7 +770,12 @@ export class SdkSession {
   private fallbackModelOption(): string | undefined {
     const primary =
       pickSdkEnv(process.env, "ANTHROPIC_MODEL") || resolveModel(this.modelOverride);
-    return resolveFallbackModel(primary, pickSdkEnv(process.env, "FALLBACK_MODEL"));
+    return resolveFallbackModel(
+      primary,
+      pickSdkEnv(process.env, "FALLBACK_MODEL"),
+      undefined,
+      process.env.ANTHROPIC_MODEL,
+    );
   }
 
   private buildOptions(): Options {
