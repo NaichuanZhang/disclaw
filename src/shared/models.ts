@@ -464,3 +464,42 @@ export function resolveModel(override?: string): string {
     return candidate(override) ?? candidate(process.env.ANTHROPIC_MODEL) ?? DEFAULT_MODEL;
   }
 }
+
+/** Strongest to weakest; a fallback only ever steps down this list. */
+const DOWNGRADE_ORDER: readonly string[] = ["mythos", "fable", "opus", "sonnet", "haiku"];
+
+/**
+ * The model an SDK session should fail over to when `primary` is overloaded or
+ * unavailable. Steps down one family at a time (opus -> sonnet -> haiku), picks
+ * the newest of that family from the catalog, and never returns `primary`
+ * itself. The weakest family has nowhere to step down to, so it falls back to
+ * another haiku version if one exists. `explicit` is the operator override:
+ * "off"/"none"/"false" disables, anything else wins verbatim (unless it equals
+ * `primary`). Sync, never throws; undefined means "no fallback".
+ */
+export function resolveFallbackModel(
+  primary: string,
+  explicit?: string,
+  ids?: readonly string[],
+): string | undefined {
+  try {
+    const pinned = candidate(explicit);
+    if (pinned) {
+      if (/^(off|none|false|0)$/i.test(pinned)) return undefined;
+      return pinned === primary ? undefined : pinned;
+    }
+    const catalog = (ids ?? getCachedSelectableModelIds() ?? FALLBACK_MODEL_IDS).filter(
+      (id) => id !== primary,
+    );
+    const own = parseModelFamily(primary)?.family;
+    const idx = own ? DOWNGRADE_ORDER.indexOf(own) : -1;
+    const lower = idx >= 0 ? DOWNGRADE_ORDER.slice(idx + 1) : FAMILY_FALLBACK_ORDER;
+    for (const family of lower) {
+      const hit = pickByFamily(family, catalog);
+      if (hit) return hit;
+    }
+    return own ? pickByFamily(own, catalog) : undefined;
+  } catch {
+    return undefined;
+  }
+}
