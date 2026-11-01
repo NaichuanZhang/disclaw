@@ -475,12 +475,15 @@ const DOWNGRADE_ORDER: readonly string[] = ["mythos", "fable", "opus", "sonnet",
  * itself. The weakest family has nowhere to step down to, so it falls back to
  * another haiku version if one exists. `explicit` is the operator override:
  * "off"/"none"/"false" disables, anything else wins verbatim (unless it equals
- * `primary`). Sync, never throws; undefined means "no fallback".
+ * `primary`). Without a pin, `envModel` (the ANTHROPIC_MODEL env value, passed
+ * in so this stays pure) is the default fallback unless it equals `primary`.
+ * Sync, never throws; undefined means "no fallback".
  */
 export function resolveFallbackModel(
   primary: string,
   explicit?: string,
   ids?: readonly string[],
+  envModel?: string,
 ): string | undefined {
   try {
     const pinned = candidate(explicit);
@@ -488,6 +491,8 @@ export function resolveFallbackModel(
       if (/^(off|none|false|0)$/i.test(pinned)) return undefined;
       return pinned === primary ? undefined : pinned;
     }
+    const fromEnv = candidate(envModel);
+    if (fromEnv && fromEnv !== primary) return fromEnv;
     const catalog = (ids ?? getCachedSelectableModelIds() ?? FALLBACK_MODEL_IDS).filter(
       (id) => id !== primary,
     );

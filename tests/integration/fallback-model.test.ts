@@ -51,4 +51,18 @@ describe("resolveFallbackModel", () => {
   it("uses the built-in list on a cold cache and never throws", () => {
     expect(resolveFallbackModel("anthropic.claude-opus-5-5")).toBe("anthropic.claude-sonnet-5-5");
   });
+
+  it("uses the env model as the default fallback unless it is the primary", () => {
+    expect(
+      resolveFallbackModel("anthropic.claude-opus-5-5", undefined, IDS, "my-env-model"),
+    ).toBe("my-env-model");
+    expect(
+      resolveFallbackModel("anthropic.claude-sonnet-5-5", undefined, IDS, "anthropic.claude-sonnet-5-5"),
+    ).toBe("anthropic.claude-haiku-5-5");
+  });
+
+  it("lets the explicit pin beat the env model", () => {
+    expect(resolveFallbackModel("a", "pinned", IDS, "my-env-model")).toBe("pinned");
+    expect(resolveFallbackModel("a", "off", IDS, "my-env-model")).toBeUndefined();
+  });
 });
