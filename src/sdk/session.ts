@@ -39,7 +39,7 @@ import type {
 import { DATA_DIR, PROJECT_ROOT } from "../shared/paths.js";
 import { getChannelConfig, setChannelConfig, addMessage } from "../db/index.js";
 import type { ChannelConfig } from "../db/index.js";
-import { resolveModel } from "../shared/models.js";
+import { resolveFallbackModel, resolveModel } from "../shared/models.js";
 import { modelFamilyEmoji, shortModelName } from "../shared/model-router.js";
 import { broadcastLog } from "../gateway/server.js";
 import { sendChunked } from "../shared/discord-utils.js";
@@ -762,9 +762,22 @@ export class SdkSession {
     ].join("\n");
   }
 
+  /**
+   * Model the SDK should fail over to when the primary is overloaded or
+   * unavailable. The SDK retries the primary at the start of each user turn,
+   * so an outage does not permanently demote the session.
+   */
+  private fallbackModelOption(): string | undefined {
+    const primary =
+      pickSdkEnv(process.env, "ANTHROPIC_MODEL") || resolveModel(this.modelOverride);
+    return resolveFallbackModel(primary, pickSdkEnv(process.env, "FALLBACK_MODEL"));
+  }
+
   private buildOptions(): Options {
     const resume = loadSdkSessionId(this.channelId);
+    const fallbackModel = this.fallbackModelOption();
     return {
+      ...(fallbackModel ? { fallbackModel } : {}),
       cwd: this.sessionDir(),
       env: buildSdkEnv({ overrides: this.modelEnvOverrides() }),
       // Unguarded by operator choice: no permission prompts, no canUseTool.
@@ -1121,7 +1134,12 @@ export class SdkSession {
     const cached = cacheRead > 0 ? ` (${fmtTokens(cacheRead)} cached)` : "";
     const durationPart = durationMs > 0 ? ` · ${fmtDuration(durationMs)}` : "";
 
-    const footer = `-# 📊 ${model} · ${fmtTokens(inTokens + cacheRead + cacheCreate)} in${cached} / ${fmtTokens(outTokens)} out · $${turnCost.toFixed(4)}${durationPart}`;
+    const failedOver =
+      this.activeModel && model !== "sdk" && model !== this.activeModel
+        ? ` (failover from ${shortModelName(this.activeModel)})`
+        : "";
+    if (failedOver) console.log(`[sdk] ${this.channelId} turn ran on ${model}, started on ${this.activeModel}`);
+    const footer = `-# 📊 ${model}${failedOver} · ${fmtTokens(inTokens + cacheRead + cacheCreate)} in${cached} / ${fmtTokens(outTokens)} out · $${turnCost.toFixed(4)}${durationPart}`;
     if (SDK_TURN_MAX_COST_USD > 0 && turnCost > SDK_TURN_MAX_COST_USD) {
       return `${footer}\n-# 💸 that turn cost $${turnCost.toFixed(4)}, over the $${SDK_TURN_MAX_COST_USD.toFixed(2)} soft cap`;
     }
