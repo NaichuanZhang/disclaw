@@ -55,6 +55,19 @@ import {
 } from "./session-dirs.js";
 import { createBridgeMcpServer } from "./bridge.js";
 import { SdkRelayQueue } from "./relay-queue.js";
+import type { EditableHandle } from "./relay-queue.js";
+import {
+  applyTaskEvent,
+  boardView,
+  emptyBoard,
+  findTask,
+  liveTaskIds,
+  renderBoard,
+  renderCompletionReport,
+  steerMessageText,
+  taskEventFromSdk,
+} from "./subagent-board.js";
+import type { BoardState, SubagentTask, TaskEvent } from "./subagent-board.js";
 import { getSkillService } from "../skills/service.js";
 import { getSoul } from "../soul/soul.js";
 import { recordSignal } from "../reflection/signals.js";
@@ -119,6 +132,9 @@ const TOOL_NAME_CACHE_LIMIT = 64;
  * before the session produced anything, so the queue is short by definition.
  */
 const REPLAY_LIMIT = 20;
+
+/** Earlier boards kept editable so background subagents can still report in. */
+const MAX_LIVE_BOARDS = 4;
 
 // ---------------------------------------------------------------------------
 // Channel config helpers
@@ -263,6 +279,38 @@ function summariseToolResult(content: unknown): string {
   return text.replace(/\s+/g, " ").trim().slice(0, TOOL_ERROR_CHARS);
 }
 
+/**
+ * Send a structured payload through a channel target. Real targets are
+ * discord.js channels whose `send` takes message options too; the interface
+ * only promises text so test fakes stay one-liners.
+ */
+function sendPayloadTo(target: SdkChannelTarget, payload: unknown): Promise<unknown> {
+  const send = target.send as unknown as (payload: unknown) => Promise<unknown>;
+  return send.call(target, payload);
+}
+
+async function editPayload(message: unknown, payload: unknown): Promise<unknown> {
+  const edit = (message as { edit?: (payload: unknown) => Promise<unknown> } | null)?.edit;
+  if (typeof edit !== "function") throw new Error("sent message is not editable");
+  return edit.call(message, payload);
+}
+
+/** Append the subagent tally to the usage footer, or stand alone without one. */
+export function foldSubagentReport(footer: string | null, report: string | null): string | null {
+  if (!report) return footer;
+  if (!footer) return `-# 🤖 ${report}`;
+  const [first, ...rest] = footer.split("\n");
+  return [`${first} · ${report}`, ...rest].join("\n");
+}
+
+/** Outcome of stopping one subagent. */
+export type SdkSubagentStopResult = "stopped" | "not_running" | "failed";
+
+interface SubagentBoardMessage {
+  handle: EditableHandle;
+  taskIds: Set<string>;
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -332,6 +380,15 @@ export class SdkSession {
   /** Order-preserving, rate-limited outbound relay to the channel. */
   private outbound: SdkRelayQueue;
 
+  /** Every subagent this session has seen (bounded inside the reducer). */
+  private tasks: BoardState = emptyBoard();
+  /** This turn's board message, created on the first task event. */
+  private board: SubagentBoardMessage | null = null;
+  /** Earlier boards still showing live tasks. */
+  private pastBoards: SubagentBoardMessage[] = [];
+  /** Tasks shown on this turn's board, for the footer report. */
+  private turnTaskIds = new Set<string>();
+
   constructor(target: SdkChannelTarget) {
     this.channelId = target.id;
     this.parentId = target.parentId ?? null;
@@ -340,6 +397,8 @@ export class SdkSession {
     // up without rebuilding the queue.
     this.outbound = new SdkRelayQueue({
       send: (text) => sendChunked(this.target, text),
+      sendPayload: (payload) => sendPayloadTo(this.target, payload),
+      editPayload,
       onError: (err) =>
         console.error(
           `[sdk] failed to send to ${this.channelId}:`,
@@ -590,6 +649,7 @@ export class SdkSession {
     this.turnActive = false;
     this.sawTurnOutput = false;
     this.steerCount = 0;
+    this.closeTurnBoard();
     this.stopTyping();
     // The debounce must never outlive the turn, or the tail of a transcript
     // sits in the buffer until the next message arrives.
@@ -994,6 +1054,8 @@ export class SdkSession {
         }
         this.checkTranscriptLocation(message as { transcript_path?: unknown });
       }
+      const event = taskEventFromSdk(message);
+      if (event) this.onTaskEvent(event);
       return;
     }
 
@@ -1001,9 +1063,20 @@ export class SdkSession {
       const blocks = (message as { message?: { content?: unknown } }).message
         ?.content;
       if (!Array.isArray(blocks)) return;
+      const parentToolUseId = (message as { parent_tool_use_id?: unknown }).parent_tool_use_id;
 
       for (const block of blocks) {
         const b = block as Record<string, unknown>;
+        // A subagent blocked on ask_user is the one reliable "needs you" signal.
+        if (
+          b.type === "tool_use" &&
+          typeof parentToolUseId === "string" &&
+          typeof b.id === "string" &&
+          typeof b.name === "string" &&
+          /(^|__)ask_user$/.test(b.name)
+        ) {
+          this.onTaskEvent({ kind: "ask_started", parentToolUseId, askToolUseId: b.id });
+        }
         if (b.type === "text" && typeof b.text === "string") {
           const text = b.text.trim();
           if (text) {
@@ -1032,6 +1105,9 @@ export class SdkSession {
       if (!Array.isArray(blocks)) return;
       for (const block of blocks) {
         const b = block as Record<string, unknown>;
+        if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
+          this.onTaskEvent({ kind: "ask_answered", askToolUseId: b.tool_use_id });
+        }
         if (b.type !== "tool_result" || b.is_error !== true) continue;
         const name =
           (typeof b.tool_use_id === "string" && this.toolNames.get(b.tool_use_id)) ||
@@ -1048,6 +1124,7 @@ export class SdkSession {
     }
 
     if (message.type === "result") {
+      const subagents = this.subagentReport();
       this.endTurn();
       // The CLI answered, so nothing is left to replay.
       this.pendingReplay = [];
@@ -1064,10 +1141,110 @@ export class SdkSession {
         this.say(`⚠️ Turn ended with an error: ${detail.slice(0, 500)}`);
       }
       const usageLine = this.formatUsage(message as Record<string, unknown>);
-      if (usageLine) this.say(usageLine);
+      const footer = foldSubagentReport(usageLine, subagents);
+      if (footer) this.say(footer);
       void this.outbound.flush();
       return;
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Subagent board
+  // -------------------------------------------------------------------------
+
+  /** Fold a task event into the session's map and refresh the boards showing it. */
+  private onTaskEvent(event: TaskEvent): void {
+    try {
+      const before = this.tasks;
+      this.tasks = applyTaskEvent(this.tasks, event);
+      if (this.tasks === before) return;
+      if (event.kind === "started") {
+        if (!this.board) this.openTurnBoard(event.taskId);
+        else this.board.taskIds.add(event.taskId);
+        this.turnTaskIds.add(event.taskId);
+      }
+      for (const board of this.boards()) this.refreshBoard(board);
+      this.retireFinishedBoards();
+    } catch (err) {
+      console.error(
+        `[sdk] subagent board update failed for ${this.channelId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /** One board per turn; it also carries subagents still running from before. */
+  private openTurnBoard(firstTaskId: string): void {
+    const taskIds = new Set([...liveTaskIds(this.tasks), firstTaskId]);
+    const view = boardView(this.tasks, taskIds);
+    this.board = { handle: this.outbound.pushEditable(renderBoard(view)), taskIds };
+    count(P.sdkSubagentBoard);
+  }
+
+  private refreshBoard(board: SubagentBoardMessage): void {
+    board.handle.update(renderBoard(boardView(this.tasks, board.taskIds)));
+  }
+
+  private boards(): SubagentBoardMessage[] {
+    return this.board ? [this.board, ...this.pastBoards] : [...this.pastBoards];
+  }
+
+  /** Stop editing past boards once nothing on them can change. */
+  private retireFinishedBoards(): void {
+    const live = new Set(liveTaskIds(this.tasks));
+    this.pastBoards = this.pastBoards.filter((board) => {
+      if ([...board.taskIds].some((id) => live.has(id))) return true;
+      void board.handle.finalize();
+      return false;
+    });
+  }
+
+  /** End of turn: the board stays editable only while it shows live tasks. */
+  private closeTurnBoard(): void {
+    this.turnTaskIds.clear();
+    if (!this.board) return;
+    this.pastBoards.unshift(this.board);
+    this.board = null;
+    for (const old of this.pastBoards.splice(MAX_LIVE_BOARDS)) void old.handle.finalize();
+    this.retireFinishedBoards();
+  }
+
+  private subagentReport(): string | null {
+    if (this.turnTaskIds.size === 0) return null;
+    return renderCompletionReport(boardView(this.tasks, this.turnTaskIds));
+  }
+
+  /** A subagent this session has seen, for the detail panel. */
+  subagent(taskId: string): SubagentTask | undefined {
+    return findTask(this.tasks, taskId);
+  }
+
+  /** Stop one running subagent via the SDK's native `Query.stopTask()`. */
+  async stopSubagent(taskId: string): Promise<SdkSubagentStopResult> {
+    const task = findTask(this.tasks, taskId);
+    const stream = this.stream;
+    if (!task || (task.status !== "running" && task.status !== "needs_you")) return "not_running";
+    if (this.closed || !stream) return "not_running";
+    try {
+      await stream.stopTask(taskId);
+      count(P.sdkSubagentStop);
+      return "stopped";
+    } catch (err) {
+      console.error(
+        `[sdk] stopTask(${taskId}) failed for ${this.channelId}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return "failed";
+    }
+  }
+
+  /** Inject a steer aimed at one subagent through the normal submit path. */
+  steerSubagent(taskId: string, text: string, userId: string, userName: string): boolean {
+    const task = findTask(this.tasks, taskId);
+    if (this.closed || !task || !text.trim()) return false;
+    count(P.sdkSubagentSteer);
+    this.submit({ text: steerMessageText(task, text), userId, userName });
+    return true;
   }
 
   /**
@@ -1358,6 +1535,47 @@ export async function interruptSdkSession(
   const session = sessions.get(channelId);
   if (!session || session.isClosed) return null;
   return session.interrupt();
+}
+
+/**
+ * The live session that knows a subagent: the channel's own session first,
+ * then any thread session under it (a board lives in the thread, but be
+ * forgiving about where the click came from).
+ */
+export function findSdkSubagent(
+  channelId: string,
+  taskId: string,
+): { session: SdkSession; task: SubagentTask } | null {
+  for (const id of [channelId, ...sdkSessionChannelIdsUnder(channelId)]) {
+    const session = sessions.get(id);
+    if (!session || session.isClosed) continue;
+    const task = session.subagent(taskId);
+    if (task) return { session, task };
+  }
+  return null;
+}
+
+/** Stop one subagent by task id. */
+export async function stopSdkSubagent(
+  channelId: string,
+  taskId: string,
+): Promise<SdkSubagentStopResult> {
+  const found = findSdkSubagent(channelId, taskId);
+  if (!found) return "not_running";
+  return found.session.stopSubagent(taskId);
+}
+
+/** Steer one subagent by task id. False when no live session knows it. */
+export function steerSdkSubagent(
+  channelId: string,
+  taskId: string,
+  text: string,
+  userId: string,
+  userName: string,
+): boolean {
+  const found = findSdkSubagent(channelId, taskId);
+  if (!found) return false;
+  return found.session.steerSubagent(taskId, text, userId, userName);
 }
 
 /** Stop the SDK session for one channel. Returns true if one was running. */
