@@ -62,6 +62,7 @@ import type { SkillService } from "../skills/service.js";
 import type { CronService } from "../cron/service.js";
 import type { CronJob, CronSchedule, CronPayload, CronDelivery } from "../cron/types.js";
 import { countCommand } from "../metrics/counters.js";
+import { handleSubagentInteraction, isSubagentCustomId } from "./subagent-interactions.js";
 
 // ---------------------------------------------------------------------------
 // Service references (set from index.ts after init)
@@ -435,6 +436,15 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
   // (Discord allows a single response within ~3s and has no defer equivalent).
   if (interaction.isAutocomplete()) {
     await handleAutocomplete(interaction);
+    return;
+  }
+
+  // Subagent board controls and the steer modal they open.
+  if (
+    (interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit()) &&
+    isSubagentCustomId(interaction.customId)
+  ) {
+    await handleSubagentInteraction(interaction);
     return;
   }
 

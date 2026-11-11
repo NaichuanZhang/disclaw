@@ -60,6 +60,10 @@ export const P = {
   sdkTurnSubmit: "sdk.turn.submit",
   sdkSessionInterrupt: "sdk.session.interrupt",
   sdkSessionStop: "sdk.session.stop",
+  sdkSubagentBoard: "sdk.subagent.board",
+  sdkSubagentDetail: "sdk.subagent.detail",
+  sdkSubagentStop: "sdk.subagent.stop",
+  sdkSubagentSteer: "sdk.subagent.steer",
 
   // Memory
   memorySearchLocal: "memory.search.local",
@@ -135,6 +139,10 @@ export const FEATURE_PATHS: PathSpec[] = [
     description: "SDK session turn interrupted (/interrupt)",
   },
   { path: P.sdkSessionStop, kind: "feature", description: "SDK session stopped" },
+  { path: P.sdkSubagentBoard, kind: "feature", description: "Subagent board posted for a turn" },
+  { path: P.sdkSubagentDetail, kind: "feature", description: "Subagent detail panel opened" },
+  { path: P.sdkSubagentStop, kind: "feature", description: "Subagent stopped from its board" },
+  { path: P.sdkSubagentSteer, kind: "feature", description: "Subagent steered from its board" },
 
   // --- Memory ---
   { path: P.memorySearchLocal, kind: "feature", description: "Local FTS5 memory search" },

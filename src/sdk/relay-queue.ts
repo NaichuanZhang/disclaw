@@ -29,6 +29,17 @@ const DEFAULT_WINDOW_MS = 5_000;
  */
 const DEFAULT_MAX_MERGED_CHARS = 1_900;
 
+/** Discord rate-limits edits per message; one per 5s keeps a live board well clear. */
+const DEFAULT_EDIT_INTERVAL_MS = 5_000;
+
+/** A message sent once and then edited in place (the subagent board). */
+export interface EditableHandle {
+  /** Replace the payload. Edits are coalesced; the latest payload wins. */
+  update(payload: unknown): void;
+  /** Optionally update, then push the latest payload out now, ignoring the interval. */
+  finalize(payload?: unknown): Promise<void>;
+}
+
 export interface SdkRelayQueueOptions {
   /** Performs the actual send. May chunk internally. */
   send: (text: string) => Promise<unknown>;
@@ -46,12 +57,22 @@ export interface SdkRelayQueueOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Called when a send throws. Sends are never retried. */
   onError?: (err: unknown) => void;
+  /** Sends a structured payload (embeds/components); resolves to the sent message. */
+  sendPayload?: (payload: unknown) => Promise<unknown>;
+  /** Edits a message previously returned by `sendPayload`. */
+  editPayload?: (message: unknown, payload: unknown) => Promise<unknown>;
+  /** Minimum gap between edits of one editable message. */
+  editIntervalMs?: number;
 }
 
-interface Entry {
-  text: string;
-  coalesce: boolean;
-}
+type Entry =
+  | { kind: "text"; text: string; coalesce: boolean }
+  | { kind: "payload"; payload: unknown; resolve: (message: unknown) => void };
+
+const NOOP_HANDLE: EditableHandle = {
+  update: () => {},
+  finalize: async () => {},
+};
 
 export class SdkRelayQueue {
   private buffer: Entry[] = [];
@@ -59,6 +80,7 @@ export class SdkRelayQueue {
   private chain: Promise<void> = Promise.resolve();
   private sendTimes: number[] = [];
   private closed = false;
+  private editables = new Set<EditableMessage>();
 
   private readonly send: (text: string) => Promise<unknown>;
   private readonly debounceMs: number;
@@ -68,6 +90,9 @@ export class SdkRelayQueue {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly onError?: (err: unknown) => void;
+  private readonly sendPayload?: (payload: unknown) => Promise<unknown>;
+  private readonly editPayload?: (message: unknown, payload: unknown) => Promise<unknown>;
+  readonly editIntervalMs: number;
 
   constructor(options: SdkRelayQueueOptions) {
     this.send = options.send;
@@ -80,6 +105,9 @@ export class SdkRelayQueue {
       options.sleep ??
       ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.onError = options.onError;
+    this.sendPayload = options.sendPayload;
+    this.editPayload = options.editPayload;
+    this.editIntervalMs = options.editIntervalMs ?? DEFAULT_EDIT_INTERVAL_MS;
   }
 
   /** True when nothing is waiting to be sent. */
@@ -93,7 +121,7 @@ export class SdkRelayQueue {
    */
   push(text: string): void {
     if (this.closed || !text) return;
-    this.buffer.push({ text, coalesce: false });
+    this.buffer.push({ kind: "text", text, coalesce: false });
     void this.flush();
   }
 
@@ -103,15 +131,65 @@ export class SdkRelayQueue {
    */
   pushCoalescing(text: string): void {
     if (this.closed || !text) return;
-    this.buffer.push({ text, coalesce: true });
+    this.buffer.push({ kind: "text", text, coalesce: true });
     this.scheduleFlush();
   }
 
-  /** Send everything queued now. Resolves once the buffer has drained. */
+  /**
+   * Send a structured message that will later be edited in place. The first
+   * send takes its place in the ordered, throttled chain; edits run on their
+   * own per-message schedule so a 5s edit gap never holds up text.
+   */
+  pushEditable(payload: unknown): EditableHandle {
+    if (this.closed || !this.sendPayload) return NOOP_HANDLE;
+    const editable = new EditableMessage(this, payload);
+    this.editables.add(editable);
+    return editable;
+  }
+
+  /** Send everything queued now, and push out pending edits. */
   flush(): Promise<void> {
     this.clearTimer();
     this.chain = this.chain.then(() => this.drain());
-    return this.chain;
+    const chain = this.chain;
+    if (this.editables.size === 0) return chain;
+    return Promise.all([chain, ...[...this.editables].map((e) => e.flushNow())]).then(() => {});
+  }
+
+  /** @internal queue a payload send behind everything already queued. */
+  enqueuePayload(payload: unknown): Promise<unknown> {
+    if (this.closed || !this.sendPayload) return Promise.resolve(null);
+    return new Promise<unknown>((resolve) => {
+      this.buffer.push({ kind: "payload", payload, resolve });
+      void this.flush();
+    });
+  }
+
+  /** @internal edit an editable's message; failures are reported, never thrown. */
+  async applyEdit(message: unknown, payload: unknown): Promise<boolean> {
+    if (!this.editPayload) return false;
+    try {
+      await this.editPayload(message, payload);
+      return true;
+    } catch (err) {
+      this.onError?.(err);
+      return false;
+    }
+  }
+
+  /** @internal */
+  get clock(): { now: () => number; sleep: (ms: number) => Promise<void> } {
+    return { now: this.now, sleep: this.sleep };
+  }
+
+  /** @internal */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /** @internal */
+  forget(editable: EditableMessage): void {
+    this.editables.delete(editable);
   }
 
   /** Flush, then refuse further work. Safe to call more than once. */
@@ -147,6 +225,18 @@ export class SdkRelayQueue {
 
   private async drain(): Promise<void> {
     while (this.buffer.length > 0) {
+      const head = this.buffer[0];
+      if (head.kind === "payload") {
+        this.buffer.shift();
+        await this.throttle();
+        try {
+          head.resolve((await this.sendPayload?.(head.payload)) ?? null);
+        } catch (err) {
+          this.onError?.(err);
+          head.resolve(null);
+        }
+        continue;
+      }
       const batch = this.takeBatch();
       await this.throttle();
       try {
@@ -164,12 +254,14 @@ export class SdkRelayQueue {
    * consecutive coalescing entries as fit in one message.
    */
   private takeBatch(): string {
-    const first = this.buffer.shift()!;
+    const first = this.buffer.shift() as Extract<Entry, { kind: "text" }>;
     if (!first.coalesce) return first.text;
 
     let text = first.text;
-    while (this.buffer.length > 0 && this.buffer[0].coalesce) {
-      const merged = `${text}\n${this.buffer[0].text}`;
+    while (this.buffer.length > 0) {
+      const next = this.buffer[0];
+      if (next.kind !== "text" || !next.coalesce) break;
+      const merged = `${text}\n${next.text}`;
       if (merged.length > this.maxMergedChars) break;
       text = merged;
       this.buffer.shift();
@@ -192,5 +284,96 @@ export class SdkRelayQueue {
 
   private forgetOldSends(now: number): void {
     this.sendTimes = this.sendTimes.filter((t) => now - t < this.windowMs);
+  }
+}
+
+/**
+ * One editable message. The initial send goes through the queue's chain; after
+ * that a small loop applies the newest pending payload at most once per
+ * `editIntervalMs`, and `flushNow()` cuts the wait short.
+ */
+class EditableMessage implements EditableHandle {
+  private message: unknown = null;
+  private readonly sent: Promise<void>;
+  private pending: { payload: unknown } | null = null;
+  private lastEditAt: number;
+  private loop: Promise<void> | null = null;
+  private kick: (() => void) | null = null;
+  private forcing = false;
+  private fellBack = false;
+  private finalized = false;
+
+  constructor(
+    private readonly queue: SdkRelayQueue,
+    payload: unknown,
+  ) {
+    this.lastEditAt = queue.clock.now();
+    this.sent = queue.enqueuePayload(payload).then((message) => {
+      this.message = message;
+      this.lastEditAt = queue.clock.now();
+    });
+  }
+
+  update(payload: unknown): void {
+    if (this.finalized || this.queue.isClosed) return;
+    this.pending = { payload };
+    this.ensureLoop();
+  }
+
+  async finalize(payload?: unknown): Promise<void> {
+    if (payload !== undefined) this.update(payload);
+    this.finalized = true;
+    await this.flushNow();
+    this.queue.forget(this);
+  }
+
+  /** Apply any pending payload now, ignoring the interval. Never throws. */
+  async flushNow(): Promise<void> {
+    if (!this.loop) return;
+    this.forcing = true;
+    this.kick?.();
+    try {
+      await this.loop;
+    } finally {
+      this.forcing = false;
+    }
+  }
+
+  private ensureLoop(): void {
+    if (this.loop) return;
+    this.loop = this.run().catch(() => {});
+  }
+
+  private async run(): Promise<void> {
+    await this.sent;
+    const { now, sleep } = this.queue.clock;
+    while (this.pending) {
+      const wait = this.lastEditAt + this.queue.editIntervalMs - now();
+      if (wait > 0 && !this.forcing) {
+        await Promise.race([
+          sleep(wait),
+          new Promise<void>((resolve) => {
+            this.kick = resolve;
+          }),
+        ]);
+        this.kick = null;
+      }
+      const next = this.pending;
+      this.pending = null;
+      if (!next) break;
+      await this.apply(next.payload);
+      this.lastEditAt = now();
+    }
+    // Synchronous with the loop condition, so an update() can't slip between.
+    this.loop = null;
+  }
+
+  private async apply(payload: unknown): Promise<void> {
+    if (this.message && (await this.queue.applyEdit(this.message, payload))) return;
+    // A deleted (or never-sent) message gets one fresh send, then we give up
+    // quietly rather than spamming the channel with copies.
+    if (this.fellBack) return;
+    this.fellBack = true;
+    this.message = await this.queue.enqueuePayload(payload);
   }
 }
