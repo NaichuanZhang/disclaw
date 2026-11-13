@@ -69,6 +69,8 @@ Tools are defined across multiple files and bridged into every session as an in-
 
 The catalog comes from `GET {ANTHROPIC_BASE_URL}/v1/models` (LiteLLM/OpenAI-shaped), TTL-cached for 5 minutes, with `FALLBACK_MODEL_IDS` used when the proxy is unreachable so selection never presents an empty list. `warmModelCache()` runs (unawaited) at boot. `resolveModel()` is synchronous, never throws, and self-heals a model the proxy no longer advertises — but only against an already-warm cache, so it never blocks a message.
 
+**Env pin disclosure**: `SDK_ANTHROPIC_MODEL` overrides `/model`, the router and cron overrides for every SDK session, but `describeModelResolution()` deliberately ignores it, so the `/model` embed and the set/reset/router replies read `getSdkModelPin()` and use `describeSdkPinOverride()` to show the pin as Active and warn that the saved selection is being overridden.
+
 **Discord surface**: `/model` shows the active model and its source; `/model name:<id>` persists a bot-wide selection (validated against the catalog); `/model reset:true` (or `name:default`) clears it; `/model refresh:true` busts the cache. `/cron add model:<id>` and `/cron set-model <id> <model>` set a per-job override stored in `CronPayload.model`.
 
 Autocomplete for these options is **cache-only** (`getCachedSelectableModelIds()`) and never awaits the network — Discord allows one response within ~3s and has no defer equivalent, while the catalog fetch timeout alone is 5s. A cold cache serves the fallback list and fires a background warm.

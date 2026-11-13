@@ -48,8 +48,10 @@ import {
 } from "../shared/models.js";
 import {
   AUTO_MODEL_VALUE,
+  describeSdkPinOverride,
   enableAutoMode,
   getRouterBias,
+  getSdkModelPin,
   getRouterFamilies,
   getRouterModels,
   isAutoMode,
@@ -676,6 +678,12 @@ function describeSource(source: string): string {
   }
 }
 
+/** Appended to /model replies when SDK_ANTHROPIC_MODEL silently overrides the choice. */
+function pinWarning(): string {
+  const w = describeSdkPinOverride(getSdkModelPin(), getSelectedModel());
+  return w ? `\n${w}` : "";
+}
+
 function routerTierSummary(): string {
   const m = getRouterModels();
   return `\`${shortModelName(m.coding)}\` for coding, \`${shortModelName(m.common)}\` for everything else`;
@@ -707,13 +715,14 @@ async function handleModel(
     setModelRouterEnabled(router);
     const pinned = getSelectedModel();
     await interaction.editReply({
-      content: router
+      content: (router
         ? `✅ Model router **on** — new threads start on ${routerTierSummary()}.` +
           (pinned
             ? `\n-# \`${pinned}\` is still pinned via /model, so the router stands down until \`/model name:auto\`.`
             : "")
         : `✅ Model router **off** — new threads use \`${describeModelResolution().model}\` ` +
-          `(${describeSource(describeModelResolution().source).toLowerCase()}).`,
+          `(${describeSource(describeModelResolution().source).toLowerCase()}).`) +
+        pinWarning(),
     });
     return;
   }
@@ -726,7 +735,8 @@ async function handleModel(
         `✅ Cleared the saved selection. ` +
         (isAutoMode()
           ? `Auto mode — new threads are routed per message (${routerTierSummary()}); cron jobs without their own model use \`${after.model}\`.`
-          : `Now using \`${after.model}\` (${describeSource(after.source).toLowerCase()}).`),
+          : `Now using \`${after.model}\` (${describeSource(after.source).toLowerCase()}).`) +
+        pinWarning(),
     });
     return;
   }
@@ -751,9 +761,8 @@ async function handleModel(
           ? `✅ **Auto mode** — new threads are routed per message: ${routerTierSummary()}. ` +
             `Cron jobs without their own model use \`${after.model}\`.\n` +
             `-# Threads already running keep their model; \`/model name:<id>\` pins one again.`
-          : `⚠️ Router switched on and the saved selection cleared, but \`SDK_ANTHROPIC_MODEL\` ` +
-            `is set in the environment and pins every session to \`${after.model}\`. ` +
-            `Unset it and restart to get auto mode.`,
+          : `⚠️ Router switched on and the saved selection cleared, but auto mode is not active.\n` +
+            (describeSdkPinOverride(getSdkModelPin()) ?? ""),
       });
       return;
     }
@@ -767,7 +776,8 @@ async function handleModel(
           `✅ Cleared the saved selection. ` +
           (isAutoMode()
             ? `Auto mode — new threads are routed per message (${routerTierSummary()}).`
-            : `Now using \`${after.model}\` (${describeSource(after.source).toLowerCase()}).`),
+            : `Now using \`${after.model}\` (${describeSource(after.source).toLowerCase()}).`) +
+          pinWarning(),
       });
       return;
     }
@@ -782,7 +792,8 @@ async function handleModel(
         (isModelRouterEnabled()
           ? `The model router stands down while a selection is pinned — \`/model name:auto\` hands control back to it. `
           : "") +
-        `Voice and the cycling coach are configured separately.`,
+        `Voice and the cycling coach are configured separately.` +
+        pinWarning(),
     });
     return;
   }
@@ -790,7 +801,7 @@ async function handleModel(
   // No arguments — report the current resolution.
   const resolution = describeModelResolution();
   const selectable = selectableModelIds(list);
-  const active = list.models.find((m) => m.id === resolution.model);
+  const active = list.models.find((m) => m.id === (getSdkModelPin() ?? resolution.model));
   const envUnknown =
     resolution.env && list.source !== "fallback" && !list.models.some((m) => m.id === resolution.env);
 
@@ -801,6 +812,7 @@ async function handleModel(
 
   const auto = isAutoMode();
   const tiers = getRouterModels();
+  const sdkPin = getSdkModelPin();
   const embed = new EmbedBuilder()
     .setTitle("🧠 Model")
     .addFields(
@@ -808,12 +820,16 @@ async function handleModel(
         name: "Active",
         value: auto
           ? `**auto** — \`${shortModelName(tiers.coding)}\` coding / \`${shortModelName(tiers.common)}\` common`
-          : `\`${resolution.model}\``,
+          : `\`${sdkPin ?? resolution.model}\``,
         inline: true,
       },
       {
         name: "Source",
-        value: auto ? "Router (per thread)" : describeSource(resolution.source),
+        value: auto
+          ? "Router (per thread)"
+          : sdkPin
+            ? "`SDK_ANTHROPIC_MODEL` env (overrides /model)"
+            : describeSource(resolution.source),
         inline: true,
       },
       {
@@ -828,6 +844,15 @@ async function handleModel(
           : "_Not set_",
         inline: false,
       },
+      ...(sdkPin
+        ? [
+            {
+              name: "Env pin",
+              value: describeSdkPinOverride(sdkPin, resolution.saved) ?? "",
+              inline: false,
+            },
+          ]
+        : []),
       { name: "Available", value: availability, inline: false },
       {
         name: `Router (${isModelRouterEnabled() ? "on" : "off"})`,
@@ -835,7 +860,7 @@ async function handleModel(
         inline: false,
       },
     )
-    .setColor(resolution.healed || envUnknown ? 0xfee75c : 0x5865f2)
+    .setColor(resolution.healed || envUnknown || sdkPin ? 0xfee75c : 0x5865f2)
     .setFooter({
       text: "/model name:auto to route per thread · /model name:<model> to pin · cron jobs keep their own override",
     });

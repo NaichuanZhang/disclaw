@@ -17,6 +17,8 @@ import {
   classifyHeuristic,
   enableAutoMode,
   createDecider,
+  describeSdkPinOverride,
+  getSdkModelPin,
   getRouterModels,
   isAutoMode,
   isModelRouterEnabled,
@@ -426,5 +428,38 @@ describe("structured decider", () => {
     const bad = await routeModel("how do I set up a cron for this", { judge: createDecider(client, () => "m") });
     expect(bad.source).toBe("judge_fallback");
     expect(bad.tier).toBe("common");
+  });
+});
+
+describe("SDK_ANTHROPIC_MODEL pin disclosure", () => {
+  beforeEach(() => {
+    delete process.env.SDK_ANTHROPIC_MODEL;
+    delete process.env.PILOT_ANTHROPIC_MODEL;
+  });
+  afterAll(() => {
+    delete process.env.SDK_ANTHROPIC_MODEL;
+  });
+
+  it("reads the pin from SDK_ and legacy PILOT_ env names", () => {
+    expect(getSdkModelPin()).toBeUndefined();
+    process.env.PILOT_ANTHROPIC_MODEL = "legacy-model";
+    expect(getSdkModelPin()).toBe("legacy-model");
+    process.env.SDK_ANTHROPIC_MODEL = "pinned-model";
+    expect(getSdkModelPin()).toBe("pinned-model");
+  });
+
+  it("says nothing without a pin", () => {
+    expect(describeSdkPinOverride(undefined, "anthropic.claude-opus-5-5")).toBeUndefined();
+  });
+
+  it("names both the pin and the overridden /model selection", () => {
+    const text = describeSdkPinOverride("sonnet-x", "opus-y");
+    expect(text).toContain("sonnet-x");
+    expect(text).toContain("instead of `opus-y`");
+  });
+
+  it("omits the 'instead of' clause when the selection matches or is unset", () => {
+    expect(describeSdkPinOverride("same", "same")).not.toContain("instead of");
+    expect(describeSdkPinOverride("same", null)).not.toContain("instead of");
   });
 });
