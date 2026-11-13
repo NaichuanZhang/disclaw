@@ -155,8 +155,24 @@ export function setModelRouterEnabled(enabled: boolean): void {
 }
 
 /** The operator pin that bypasses every model choice for SDK sessions. */
-function sdkModelPin(): string | undefined {
+export function getSdkModelPin(): string | undefined {
   return envValue("SDK_ANTHROPIC_MODEL") ?? envValue("PILOT_ANTHROPIC_MODEL");
+}
+
+/**
+ * Warning text for when the `SDK_ANTHROPIC_MODEL` env pin is set. It outranks
+ * `/model`, the router and per-cron overrides for every SDK session, so any
+ * /model reply that implies a choice took effect must say so. Undefined when
+ * there is no pin.
+ */
+export function describeSdkPinOverride(pin: string | undefined, selected?: string | null): string | undefined {
+  if (!pin) return undefined;
+  const instead = selected && selected !== pin ? ` instead of \`${selected}\`` : "";
+  return (
+    `⚠️ \`SDK_ANTHROPIC_MODEL\` is set to \`${pin}\` in the environment. It overrides /model, the router ` +
+    `and cron model overrides, so sessions run on \`${pin}\`${instead}. ` +
+    `Unset it in \`.env\` and restart for /model to take effect.`
+  );
 }
 
 /** The `/model name:` value that means "let the router decide". */
@@ -170,7 +186,7 @@ export const AUTO_MODEL_VALUE = "auto";
  */
 export function isAutoMode(): boolean {
   try {
-    return isModelRouterEnabled() && !getSelectedModel() && !sdkModelPin();
+    return isModelRouterEnabled() && !getSelectedModel() && !getSdkModelPin();
   } catch {
     return false;
   }
@@ -469,7 +485,7 @@ export async function planSessionModel(input: SessionModelInput): Promise<Sessio
 
   if (!input.text?.trim()) return skip("empty");
 
-  const envPin = sdkModelPin();
+  const envPin = getSdkModelPin();
   if (envPin) return skip("sdk_env_pin", { model: envPin });
 
   const pinned = getSelectedModel();
