@@ -678,7 +678,7 @@ function describeSource(source: string): string {
   }
 }
 
-/** Appended to /model replies when SDK_ANTHROPIC_MODEL silently overrides the choice. */
+/** Appended to /model replies when SDK_ANTHROPIC_MODEL is in effect (no saved selection). */
 function pinWarning(): string {
   const w = describeSdkPinOverride(getSdkModelPin(), getSelectedModel());
   return w ? `\n${w}` : "";
@@ -801,7 +801,8 @@ async function handleModel(
   // No arguments — report the current resolution.
   const resolution = describeModelResolution();
   const selectable = selectableModelIds(list);
-  const active = list.models.find((m) => m.id === (getSdkModelPin() ?? resolution.model));
+  const sdkPin = resolution.saved ? undefined : getSdkModelPin();
+  const active = list.models.find((m) => m.id === (sdkPin ?? resolution.model));
   const envUnknown =
     resolution.env && list.source !== "fallback" && !list.models.some((m) => m.id === resolution.env);
 
@@ -812,7 +813,6 @@ async function handleModel(
 
   const auto = isAutoMode();
   const tiers = getRouterModels();
-  const sdkPin = getSdkModelPin();
   const embed = new EmbedBuilder()
     .setTitle("🧠 Model")
     .addFields(
@@ -828,7 +828,7 @@ async function handleModel(
         value: auto
           ? "Router (per thread)"
           : sdkPin
-            ? "`SDK_ANTHROPIC_MODEL` env (overrides /model)"
+            ? "`SDK_ANTHROPIC_MODEL` env"
             : describeSource(resolution.source),
         inline: true,
       },

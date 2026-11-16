@@ -39,7 +39,7 @@ import type {
 import { DATA_DIR, PROJECT_ROOT } from "../shared/paths.js";
 import { getChannelConfig, setChannelConfig, addMessage } from "../db/index.js";
 import type { ChannelConfig } from "../db/index.js";
-import { resolveFallbackModel, resolveModel } from "../shared/models.js";
+import { getSelectedModel, resolveFallbackModel, resolveModel } from "../shared/models.js";
 import { modelFamilyEmoji, shortModelName } from "../shared/model-router.js";
 import { broadcastLog } from "../gateway/server.js";
 import { sendChunked } from "../shared/discord-utils.js";
@@ -716,12 +716,12 @@ export class SdkSession {
    *
    * The child used to take whatever `ANTHROPIC_MODEL` the bot happened to have,
    * so `/model` (and a cron job's per-job model) applied to every runtime
-   * except this one. `SDK_ANTHROPIC_MODEL` still wins — it is the explicit
-   * "pin sessions to their own model" escape hatch — so we only override when it is
-   * unset.
+   * except this one. `SDK_ANTHROPIC_MODEL` is the operator's default pin: it
+   * applies only when there is no `/model` selection and no explicit override
+   * (a cron job's model), both of which outrank it.
    */
   private modelEnvOverrides(): Record<string, string> {
-    if (pickSdkEnv(process.env, "ANTHROPIC_MODEL")) return {};
+    if (pickSdkEnv(process.env, "ANTHROPIC_MODEL") && !this.modelOverride && !getSelectedModel()) return {};
     const model = resolveModel(this.modelOverride);
     return model ? { ANTHROPIC_MODEL: model } : {};
   }

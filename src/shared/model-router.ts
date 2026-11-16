@@ -9,7 +9,7 @@
 //
 // Where this sits in model precedence (interactive sessions only — cron keeps
 // its per-job override):
-//   SDK_ANTHROPIC_MODEL pin > /model selection > router > ANTHROPIC_MODEL env
+//   /model selection > SDK_ANTHROPIC_MODEL pin > router > ANTHROPIC_MODEL env
 //   > DEFAULT_MODEL
 // An explicit /model pick is a human decision, so the router stands down while
 // one is set; /model reset or /model name:auto hands control back.
@@ -154,24 +154,22 @@ export function setModelRouterEnabled(enabled: boolean): void {
   setConfig(ROUTER_CONFIG_KEY, enabled ? "on" : "off");
 }
 
-/** The operator pin that bypasses every model choice for SDK sessions. */
+/** The operator's default model for SDK sessions; a `/model` selection outranks it. */
 export function getSdkModelPin(): string | undefined {
   return envValue("SDK_ANTHROPIC_MODEL") ?? envValue("PILOT_ANTHROPIC_MODEL");
 }
 
 /**
- * Warning text for when the `SDK_ANTHROPIC_MODEL` env pin is set. It outranks
- * `/model`, the router and per-cron overrides for every SDK session, so any
- * /model reply that implies a choice took effect must say so. Undefined when
- * there is no pin.
+ * Warning text for when the `SDK_ANTHROPIC_MODEL` env pin is in effect. It
+ * outranks the router and the default but yields to a `/model` selection, so
+ * there is nothing to warn about once one is saved. Undefined when there is no
+ * pin or a selection is saved.
  */
 export function describeSdkPinOverride(pin: string | undefined, selected?: string | null): string | undefined {
-  if (!pin) return undefined;
-  const instead = selected && selected !== pin ? ` instead of \`${selected}\`` : "";
+  if (!pin || selected) return undefined;
   return (
-    `⚠️ \`SDK_ANTHROPIC_MODEL\` is set to \`${pin}\` in the environment. It overrides /model, the router ` +
-    `and cron model overrides, so sessions run on \`${pin}\`${instead}. ` +
-    `Unset it in \`.env\` and restart for /model to take effect.`
+    `⚠️ \`SDK_ANTHROPIC_MODEL\` is set to \`${pin}\` in the environment. It overrides the router ` +
+    `and the default, so sessions run on \`${pin}\`. \`/model name:<id>\` takes precedence over it.`
   );
 }
 
@@ -485,11 +483,11 @@ export async function planSessionModel(input: SessionModelInput): Promise<Sessio
 
   if (!input.text?.trim()) return skip("empty");
 
-  const envPin = getSdkModelPin();
-  if (envPin) return skip("sdk_env_pin", { model: envPin });
-
   const pinned = getSelectedModel();
   if (pinned) return skip("model_pin", { model: pinned });
+
+  const envPin = getSdkModelPin();
+  if (envPin) return skip("sdk_env_pin", { model: envPin });
 
   if (!isModelRouterEnabled()) return skip("disabled");
 
