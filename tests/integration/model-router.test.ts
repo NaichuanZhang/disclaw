@@ -283,6 +283,15 @@ describe("planSessionModel", () => {
     });
   });
 
+  it("lets a /model selection outrank the SDK env pin", async () => {
+    process.env.SDK_ANTHROPIC_MODEL = "bedrock-claude-sonnet-5-5";
+    setSelectedModel("bedrock-claude-opus-5-1m");
+    expect(await planSessionModel({ ...base, text: "fix the bug" })).toEqual({
+      action: "skip",
+      reason: "model_pin",
+    });
+  });
+
   it("stands down when switched off", async () => {
     setModelRouterEnabled(false);
     expect(await planSessionModel({ ...base, text: "fix the bug" })).toEqual({
@@ -452,14 +461,13 @@ describe("SDK_ANTHROPIC_MODEL pin disclosure", () => {
     expect(describeSdkPinOverride(undefined, "anthropic.claude-opus-5-5")).toBeUndefined();
   });
 
-  it("names both the pin and the overridden /model selection", () => {
-    const text = describeSdkPinOverride("sonnet-x", "opus-y");
+  it("names the pin and says /model outranks it when no selection is saved", () => {
+    const text = describeSdkPinOverride("sonnet-x", null);
     expect(text).toContain("sonnet-x");
-    expect(text).toContain("instead of `opus-y`");
+    expect(text).toContain("/model name:<id>");
   });
 
-  it("omits the 'instead of' clause when the selection matches or is unset", () => {
-    expect(describeSdkPinOverride("same", "same")).not.toContain("instead of");
-    expect(describeSdkPinOverride("same", null)).not.toContain("instead of");
+  it("says nothing once a /model selection is saved, since it outranks the pin", () => {
+    expect(describeSdkPinOverride("sonnet-x", "opus-y")).toBeUndefined();
   });
 });

@@ -80,10 +80,12 @@ describe("a session honours a model override", () => {
     expect(sessionSrc).toContain("buildSdkEnv({ overrides: this.modelEnvOverrides() })");
   });
 
-  it("still lets an SDK_ANTHROPIC_MODEL in the environment win", () => {
+  it("lets an SDK_ANTHROPIC_MODEL in the environment win only without a /model selection or explicit override", () => {
     const overrides = fnBody(sessionSrc, "private modelEnvOverrides()");
     // pickSdkEnv reads SDK_ANTHROPIC_MODEL, then the pre-rename PILOT_ name.
     expect(overrides).toContain('pickSdkEnv(process.env, "ANTHROPIC_MODEL")');
+    expect(overrides).toContain("!this.modelOverride");
+    expect(overrides).toContain("!getSelectedModel()");
     expect(overrides.indexOf('pickSdkEnv(process.env, "ANTHROPIC_MODEL")')).toBeLessThan(
       overrides.indexOf("resolveModel(this.modelOverride)"),
     );
