@@ -51,6 +51,7 @@ import {
   describeSdkPinOverride,
   enableAutoMode,
   getRouterBias,
+  getEffectiveSdkModelPin,
   getSdkModelPin,
   getRouterFamilies,
   getRouterModels,
@@ -680,7 +681,7 @@ function describeSource(source: string): string {
 
 /** Appended to /model replies when SDK_ANTHROPIC_MODEL is in effect (no saved selection). */
 function pinWarning(): string {
-  const w = describeSdkPinOverride(getSdkModelPin(), getSelectedModel());
+  const w = describeSdkPinOverride(getEffectiveSdkModelPin(), getSelectedModel());
   return w ? `\n${w}` : "";
 }
 
@@ -759,10 +760,11 @@ async function handleModel(
       await interaction.editReply({
         content: isAutoMode()
           ? `✅ **Auto mode** — new threads are routed per message: ${routerTierSummary()}. ` +
-            `Cron jobs without their own model use \`${after.model}\`.\n` +
-            `-# Threads already running keep their model; \`/model name:<id>\` pins one again.`
+            `Cron jobs without their own model use \`${after.model}\`.` +
+            (getSdkModelPin() ? `\n-# Overrides \`SDK_ANTHROPIC_MODEL\` (\`${getSdkModelPin()}\`) for interactive threads.` : "") +
+            `\n-# Threads already running keep their model; \`/model name:<id>\` pins one again.`
           : `⚠️ Router switched on and the saved selection cleared, but auto mode is not active.\n` +
-            (describeSdkPinOverride(getSdkModelPin()) ?? ""),
+            (describeSdkPinOverride(getEffectiveSdkModelPin()) ?? ""),
       });
       return;
     }
@@ -801,7 +803,7 @@ async function handleModel(
   // No arguments — report the current resolution.
   const resolution = describeModelResolution();
   const selectable = selectableModelIds(list);
-  const sdkPin = resolution.saved ? undefined : getSdkModelPin();
+  const sdkPin = resolution.saved ? undefined : getEffectiveSdkModelPin();
   const active = list.models.find((m) => m.id === (sdkPin ?? resolution.model));
   const envUnknown =
     resolution.env && list.source !== "fallback" && !list.models.some((m) => m.id === resolution.env);

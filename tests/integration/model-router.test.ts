@@ -18,7 +18,9 @@ import {
   enableAutoMode,
   createDecider,
   describeSdkPinOverride,
+  getEffectiveSdkModelPin,
   getSdkModelPin,
+  isSdkPinSuperseded,
   getRouterModels,
   isAutoMode,
   isModelRouterEnabled,
@@ -228,6 +230,45 @@ describe("configuration", () => {
       text: "fix the bug in `x`",
     });
     expect(plan.action).toBe("route");
+  });
+
+  it("an explicit /model name:auto outranks the SDK_ANTHROPIC_MODEL env pin", async () => {
+    process.env.SDK_ANTHROPIC_MODEL = "bedrock-claude-sonnet-5-5";
+    expect(isAutoMode()).toBe(false);
+
+    enableAutoMode();
+    expect(isAutoMode()).toBe(true);
+    expect(getSdkModelPin()).toBe("bedrock-claude-sonnet-5-5");
+    expect(getEffectiveSdkModelPin()).toBeUndefined();
+
+    const plan = await planSessionModel({
+      channelId: "t-auto-pin",
+      hasLiveSession: false,
+      judge: async () => "common",
+      text: "fix the bug in `x`",
+    });
+    expect(plan.action).toBe("route");
+  });
+
+  it("any other explicit choice ends auto's override of the env pin", async () => {
+    process.env.SDK_ANTHROPIC_MODEL = "bedrock-claude-sonnet-5-5";
+    const text = "fix the bug in `x`";
+    const run = () => planSessionModel({ channelId: "t-x", hasLiveSession: false, judge: async () => "common", text });
+
+    enableAutoMode();
+    setSelectedModel("bedrock-claude-opus-5-1m");
+    expect(isSdkPinSuperseded()).toBe(false);
+
+    enableAutoMode();
+    clearSelectedModel();
+    expect(isSdkPinSuperseded()).toBe(false);
+    expect(await run()).toEqual({ action: "skip", reason: "sdk_env_pin" });
+
+    enableAutoMode();
+    setModelRouterEnabled(false);
+    expect(isSdkPinSuperseded()).toBe(false);
+    setModelRouterEnabled(true);
+    expect(isAutoMode()).toBe(false);
   });
 
   it("shortens model ids for the channel line", () => {
