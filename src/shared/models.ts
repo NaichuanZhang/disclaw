@@ -15,6 +15,13 @@ export const DEFAULT_MODEL = "anthropic.claude-opus-5-5";
 /** Key in the global `config` table holding the persisted selection. */
 export const MODEL_CONFIG_KEY = "selected_model";
 
+/**
+ * Key in the `config` table for an explicit `/model name:auto`. While set, the
+ * router outranks the `SDK_ANTHROPIC_MODEL` env pin. Any other explicit model
+ * choice (a selection, a reset, router off) clears it.
+ */
+export const AUTO_CONFIG_KEY = "model_auto";
+
 /** Discord allows at most 25 autocomplete choices per response. */
 export const AUTOCOMPLETE_LIMIT = 25;
 
@@ -374,11 +381,13 @@ export function getSelectedModel(): string | undefined {
 
 export function setSelectedModel(id: string): void {
   setConfig(MODEL_CONFIG_KEY, cleanModelName(id));
+  deleteConfig(AUTO_CONFIG_KEY);
   warnedIds.clear();
 }
 
 export function clearSelectedModel(): void {
   deleteConfig(MODEL_CONFIG_KEY);
+  deleteConfig(AUTO_CONFIG_KEY);
   warnedIds.clear();
 }
 

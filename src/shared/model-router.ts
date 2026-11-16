@@ -12,15 +12,18 @@
 //   /model selection > SDK_ANTHROPIC_MODEL pin > router > ANTHROPIC_MODEL env
 //   > DEFAULT_MODEL
 // An explicit /model pick is a human decision, so the router stands down while
-// one is set; /model reset or /model name:auto hands control back.
+// one is set; /model reset or /model name:auto hands control back. An explicit
+// /model name:auto is itself a human decision, so it also outranks the env pin
+// (see isSdkPinSuperseded()).
 // ---------------------------------------------------------------------------
 
 import { anthropicClient } from "./anthropic.js";
 import { createLogger } from "../logging/logger.js";
-import { getConfig, setConfig } from "../db/index.js";
+import { deleteConfig, getConfig, setConfig } from "../db/index.js";
 import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import {
+  AUTO_CONFIG_KEY,
   FALLBACK_MODEL_IDS,
   clearSelectedModel,
   getCachedSelectableModelIds,
@@ -152,11 +155,26 @@ export function isModelRouterEnabled(): boolean {
 
 export function setModelRouterEnabled(enabled: boolean): void {
   setConfig(ROUTER_CONFIG_KEY, enabled ? "on" : "off");
+  if (!enabled) deleteConfig(AUTO_CONFIG_KEY);
 }
 
 /** The operator's default model for SDK sessions; a `/model` selection outranks it. */
 export function getSdkModelPin(): string | undefined {
   return envValue("SDK_ANTHROPIC_MODEL") ?? envValue("PILOT_ANTHROPIC_MODEL");
+}
+
+/** True after an explicit `/model name:auto`: the router outranks the env pin. Never throws. */
+export function isSdkPinSuperseded(): boolean {
+  try {
+    return getConfig(AUTO_CONFIG_KEY) === "on";
+  } catch {
+    return false;
+  }
+}
+
+/** The env pin as it applies to routing: undefined once `/model name:auto` superseded it. */
+export function getEffectiveSdkModelPin(): string | undefined {
+  return isSdkPinSuperseded() ? undefined : getSdkModelPin();
 }
 
 /**
@@ -184,20 +202,20 @@ export const AUTO_MODEL_VALUE = "auto";
  */
 export function isAutoMode(): boolean {
   try {
-    return isModelRouterEnabled() && !getSelectedModel() && !getSdkModelPin();
+    return isModelRouterEnabled() && !getSelectedModel() && !getEffectiveSdkModelPin();
   } catch {
     return false;
   }
 }
 
 /**
- * Put the router in charge: clear the `/model` pin and switch routing on in
- * one step. An env pin is out of reach (it is the operator's), so the caller
- * should check isAutoMode() afterwards if it needs to promise anything.
+ * Put the router in charge: clear the `/model` pin, switch routing on and
+ * record that it supersedes the `SDK_ANTHROPIC_MODEL` env pin, in one step.
  */
 export function enableAutoMode(): void {
   clearSelectedModel();
   setModelRouterEnabled(true);
+  setConfig(AUTO_CONFIG_KEY, "on");
 }
 
 // ---------------------------------------------------------------------------
@@ -486,7 +504,7 @@ export async function planSessionModel(input: SessionModelInput): Promise<Sessio
   const pinned = getSelectedModel();
   if (pinned) return skip("model_pin", { model: pinned });
 
-  const envPin = getSdkModelPin();
+  const envPin = getEffectiveSdkModelPin();
   if (envPin) return skip("sdk_env_pin", { model: envPin });
 
   if (!isModelRouterEnabled()) return skip("disabled");
