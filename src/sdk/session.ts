@@ -54,6 +54,7 @@ import {
   sdkSessionDir,
 } from "./session-dirs.js";
 import { createBridgeMcpServer } from "./bridge.js";
+import { closeBrowserFor } from "../browser/manager.js";
 import { SdkRelayQueue } from "./relay-queue.js";
 import type { EditableHandle } from "./relay-queue.js";
 import {
@@ -685,6 +686,8 @@ export class SdkSession {
     if (this.loop) {
       await this.loop.catch(() => {});
     }
+    // Before the relay closes, so the browser board's final edit still lands.
+    await closeBrowserFor(this.channelId, `session ${reason}`).catch(() => false);
     await this.outbound.close();
   }
 
@@ -861,6 +864,8 @@ export class SdkSession {
           // A getter, not a value: the server is built once but the person
           // talking changes, and ask_user / evolve_* must follow them.
           getUserId: this.currentUserId,
+          sessionDir: this.sessionDir(),
+          openEditable: (payload) => this.outbound.pushEditable(payload),
         }),
         ...(process.env.NOTION_API_KEY
           ? {

@@ -22,6 +22,9 @@ import { handleMemoryTool } from "../memory/tools.js";
 import { handleSkillTool } from "../skills/tools.js";
 import { handleConversationHistoryTool } from "../shared/conversation-history.js";
 import { handleEvolutionTool, setEvolutionContext } from "../evolution/tools.js";
+import { handleBrowserTool } from "../browser/tools.js";
+import { browserFeatureEnabled } from "../browser/launch.js";
+import type { EditableHandle } from "./relay-queue.js";
 
 export interface SdkBridgeOptions {
   /** Channel the session lives in — used as the default target. */
@@ -33,6 +36,10 @@ export interface SdkBridgeOptions {
    * `evolve_*` call would be attributed to them no matter who is talking.
    */
   getUserId?: () => string | undefined;
+  /** The session's own folder (browser screenshots are saved under it). */
+  sessionDir?: string;
+  /** Opens an editable message on the session's relay queue (browser board). */
+  openEditable?: (payload: unknown) => EditableHandle;
 }
 
 /** MCP server name; tools appear to the model as `mcp__discordclaw__<name>`. */
@@ -118,6 +125,115 @@ async function runEvolutionTool(
   }
 }
 
+type ToolContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
+
+/** Browser tools are keyed to the session's channel; errors come back as text. */
+async function runBrowserTool(
+  name: string,
+  input: Record<string, unknown>,
+  ctx: SdkBridgeOptions,
+): Promise<{ content: ToolContent[] }> {
+  try {
+    const result = await handleBrowserTool(name, input, {
+      ownerKey: ctx.channelId,
+      sessionDir: ctx.sessionDir,
+      openEditable: ctx.openEditable,
+      getUserId: ctx.getUserId,
+      notify: (text) => handleDiscordTool("send_message", { channel_id: ctx.channelId, text }),
+    });
+    const content: ToolContent[] = [{ type: "text", text: result.text }];
+    if (result.image) content.push({ type: "image", data: result.image, mimeType: "image/jpeg" });
+    return { content };
+  } catch (err) {
+    return textResult(
+      JSON.stringify({
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
+}
+
+/** Agentic browser tools, only when enabled and a Chromium binary exists. */
+function browserBridgeTools(options: SdkBridgeOptions) {
+  if (!browserFeatureEnabled()) return [];
+  return [
+      tool(
+        "browser_open",
+        "Open a headless Chromium (1280x800, throwaway profile) for this conversation and load a URL. Posts a live board the user can watch and take over from. Reuses this conversation's browser if one is open.",
+        { url: z.string().describe("URL to load (https:// assumed)") },
+        async (args) => runBrowserTool("browser_open", { url: args.url }, options),
+      ),
+
+      tool(
+        "browser_navigate",
+        "Load a URL in this conversation's browser and wait for the page to finish loading.",
+        { url: z.string().describe("URL to load") },
+        async (args) => runBrowserTool("browser_navigate", { url: args.url }, options),
+      ),
+
+      tool(
+        "browser_snapshot",
+        "Text outline of the current page: title, URL, visible text and every interactive element with a numbered ref for browser_click / browser_type. Your primary way to see the page; take a fresh one after anything changes it.",
+        {},
+        async () => runBrowserTool("browser_snapshot", {}, options),
+      ),
+
+      tool(
+        "browser_click",
+        "Click an element by snapshot ref, or at viewport coordinates (CSS px of the 1280x800 viewport).",
+        {
+          ref: z.number().optional().describe("Element ref from browser_snapshot"),
+          x: z.number().optional().describe("Viewport x (when no ref)"),
+          y: z.number().optional().describe("Viewport y (when no ref)"),
+        },
+        async (args) => runBrowserTool("browser_click", { ref: args.ref, x: args.x, y: args.y }, options),
+      ),
+
+      tool(
+        "browser_type",
+        "Type text. With a ref, clicks that field and replaces its content first; without one, types into whatever has focus. submit=true presses Enter afterwards.",
+        {
+          text: z.string().describe("Text to type"),
+          ref: z.number().optional().describe("Field ref from browser_snapshot"),
+          submit: z.boolean().optional().describe("Press Enter after typing"),
+          clear: z
+            .boolean()
+            .optional()
+            .describe("Replace existing content when a ref is given (default true)"),
+        },
+        async (args) =>
+          runBrowserTool(
+            "browser_type",
+            { text: args.text, ref: args.ref, submit: args.submit, clear: args.clear },
+            options,
+          ),
+      ),
+
+      tool(
+        "browser_screenshot",
+        "JPEG screenshot of the viewport, also saved into this session's folder (browser/). Use when the snapshot is not enough (layout, images, canvas).",
+        {},
+        async () => runBrowserTool("browser_screenshot", {}, options),
+      ),
+
+      tool(
+        "browser_request_human",
+        "Hand the browser to a human (login, CAPTCHA, payment, anything you must not do yourself) and wait until they press Done on the board or in the live viewer. Blocks up to 10 minutes.",
+        { reason: z.string().describe("What the human needs to do, in one line") },
+        async (args) => runBrowserTool("browser_request_human", { reason: args.reason }, options),
+      ),
+
+      tool(
+        "browser_close",
+        "Close this conversation's browser and delete its profile.",
+        {},
+        async () => runBrowserTool("browser_close", {}, options),
+      ),
+  ];
+}
+
 /**
  * Build the in-process MCP server exposing our Discord + memory tools to a
  * session.
@@ -138,7 +254,10 @@ export function createBridgeMcpServer(options: SdkBridgeOptions) {
       "use it instead of telling the user 'I'll let you know when it's done', since a " +
       "background job cannot post to Discord once your turn ends. The evolve_* tools " +
       "modify this bot's own source code through an isolated worktree and an " +
-      "auto-merged PR — they require an explicitly approved build plan first.",
+      "auto-merged PR — they require an explicitly approved build plan first. " +
+      "The browser_* tools (when present) drive a headless Chromium: browser_snapshot " +
+      "is the main observation, and browser_request_human hands control to the user " +
+      "for logins, CAPTCHAs or anything you must not do yourself.",
     alwaysLoad: true,
     tools: [
       tool(
@@ -632,6 +751,8 @@ export function createBridgeMcpServer(options: SdkBridgeOptions) {
         },
         async (args) => runEvolutionTool("evolve_merge", { id: args.id }, options),
       ),
+
+      ...browserBridgeTools(options),
     ],
   });
 }

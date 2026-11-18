@@ -24,6 +24,7 @@ import { declareAgentToolPaths } from "./agent/tool-paths.js";
 import { createClient, startBot, stopBot } from "./bot/client.js";
 import { setCommandsSkillService, setCommandsCronService, slashCommands } from "./bot/commands.js";
 import { startGateway } from "./gateway/server.js";
+import { stopAllBrowsers, sweepOrphanBrowserProcesses } from "./browser/manager.js";
 import { cleanExpiredSessions } from "./agent/sessions.js";
 import { setRestartHandler } from "./restart.js";
 import { syncDeployedEvolutions, setEvolutionSendToDiscord, setEvolutionCreateThread, checkGhCli } from "./evolution/engine.js";
@@ -199,6 +200,8 @@ async function main(): Promise<void> {
   } catch (err) {
     console.warn("[discordclaw] SDK runtime init failed (non-fatal):", err);
   }
+  const orphanBrowsers = sweepOrphanBrowserProcesses();
+  if (orphanBrowsers > 0) console.log(`[discordclaw] Killed ${orphanBrowsers} orphaned browser process(es)`);
 
   // 3.7 Check gh CLI availability
   const ghAvailable = await checkGhCli();
@@ -443,6 +446,9 @@ async function main(): Promise<void> {
     stopMemoryWatcher();
     skillService.stop();
 
+    // Kill headless browsers (and their profiles) before the gateway goes
+    await stopAllBrowsers().catch(() => 0);
+
     // Close gateway
     gateway.close();
 
@@ -469,6 +475,7 @@ async function main(): Promise<void> {
       stopSoulWatcher();
       stopMemoryWatcher();
       skillService.stop();
+      await stopAllBrowsers().catch(() => 0);
       gateway.close();
       // process.exit() runs neither SIGTERM nor beforeExit, so the session
       // teardown hooks never fire — without this, every SDK child is orphaned

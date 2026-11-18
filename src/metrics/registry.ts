@@ -65,6 +65,14 @@ export const P = {
   sdkSubagentStop: "sdk.subagent.stop",
   sdkSubagentSteer: "sdk.subagent.steer",
 
+  // Browser
+  browserOpen: "browser.open",
+  browserAction: "browser.action",
+  browserViewerConnect: "browser.viewer.connect",
+  browserTakeover: "browser.takeover",
+  browserRequestHuman: "browser.request_human",
+  browserBoardControl: "browser.board.control",
+
   // Memory
   memorySearchLocal: "memory.search.local",
   memoryGetLines: "memory.get_lines",
@@ -143,6 +151,14 @@ export const FEATURE_PATHS: PathSpec[] = [
   { path: P.sdkSubagentDetail, kind: "feature", description: "Subagent detail panel opened" },
   { path: P.sdkSubagentStop, kind: "feature", description: "Subagent stopped from its board" },
   { path: P.sdkSubagentSteer, kind: "feature", description: "Subagent steered from its board" },
+
+  // --- Browser ---
+  { path: P.browserOpen, kind: "feature", description: "Headless browser launched for a session" },
+  { path: P.browserAction, kind: "feature", description: "Agent browser action (navigate/click/type)" },
+  { path: P.browserViewerConnect, kind: "feature", description: "Live browser viewer connected" },
+  { path: P.browserTakeover, kind: "feature", description: "Human took control of a browser" },
+  { path: P.browserRequestHuman, kind: "feature", description: "Agent asked a human to take over the browser" },
+  { path: P.browserBoardControl, kind: "feature", description: "Browser board button pressed in Discord" },
 
   // --- Memory ---
   { path: P.memorySearchLocal, kind: "feature", description: "Local FTS5 memory search" },
