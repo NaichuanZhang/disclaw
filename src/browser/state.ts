@@ -9,7 +9,8 @@
 //   needs-human → running            Done
 //   any → closed                     stop / reap / session end (terminal)
 //
-// The agent may act only in `running`.
+// The agent may act only in `running` (in `human-control` its actions wait for
+// the hand-back; see BrowserSession.agentAct).
 // ---------------------------------------------------------------------------
 
 export type BrowserState = "running" | "paused" | "needs-human" | "human-control" | "closed";
@@ -55,7 +56,7 @@ export function agentBlockedReason(state: BrowserState): string | null {
     case "running":
       return null;
     case "human-control":
-      return "A human has control of the browser right now. Wait for them to hand it back (they press Done or Release), then try again.";
+      return "A human has control of the browser right now. Wait for them to hand it back (Hand back in the viewer or on the board), then try again.";
     case "paused":
       return "The browser is paused from Discord. Ask the user to press Resume, or wait.";
     case "needs-human":

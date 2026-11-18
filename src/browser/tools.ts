@@ -10,8 +10,12 @@
 import type { EditableHandle } from "../sdk/relay-queue.js";
 import { attachBrowserBoard } from "./board.js";
 import { closeBrowserFor, getBrowserFor, openBrowser } from "./manager.js";
-import { DEFAULT_HUMAN_TIMEOUT_MS } from "./browser-session.js";
-import { countTool } from "../metrics/counters.js";
+import { DEFAULT_HUMAN_TIMEOUT_MS, takeoverIdleMs, type HumanWaitOutcome } from "./browser-session.js";
+import { describeHandBackForAgent } from "./handback.js";
+import { normalizeBrowserUrl } from "./page-scripts.js";
+import { assertBrowserUrlAllowed } from "./url-gate.js";
+import { count, countTool } from "../metrics/counters.js";
+import { P } from "../metrics/registry.js";
 
 export const browserTools = [
   {
@@ -75,10 +79,17 @@ export const browserTools = [
   {
     name: "browser_request_human",
     description:
-      "Hand the browser to a human (login, CAPTCHA, payment, anything you must not do yourself) and wait until they press Done on the board or in the live viewer. Blocks up to 10 minutes.",
+      "Hand the browser to a human (login, CAPTCHA, payment, anything you must not do yourself) and wait until they hand it back from the live viewer or the board, optionally with a choice and a note. Blocks up to 10 minutes.",
     input_schema: {
       type: "object" as const,
-      properties: { reason: { type: "string", description: "What the human needs to do, in one line" } },
+      properties: {
+        reason: { type: "string", description: "What the human needs to do, in one line" },
+        handback_options: {
+          type: "array",
+          items: { type: "string" },
+          description: "Up to 4 short choices (max 40 chars each) the user can pick when handing back",
+        },
+      },
       required: ["reason"],
     },
   },
@@ -99,6 +110,8 @@ export interface BrowserToolContext {
   /** Pings the user when a human is needed. */
   notify?: (text: string) => Promise<unknown> | void;
   getUserId?: () => string | undefined;
+  /** Delivers a hand-back note to this conversation when no tool call is waiting for it. */
+  deliverChat?: (text: string, userId: string) => void;
 }
 
 export interface BrowserToolResult {
@@ -134,7 +147,15 @@ export async function handleBrowserTool(
   countTool(name);
   switch (name) {
     case "browser_open": {
+      // Before launching, so a refused URL never costs a Chromium.
+      try {
+        assertBrowserUrlAllowed(normalizeBrowserUrl(str(input.url)));
+      } catch (err) {
+        count(P.browserUrlRefused);
+        throw err;
+      }
       const { session, created } = await openBrowser(ctx.ownerKey);
+      if (ctx.deliverChat) session.onHandBackChat = ctx.deliverChat;
       if (created && ctx.openEditable) attachBrowserBoard(session, ctx.openEditable);
       await session.navigate(str(input.url));
       return {
@@ -180,21 +201,17 @@ export async function handleBrowserTool(
     case "browser_request_human": {
       const session = requireBrowser(ctx.ownerKey);
       const reason = str(input.reason) || "The agent needs a human to take over.";
-      const wait = session.requestHuman(reason, DEFAULT_HUMAN_TIMEOUT_MS);
+      const wait = session.requestHuman(reason, DEFAULT_HUMAN_TIMEOUT_MS, input.handback_options);
       const userId = ctx.getUserId?.();
       try {
         await ctx.notify?.(
-          `${userId ? `<@${userId}> ` : ""}🙋 The browser needs you: ${reason}\nUse **Live view** on the browser board to take control, then press **Done**.`,
+          `${userId ? `<@${userId}> ` : ""}🙋 The browser needs you: ${reason}\nUse **Live view** on the browser board to take control, then press **Hand back**.`,
         );
       } catch {
         // the board still shows it
       }
-      const result = await wait;
-      if (result === "done") return { text: `The human pressed Done. Now at: ${where(session)}\nTake a fresh browser_snapshot.` };
-      if (result === "closed") return { text: "The browser was closed while waiting for the human." };
-      return {
-        text: `No human responded within ${Math.round(DEFAULT_HUMAN_TIMEOUT_MS / 60000)} minutes. The browser is back under your control; ask the user in the channel before trying again.`,
-      };
+      const outcome = await wait;
+      return { text: requestHumanResultText(outcome, session) };
     }
     case "browser_close": {
       const closed = await closeBrowserFor(ctx.ownerKey, "closed by the agent");
@@ -203,4 +220,19 @@ export async function handleBrowserTool(
     default:
       throw new Error(`Unknown browser tool: ${name}`);
   }
+}
+
+/** The browser_request_human tool result for a settled wait. */
+export function requestHumanResultText(
+  outcome: HumanWaitOutcome,
+  session: { title: string; url: string },
+): string {
+  if (outcome.result === "done") {
+    const said = outcome.auto
+      ? `The user's control was released automatically after ${Math.round(takeoverIdleMs() / 60000)} minutes without input; they may not have finished.`
+      : describeHandBackForAgent(outcome);
+    return `${said}\nNow at: ${where(session)}\nTake a fresh browser_snapshot.`;
+  }
+  if (outcome.result === "closed") return "The browser was closed while waiting for the human.";
+  return `No human responded within ${Math.round(DEFAULT_HUMAN_TIMEOUT_MS / 60000)} minutes. The browser is back under your control; ask the user in the channel before trying again.`;
 }

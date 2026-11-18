@@ -3,7 +3,9 @@
 //
 // live      -> mint a 15-minute viewer token bound to the clicking user and
 //              reply ephemerally with the gateway URL
-// pause / resume / takeover / done / stop -> drive the browser's state machine
+// pause / resume / takeover / done -> drive the browser's state machine
+// handback  -> modal (choice + note); its submit calls BrowserSession.handBack
+// stop      -> close the browser (labelled "Close" on the board)
 //
 // Authorization mirrors the subagent board: anyone who can see the thread can
 // already steer the session, so the board grants nothing a reply wouldn't.
@@ -11,8 +13,8 @@
 // to the user who asked for it, because the gateway has no auth of its own.
 // ---------------------------------------------------------------------------
 
-import type { ButtonInteraction } from "discord.js";
-import { parseBrowserCustomId } from "../browser/board.js";
+import type { ButtonInteraction, ModalSubmitInteraction } from "discord.js";
+import { parseBrowserCustomId, renderHandBackModal } from "../browser/board.js";
 import { closeBrowser, getBrowser } from "../browser/manager.js";
 import { mintViewerToken, VIEWER_TOKEN_TTL_MS } from "../browser/tokens.js";
 import { count } from "../metrics/counters.js";
@@ -42,14 +44,16 @@ function isLocalBase(base: string): boolean {
   }
 }
 
-async function replyEphemeral(interaction: ButtonInteraction, content: string): Promise<void> {
+type BrowserInteraction = ButtonInteraction | ModalSubmitInteraction;
+
+async function replyEphemeral(interaction: BrowserInteraction, content: string): Promise<void> {
   const payload = { content, ephemeral: true };
   if (interaction.replied || interaction.deferred) await interaction.followUp(payload);
   else await interaction.reply(payload);
 }
 
-/** Route one `br:` button. Never throws. */
-export async function handleBrowserInteraction(interaction: ButtonInteraction): Promise<void> {
+/** Route one `br:` button or modal submit. Never throws. */
+export async function handleBrowserInteraction(interaction: BrowserInteraction): Promise<void> {
   try {
     await route(interaction);
   } catch (err) {
@@ -58,7 +62,7 @@ export async function handleBrowserInteraction(interaction: ButtonInteraction): 
   }
 }
 
-async function route(interaction: ButtonInteraction): Promise<void> {
+async function route(interaction: BrowserInteraction): Promise<void> {
   const parsed = parseBrowserCustomId(interaction.customId);
   if (!parsed) {
     await replyEphemeral(interaction, "That control is not recognised.");
@@ -102,7 +106,7 @@ async function route(interaction: ButtonInteraction): Promise<void> {
       await replyEphemeral(
         interaction,
         session.takeControl(userId)
-          ? "🧑 You have control. Open **Live view** to click and type; press **Done** to hand back."
+          ? "🧑 You have control. Open **Live view** to click and type; press **Hand back…** when you are finished."
           : "Someone already has control.",
       );
       return;
@@ -112,8 +116,36 @@ async function route(interaction: ButtonInteraction): Promise<void> {
         session.humanDone(userId) ? "✅ Handed back to the agent." : "Nothing is waiting on a human right now.",
       );
       return;
+    case "handback": {
+      const modal = session.state === "human-control" ? renderHandBackModal(session.id, session.handBackOptions) : null;
+      if (!modal || !interaction.isButton()) {
+        await replyEphemeral(interaction, "Nobody has control of the browser right now, so there is nothing to hand back.");
+        return;
+      }
+      await interaction.showModal(modal as never);
+      return;
+    }
+    case "handback-submit": {
+      if (!interaction.isModalSubmit()) {
+        await replyEphemeral(interaction, "That control is not recognised.");
+        return;
+      }
+      const choice = interaction.fields.getTextInputValue("choice");
+      const note = interaction.fields.getTextInputValue("note");
+      const result = session.handBack(userId, { choice: choice || undefined, note: note || undefined });
+      await replyEphemeral(
+        interaction,
+        result.ok
+          ? result.delivered === "none"
+            ? "✅ Handed back to the agent."
+            : "✅ Handed back to the agent with your note."
+          : `Not handed back: ${result.error}`,
+      );
+      return;
+    }
     case "stop":
-      await closeBrowser(session.id, `stopped from Discord by ${interaction.user.username}`);
+      count(P.browserClose);
+      await closeBrowser(session.id, `closed from Discord by ${interaction.user.username}`);
       await replyEphemeral(interaction, "⏹️ Browser closed.");
       return;
   }

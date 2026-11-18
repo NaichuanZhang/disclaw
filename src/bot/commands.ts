@@ -452,8 +452,8 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
     return;
   }
 
-  // Browser board buttons.
-  if (interaction.isButton() && isBrowserCustomId(interaction.customId)) {
+  // Browser board buttons and the hand-back modal they open.
+  if ((interaction.isButton() || interaction.isModalSubmit()) && isBrowserCustomId(interaction.customId)) {
     await handleBrowserInteraction(interaction);
     return;
   }

@@ -7,12 +7,22 @@
 // an editable relay handle (edits coalesced to one per 5s by the relay queue).
 // ---------------------------------------------------------------------------
 
-import { ButtonStyle, ComponentType } from "discord.js";
+import { ButtonStyle, ComponentType, TextInputStyle } from "discord.js";
 import type { EditableHandle } from "../sdk/relay-queue.js";
 import type { BrowserSession } from "./browser-session.js";
+import { DEFAULT_HANDBACK_OPTIONS, HANDBACK_CHOICE_MAX, HANDBACK_NOTE_MAX } from "./handback.js";
 import { STATE_LABEL, type BrowserState } from "./state.js";
 
-export const BROWSER_ACTIONS = ["live", "pause", "resume", "takeover", "done", "stop"] as const;
+export const BROWSER_ACTIONS = [
+  "live",
+  "pause",
+  "resume",
+  "takeover",
+  "done",
+  "handback",
+  "handback-submit",
+  "stop",
+] as const;
 export type BrowserBoardAction = (typeof BROWSER_ACTIONS)[number];
 
 export const BOARD_SHOT_NAME = "browser.jpg";
@@ -78,7 +88,7 @@ export function enabledActions(state: BrowserState): Set<BrowserBoardAction> {
     case "needs-human":
       return new Set(["live", "takeover", "done", "stop"]);
     case "human-control":
-      return new Set(["live", "done", "stop"]);
+      return new Set(["live", "handback", "stop"]);
     case "closed":
       return new Set();
   }
@@ -98,10 +108,10 @@ export function renderBrowserBoard(view: BrowserBoardView): BrowserBoardPayload 
   ];
   if (view.state === "needs-human" && view.humanReason) {
     lines.push("", `🙋 **Needs you:** ${oneLine(view.humanReason, 500)}`);
-    lines.push("Open **Live view**, take control, then press **Done**.");
+    lines.push("Open **Live view**, take control, then **Hand back** (or press **Done** here).");
   }
   if (view.state === "human-control" && view.controllerUserId) {
-    lines.push("", `🧑 <@${view.controllerUserId}> is driving. Press **Done** to hand back.`);
+    lines.push("", `🧑 <@${view.controllerUserId}> is driving. Press **Hand back…** to return control, with an optional note.`);
   }
   const description = lines.join("\n").slice(0, 4096);
 
@@ -145,8 +155,10 @@ export function renderBrowserBoard(view: BrowserBoardView): BrowserBoardPayload 
                 ? button("resume", "Resume", ButtonStyle.Secondary)
                 : button("pause", "Pause", ButtonStyle.Secondary),
               button("takeover", "Take control", ButtonStyle.Secondary),
-              button("done", "Done", ButtonStyle.Success),
-              button("stop", "Stop", ButtonStyle.Danger),
+              view.state === "human-control"
+                ? button("handback", "Hand back…", ButtonStyle.Success)
+                : button("done", "Done", ButtonStyle.Success),
+              button("stop", "Close", ButtonStyle.Danger),
             ],
           },
         ];
@@ -154,6 +166,46 @@ export function renderBrowserBoard(view: BrowserBoardView): BrowserBoardPayload 
   return {
     embeds: [embed],
     components,
+  };
+}
+
+/** Modal opened by the board's Hand back… button. */
+export function renderHandBackModal(browserId: string, options: string[] = []): Record<string, unknown> | null {
+  const customId = buildBrowserCustomId(browserId, "handback-submit");
+  if (!customId) return null;
+  const choices = (options.length ? options : DEFAULT_HANDBACK_OPTIONS).join(", ");
+  return {
+    custom_id: customId,
+    title: "Hand the browser back",
+    components: [
+      {
+        type: ComponentType.ActionRow,
+        components: [
+          {
+            type: ComponentType.TextInput,
+            custom_id: "choice",
+            label: "Outcome (optional)",
+            style: TextInputStyle.Short,
+            required: false,
+            max_length: HANDBACK_CHOICE_MAX,
+            placeholder: oneLine(`e.g. ${choices}`, 100),
+          },
+        ],
+      },
+      {
+        type: ComponentType.ActionRow,
+        components: [
+          {
+            type: ComponentType.TextInput,
+            custom_id: "note",
+            label: "Note for the agent (optional)",
+            style: TextInputStyle.Paragraph,
+            required: false,
+            max_length: HANDBACK_NOTE_MAX,
+          },
+        ],
+      },
+    ],
   };
 }
 
