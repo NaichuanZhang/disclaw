@@ -6,6 +6,7 @@ import { existsSync } from "node:fs";
 import { PROJECT_ROOT } from "../shared/paths.js";
 import { createApiRouter } from "./api.js";
 import { createArtifactRouter } from "./artifacts.js";
+import { closeBrowserViewers, createBrowserViewRouter, handleBrowserUpgrade } from "./browser-view.js";
 import type { CronService } from "../cron/service.js";
 import type { SkillService } from "../skills/service.js";
 
@@ -59,6 +60,9 @@ export function startGateway(opts: {
   const artifactRouter = createArtifactRouter();
   app.use(artifactRouter);
 
+  // ---------- Live browser viewer (token-gated; before the SPA fallback) ----------
+  app.use(createBrowserViewRouter());
+
   // ---------- Static files for dashboard SPA ----------
   const uiDistPath = join(PROJECT_ROOT, "dist", "ui");
   if (existsSync(uiDistPath)) {
@@ -104,6 +108,8 @@ export function startGateway(opts: {
       wssLogs.handleUpgrade(request, socket, head, (ws) => {
         wssLogs.emit("connection", ws, request);
       });
+    } else if (handleBrowserUpgrade(request, socket, head)) {
+      // handled (or rejected) by the browser viewer
     } else {
       socket.destroy();
     }
@@ -124,6 +130,7 @@ export function startGateway(opts: {
       }
       wsClients.clear();
       wssLogs.close();
+      closeBrowserViewers();
       server.close();
       console.log("[gateway] Shut down complete");
     },

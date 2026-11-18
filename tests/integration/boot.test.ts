@@ -200,14 +200,31 @@ describe("Tool Registration", () => {
     expect(evolutionTools.length).toBeGreaterThan(0);
   });
 
+  it("browser tools export correctly", async () => {
+    const { browserTools } = await import("../../src/browser/tools.js");
+    expect(browserTools.map((t) => t.name)).toEqual([
+      "browser_open",
+      "browser_navigate",
+      "browser_snapshot",
+      "browser_click",
+      "browser_type",
+      "browser_screenshot",
+      "browser_request_human",
+      "browser_close",
+    ]);
+    for (const tool of browserTools) expect(tool.input_schema.type).toBe("object");
+  });
+
   it("all tool names are unique", async () => {
     const { memoryTools } = await import("../../src/memory/tools.js");
     const { discordTools } = await import("../../src/agent/tools.js");
     const { skillTools } = await import("../../src/skills/tools.js");
     const { dangerousTools } = await import("../../src/agent/dangerous-tools.js");
     const { evolutionTools } = await import("../../src/evolution/tools.js");
+    const { browserTools } = await import("../../src/browser/tools.js");
 
     const allNames = [
+      ...browserTools.map((t) => t.name),
       ...memoryTools.map((t) => t.name),
       ...discordTools.map((t) => t.name),
       ...skillTools.map((t) => t.name),

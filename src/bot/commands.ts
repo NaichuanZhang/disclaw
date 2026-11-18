@@ -66,6 +66,7 @@ import type { CronService } from "../cron/service.js";
 import type { CronJob, CronSchedule, CronPayload, CronDelivery } from "../cron/types.js";
 import { countCommand } from "../metrics/counters.js";
 import { handleSubagentInteraction, isSubagentCustomId } from "./subagent-interactions.js";
+import { handleBrowserInteraction, isBrowserCustomId } from "./browser-interactions.js";
 
 // ---------------------------------------------------------------------------
 // Service references (set from index.ts after init)
@@ -448,6 +449,12 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
     isSubagentCustomId(interaction.customId)
   ) {
     await handleSubagentInteraction(interaction);
+    return;
+  }
+
+  // Browser board buttons.
+  if (interaction.isButton() && isBrowserCustomId(interaction.customId)) {
+    await handleBrowserInteraction(interaction);
     return;
   }
 

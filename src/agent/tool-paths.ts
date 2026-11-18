@@ -13,6 +13,7 @@ import { discordTools } from "./tools.js";
 import { skillTools } from "../skills/tools.js";
 import { dangerousTools } from "./dangerous-tools.js";
 import { evolutionTools } from "../evolution/tools.js";
+import { browserTools } from "../browser/tools.js";
 import { declareToolPaths } from "../metrics/counters.js";
 
 /** Seed usage metrics with every registered tool name. Called once at boot. */
@@ -24,5 +25,6 @@ export function declareAgentToolPaths(): void {
     ...skillTools,
     ...dangerousTools,
     ...evolutionTools,
+    ...browserTools,
   ] as ReadonlyArray<{ name: string; description?: string }>);
 }
