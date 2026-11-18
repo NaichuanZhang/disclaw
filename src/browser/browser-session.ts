@@ -3,9 +3,11 @@
 //
 // Owns the state machine (state.ts), the bounded action log, the latest
 // thumbnail for the Discord board, the screencast fan-out to viewers and the
-// browser_request_human waiter. Agent actions are refused unless the state is
-// `running`; observation (snapshot, screenshot) is allowed while a human
-// drives, so the agent can watch what they did.
+// browser_request_human waiter. Agent actions run only in `running`; while a
+// human holds control they wait (BROWSER_HOLD_MS) for the hand-back instead of
+// failing. Observation (snapshot, screenshot) is allowed while a human drives,
+// so the agent can watch what they did. Every URL the agent opens, and every
+// URL a page commits to after an agent action, passes url-gate.ts.
 // ---------------------------------------------------------------------------
 
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -19,6 +21,7 @@ import {
   formatSnapshot,
   normalizeBrowserUrl,
   refCenterScript,
+  sensitiveFieldScript,
   type HumanInput,
   type SnapshotData,
 } from "./page-scripts.js";
@@ -28,11 +31,37 @@ import {
   type BrowserControlEvent,
   type BrowserState,
 } from "./state.js";
+import {
+  formatHandBackChat,
+  parseHandBack,
+  sanitizeHandBackOptions,
+  type HandBack,
+  type HandBackInput,
+} from "./handback.js";
+import { assertBrowserUrlAllowed, checkCommittedUrl } from "./url-gate.js";
 import { count } from "../metrics/counters.js";
 import { P } from "../metrics/registry.js";
 
 export const MAX_ACTION_LOG = 50;
 export const DEFAULT_HUMAN_TIMEOUT_MS = 10 * 60 * 1000;
+
+function envMs(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** How long an agent action waits for a human to hand control back. */
+export function browserHoldMs(): number {
+  return envMs("BROWSER_HOLD_MS", 10 * 60 * 1000);
+}
+
+/** A takeover with no viewer input for this long is released automatically. */
+export function takeoverIdleMs(): number {
+  return envMs("BROWSER_TAKEOVER_IDLE_MS", 5 * 60 * 1000);
+}
+
+export const PASSWORD_FIELD_ERROR =
+  "browser_type refuses password and one-time-code fields, so the agent never types credentials. Call browser_request_human and let the user type it during takeover.";
 const NAVIGATION_TIMEOUT_MS = 15_000;
 const FRAME_ACK_FALLBACK_MS = 3_000;
 
@@ -53,6 +82,20 @@ export interface ScreencastFrame {
 export type FrameListener = (frame: ScreencastFrame, done: () => void) => void;
 
 export type HumanWaitResult = "done" | "timeout" | "closed";
+
+export interface HumanWaitOutcome extends HandBack {
+  result: HumanWaitResult;
+  userId?: string;
+  /** Set when control was released for the human, not by them. */
+  auto?: "idle";
+}
+
+export type HandBackResult =
+  | { ok: true; delivered: "waiter" | "chat" | "none" }
+  | { ok: false; error: string };
+
+/** Delivers a hand-back note to the owning conversation when no tool call is waiting. */
+export type HandBackChat = (text: string, userId: string) => void;
 
 type Events = {
   state: BrowserState;
@@ -76,6 +119,9 @@ export class BrowserSession {
   lastShot: Buffer | null = null;
   controllerUserId: string | null = null;
   humanReason: string | null = null;
+  /** Agent-supplied hand-back choices for the current request (viewer + modal). */
+  handBackOptions: string[] = [];
+  onHandBackChat: HandBackChat | null = null;
   lastActivityAt: number;
 
   private readonly page: CdpPage;
@@ -85,9 +131,11 @@ export class BrowserSession {
   private frameListeners = new Set<FrameListener>();
   private screencasting = false;
   private humanWaiter: {
-    resolve: (r: HumanWaitResult) => void;
+    resolve: (r: HumanWaitOutcome) => void;
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private takeovers = 0;
   private closing: Promise<void> | null = null;
   private unsubscribers: Array<() => void> = [];
 
@@ -184,8 +232,34 @@ export class BrowserSession {
     if (!next) return false;
     this.state = next;
     this.touch();
+    if (next === "human-control") this.armIdleRelease();
+    else this.clearIdleRelease();
     this.emit("state", next);
     return true;
+  }
+
+  private armIdleRelease(): void {
+    this.clearIdleRelease();
+    const ms = takeoverIdleMs();
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      if (this.state !== "human-control") return;
+      count(P.browserIdleRelease);
+      this.handBack(this.controllerUserId ?? "unknown", {}, { auto: "idle", idleMs: ms });
+    }, ms);
+    this.idleTimer.unref?.();
+  }
+
+  private clearIdleRelease(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+  }
+
+  /** Any viewer message (input, heartbeat) keeps a takeover from idling out. */
+  noteHumanActivity(): void {
+    if (this.state !== "human-control") return;
+    this.touch();
+    this.armIdleRelease();
   }
 
   private record(actor: BrowserAction["actor"], kind: string, detail: string): void {
@@ -209,6 +283,7 @@ export class BrowserSession {
   takeControl(userId: string): boolean {
     if (!this.transition("takeover")) return false;
     this.controllerUserId = userId;
+    this.takeovers++;
     count(P.browserTakeover);
     this.record("human", "takeover", `<@${userId}> took control`);
     return true;
@@ -226,37 +301,115 @@ export class BrowserSession {
     if (!this.transition("done")) return false;
     this.controllerUserId = null;
     this.humanReason = null;
+    this.handBackOptions = [];
     this.record("human", "done", userId ? `<@${userId}> pressed Done` : "Done");
-    this.settleHuman("done");
+    this.settleHuman({ result: "done", userId });
     return true;
   }
 
-  /** Block until a human presses Done (or timeout / close). */
-  requestHuman(reason: string, timeoutMs = DEFAULT_HUMAN_TIMEOUT_MS): Promise<HumanWaitResult> {
+  /**
+   * The human hands control back, optionally saying something. Valid only in
+   * human-control; a refusal leaves them in control. What they said goes to a
+   * waiting browser_request_human if there is one, otherwise to the owning
+   * conversation as a chat message — delivered exactly once either way.
+   */
+  handBack(userId: string, input: HandBackInput, opts: { auto?: "idle"; idleMs?: number } = {}): HandBackResult {
+    if (this.state !== "human-control") {
+      return { ok: false, error: "Nobody has control of the browser right now, so there is nothing to hand back." };
+    }
+    const parsed = parseHandBack(input);
+    if (!parsed.ok) return parsed;
+    const said = parsed.value;
+    const logDetail = opts.auto
+      ? `released automatically after ${Math.round((opts.idleMs ?? 0) / 60000)} min without input`
+      : `<@${userId}> handed back${formatHandBackChat(said) ? `: ${formatHandBackChat(said)}` : ""}`;
+
+    if (this.humanWaiter) {
+      if (!this.transition("done")) return { ok: false, error: "Could not hand the browser back." };
+      this.afterHandBack(opts.auto ? "idle_release" : "handback", logDetail);
+      this.settleHuman({ result: "done", userId, ...said, ...(opts.auto ? { auto: opts.auto } : {}) });
+      return { ok: true, delivered: "waiter" };
+    }
+
+    const text = formatHandBackChat(said);
+    if (text) {
+      if (!this.onHandBackChat) {
+        return { ok: false, error: "This browser has no conversation to deliver the note to. Hand back without a note, or close the browser." };
+      }
+      try {
+        this.onHandBackChat(text, userId);
+      } catch (err) {
+        console.error("[browser] hand-back delivery failed:", err);
+        return { ok: false, error: "Could not deliver the note to the conversation; you still have control." };
+      }
+    }
+    this.transition("release");
+    this.afterHandBack(opts.auto ? "idle_release" : "handback", logDetail);
+    return { ok: true, delivered: text ? "chat" : "none" };
+  }
+
+  private afterHandBack(kind: string, detail: string): void {
+    this.controllerUserId = null;
+    this.humanReason = null;
+    this.handBackOptions = [];
+    count(P.browserHandBack);
+    this.record("human", kind, detail);
+  }
+
+  /** Block until a human hands back (or timeout / close). */
+  requestHuman(
+    reason: string,
+    timeoutMs = DEFAULT_HUMAN_TIMEOUT_MS,
+    handBackOptions?: unknown,
+  ): Promise<HumanWaitOutcome> {
     const blocked = agentBlockedReason(this.state);
     if (blocked) return Promise.reject(new Error(blocked));
-    if (!this.transition("request_human")) return Promise.reject(new Error("Could not hand over to a human."));
+    // Set before the transition so the state broadcast already carries them.
+    this.handBackOptions = sanitizeHandBackOptions(handBackOptions);
+    if (!this.transition("request_human")) {
+      this.handBackOptions = [];
+      return Promise.reject(new Error("Could not hand over to a human."));
+    }
     count(P.browserRequestHuman);
     this.humanReason = reason.slice(0, 300);
     this.record("agent", "request_human", this.humanReason);
-    return new Promise<HumanWaitResult>((resolve) => {
+    return new Promise<HumanWaitOutcome>((resolve) => {
       const timer = setTimeout(() => {
         this.humanWaiter = null;
         this.humanReason = null;
+        this.handBackOptions = [];
         if (this.state === "needs-human") this.transition("done");
-        resolve("timeout");
+        resolve({ result: "timeout" });
       }, timeoutMs);
       timer.unref?.();
       this.humanWaiter = { resolve, timer };
     });
   }
 
-  private settleHuman(result: HumanWaitResult): void {
+  private settleHuman(outcome: HumanWaitOutcome): void {
     const waiter = this.humanWaiter;
     if (!waiter) return;
     this.humanWaiter = null;
     clearTimeout(waiter.timer);
-    waiter.resolve(result);
+    waiter.resolve(outcome);
+  }
+
+  /** Resolves true once the state leaves human-control, false after `timeoutMs`. */
+  waitForAgentTurn(timeoutMs: number): Promise<boolean> {
+    if (this.state !== "human-control") return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      const off = this.on("state", (s) => {
+        if (s === "human-control") return;
+        clearTimeout(timer);
+        off();
+        resolve(true);
+      });
+      const timer = setTimeout(() => {
+        off();
+        resolve(false);
+      }, timeoutMs);
+      timer.unref?.();
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -344,11 +497,58 @@ export class BrowserSession {
     }
   }
 
+  private interrupted(kind: string): Error {
+    return new Error(
+      `A human took control of the browser while this ${kind} was running, so it may have been interrupted. Wait for them to hand it back, then take a fresh browser_snapshot before retrying.`,
+    );
+  }
+
+  /**
+   * If the page ended up somewhere the gate refuses, blank it (only when the
+   * agent is driving — never yank a page from a human) and throw.
+   */
+  private async enforceCommittedUrl(url: string): Promise<void> {
+    const verdict = checkCommittedUrl(url);
+    if (verdict.ok) return;
+    count(P.browserUrlRefused);
+    if (this.state === "running") {
+      try {
+        await this.page.send("Page.navigate", { url: "about:blank" });
+      } catch {
+        // the error below still stops the agent
+      }
+      this.url = "about:blank";
+      this.title = "";
+      this.record("agent", "redirect_refused", url);
+      this.emit("meta", undefined);
+    }
+    throw new Error(
+      `redirect_refused: the page went to ${url}, which ${verdict.reason}.${this.state === "running" ? " The browser was sent to about:blank." : ""} Only public http(s) sites are allowed.`,
+    );
+  }
+
   private async agentAct<T>(kind: string, detail: string, fn: () => Promise<T>): Promise<T> {
+    if (this.state === "human-control") {
+      const holdMs = browserHoldMs();
+      if (!(await this.waitForAgentTurn(holdMs))) {
+        throw new Error(
+          `The user is still in control of the browser (waited ${Math.round(holdMs / 60000)} min). Tell them you are waiting for them to hand it back, and end your turn.`,
+        );
+      }
+    }
     this.assertAgentCanAct();
     this.touch();
-    const result = await fn();
+    const epoch = this.takeovers;
+    let result: T;
+    try {
+      result = await fn();
+    } catch (err) {
+      if (this.takeovers !== epoch) throw this.interrupted(kind);
+      throw err;
+    }
+    if (this.takeovers !== epoch) throw this.interrupted(kind);
     await this.refreshMeta();
+    await this.enforceCommittedUrl(this.url);
     await this.captureThumb();
     count(P.browserAction);
     this.record("agent", kind, detail);
@@ -357,6 +557,12 @@ export class BrowserSession {
 
   async navigate(rawUrl: string): Promise<string> {
     const url = normalizeBrowserUrl(rawUrl);
+    try {
+      assertBrowserUrlAllowed(url);
+    } catch (err) {
+      count(P.browserUrlRefused);
+      throw err;
+    }
     return this.agentAct("navigate", url, async () => {
       const load = this.waitForEvent("Page.loadEventFired", NAVIGATION_TIMEOUT_MS);
       const res = await this.page.send<{ errorText?: string; loaderId?: string }>("Page.navigate", { url });
@@ -377,6 +583,7 @@ export class BrowserSession {
     const data = JSON.parse(raw) as SnapshotData;
     this.url = data.url;
     this.title = data.title;
+    await this.enforceCommittedUrl(data.url);
     return formatSnapshot(data);
   }
 
@@ -414,10 +621,13 @@ export class BrowserSession {
     const label = `${opts.text.length} chars${opts.ref ? ` into ref ${opts.ref}` : ""}${opts.submit ? " + Enter" : ""}`;
     return this.agentAct("type", label, async () => {
       if (opts.ref !== undefined) {
+        if (await this.isSensitiveField(opts.ref)) throw new Error(PASSWORD_FIELD_ERROR);
         const point = await this.refPoint(opts.ref);
         await this.mouseClick(point.x, point.y);
         if (opts.clear !== false) await this.eval(SELECT_FOCUSED_SCRIPT);
       }
+      // Also checks the focused element: clicking a label can focus a password field.
+      if (opts.text && (await this.isSensitiveField())) throw new Error(PASSWORD_FIELD_ERROR);
       if (opts.text) await this.page.send("Input.insertText", { text: opts.text });
       if (opts.submit) {
         const settled = this.settle();
@@ -430,10 +640,17 @@ export class BrowserSession {
     });
   }
 
+  private async isSensitiveField(ref?: number): Promise<boolean> {
+    if (ref !== undefined && (!Number.isInteger(ref) || ref < 1)) throw new Error(`Invalid ref: ${ref}`);
+    return (await this.eval<unknown>(sensitiveFieldScript(ref))) === true;
+  }
+
   /** Full-size JPEG; also written under `<dir>/browser/` when a dir is given. */
   async screenshot(dir?: string): Promise<{ base64: string; path: string | null }> {
     this.assertOpen();
     this.touch();
+    await this.refreshMeta();
+    await this.enforceCommittedUrl(this.url);
     const { data } = await this.page.send<{ data: string }>("Page.captureScreenshot", {
       format: "jpeg",
       quality: 80,
@@ -462,7 +679,7 @@ export class BrowserSession {
   /** Forward one validated viewer input. False unless a human has control. */
   async dispatchHumanInput(input: HumanInput): Promise<boolean> {
     if (this.state !== "human-control") return false;
-    this.touch();
+    this.noteHumanActivity();
     try {
       if (input.t === "mouse") {
         await this.page.send("Input.dispatchMouseEvent", {
@@ -570,7 +787,8 @@ export class BrowserSession {
   close(reason = "closed"): Promise<void> {
     if (this.closing) return this.closing;
     this.transition("close");
-    this.settleHuman("closed");
+    this.clearIdleRelease();
+    this.settleHuman({ result: "closed" });
     this.frameListeners.clear();
     for (const off of this.unsubscribers.splice(0)) {
       try {

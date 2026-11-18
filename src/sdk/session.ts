@@ -866,6 +866,7 @@ export class SdkSession {
           getUserId: this.currentUserId,
           sessionDir: this.sessionDir(),
           openEditable: (payload) => this.outbound.pushEditable(payload),
+          submitChat: (text, userId, userName) => this.submit({ text, userId, userName }),
         }),
         ...(process.env.NOTION_API_KEY
           ? {

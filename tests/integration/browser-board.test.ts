@@ -5,6 +5,7 @@
 import { describe, it, expect } from "vitest";
 import {
   BOARD_SHOT_NAME,
+  renderHandBackModal,
   buildBrowserCustomId,
   enabledActions,
   isBrowserCustomId,
@@ -36,7 +37,7 @@ function buttons(state: BrowserState): Button[] {
 
 describe("browser board custom ids", () => {
   it("round-trips every action", () => {
-    for (const action of ["live", "pause", "resume", "takeover", "done", "stop"] as const) {
+    for (const action of ["live", "pause", "resume", "takeover", "done", "handback", "handback-submit", "stop"] as const) {
       const id = buildBrowserCustomId("b1", action)!;
       expect(id).toBe(`br:b1:${action}`);
       expect(isBrowserCustomId(id)).toBe(true);
@@ -76,7 +77,14 @@ describe("renderBrowserBoard", () => {
     expect(enabled("running")).toEqual(["live", "pause", "takeover", "stop"]);
     expect(enabled("paused")).toEqual(["live", "resume", "takeover", "stop"]);
     expect(enabled("needs-human")).toEqual(["live", "takeover", "done", "stop"]);
-    expect(enabled("human-control")).toEqual(["live", "done", "stop"]);
+    expect(enabled("human-control")).toEqual(["live", "handback", "stop"]);
+  });
+
+  it("swaps Done for Hand back… while a human has control, and labels stop as Close", () => {
+    const b = buttons("human-control");
+    expect(b[3]).toMatchObject({ custom_id: "br:abc_DEF-123:handback", label: "Hand back…", disabled: false });
+    expect(buttons("needs-human")[3].custom_id).toBe("br:abc_DEF-123:done");
+    expect(b[4]).toMatchObject({ custom_id: "br:abc_DEF-123:stop", label: "Close" });
   });
 
   it("swaps Pause for Resume while paused", () => {
@@ -117,6 +125,20 @@ describe("renderBrowserBoard", () => {
     expect(embed.title.length).toBeLessThanOrEqual(256);
     expect(embed.description.length).toBeLessThanOrEqual(4096);
     for (const f of embed.fields) expect(f.value.length).toBeLessThanOrEqual(1024);
+  });
+
+  it("renders the hand-back modal with capped choice and note inputs", () => {
+    const modal = renderHandBackModal("b1", ["Logged in", "Gave up"]) as any;
+    expect(modal.custom_id).toBe("br:b1:handback-submit");
+    expect(parseBrowserCustomId(modal.custom_id)).toEqual({ browserId: "b1", action: "handback-submit" });
+    const inputs = modal.components.map((r: any) => r.components[0]);
+    expect(inputs.map((i: any) => [i.custom_id, i.max_length, i.required])).toEqual([
+      ["choice", 40, false],
+      ["note", 500, false],
+    ]);
+    expect(inputs[0].placeholder).toContain("Logged in, Gave up");
+    expect((renderHandBackModal("b1") as any).components[0].components[0].placeholder).toContain("Didn't work");
+    expect(renderHandBackModal("bad id")).toBeNull();
   });
 
   it("renders no controls for an unsafe browser id", () => {

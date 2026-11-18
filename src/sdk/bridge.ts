@@ -40,6 +40,8 @@ export interface SdkBridgeOptions {
   sessionDir?: string;
   /** Opens an editable message on the session's relay queue (browser board). */
   openEditable?: (payload: unknown) => EditableHandle;
+  /** Injects a message into this session (browser hand-back notes). */
+  submitChat?: (text: string, userId: string, userName: string) => void;
 }
 
 /** MCP server name; tools appear to the model as `mcp__discordclaw__<name>`. */
@@ -141,6 +143,9 @@ async function runBrowserTool(
       sessionDir: ctx.sessionDir,
       openEditable: ctx.openEditable,
       getUserId: ctx.getUserId,
+      deliverChat: ctx.submitChat
+        ? (text, userId) => ctx.submitChat!(text, userId, `browser hand-back from <@${userId}>`)
+        : undefined,
       notify: (text) => handleDiscordTool("send_message", { channel_id: ctx.channelId, text }),
     });
     const content: ToolContent[] = [{ type: "text", text: result.text }];
@@ -220,9 +225,20 @@ function browserBridgeTools(options: SdkBridgeOptions) {
 
       tool(
         "browser_request_human",
-        "Hand the browser to a human (login, CAPTCHA, payment, anything you must not do yourself) and wait until they press Done on the board or in the live viewer. Blocks up to 10 minutes.",
-        { reason: z.string().describe("What the human needs to do, in one line") },
-        async (args) => runBrowserTool("browser_request_human", { reason: args.reason }, options),
+        "Hand the browser to a human (login, CAPTCHA, payment, anything you must not do yourself) and wait until they hand it back from the live viewer or the board, optionally with a choice and a note. Blocks up to 10 minutes.",
+        {
+          reason: z.string().describe("What the human needs to do, in one line"),
+          handback_options: z
+            .array(z.string())
+            .optional()
+            .describe("Up to 4 short choices (max 40 chars each) the user can pick when handing back"),
+        },
+        async (args) =>
+          runBrowserTool(
+            "browser_request_human",
+            { reason: args.reason, handback_options: args.handback_options },
+            options,
+          ),
       ),
 
       tool(

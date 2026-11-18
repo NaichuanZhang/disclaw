@@ -72,6 +72,10 @@ export const P = {
   browserTakeover: "browser.takeover",
   browserRequestHuman: "browser.request_human",
   browserBoardControl: "browser.board.control",
+  browserHandBack: "browser.handback",
+  browserClose: "browser.close",
+  browserIdleRelease: "browser.takeover.idle_release",
+  browserUrlRefused: "browser.url_refused",
 
   // Memory
   memorySearchLocal: "memory.search.local",
@@ -159,6 +163,10 @@ export const FEATURE_PATHS: PathSpec[] = [
   { path: P.browserTakeover, kind: "feature", description: "Human took control of a browser" },
   { path: P.browserRequestHuman, kind: "feature", description: "Agent asked a human to take over the browser" },
   { path: P.browserBoardControl, kind: "feature", description: "Browser board button pressed in Discord" },
+  { path: P.browserHandBack, kind: "feature", description: "Human handed the browser back (viewer or Discord)" },
+  { path: P.browserClose, kind: "feature", description: "Human closed the browser from the viewer or board" },
+  { path: P.browserIdleRelease, kind: "feature", description: "Browser takeover released after idle timeout", rare: true },
+  { path: P.browserUrlRefused, kind: "feature", description: "Browser URL refused by the gate (non-public target or redirect)", rare: true },
 
   // --- Memory ---
   { path: P.memorySearchLocal, kind: "feature", description: "Local FTS5 memory search" },

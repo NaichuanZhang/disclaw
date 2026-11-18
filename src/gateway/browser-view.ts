@@ -8,14 +8,17 @@
 // on both. Frames are acked to Chrome only after the socket write completes
 // (see BrowserSession.onFrame), so a slow viewer slows the screencast instead
 // of buffering it. Input reaches the page only in `human-control`. A viewer
-// that took control releases it when it disconnects.
+// that took control releases it when it disconnects. `handback` carries the
+// user's optional choice + note (validated in BrowserSession.handBack, acked
+// or refused back over the socket); `close` closes the browser from any state;
+// any message, including the 30 s `ping` heartbeat, counts as takeover activity.
 // ---------------------------------------------------------------------------
 
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { Router } from "express";
 import { WebSocketServer, WebSocket } from "ws";
-import { getBrowser } from "../browser/manager.js";
+import { closeBrowser, getBrowser } from "../browser/manager.js";
 import type { BrowserSession } from "../browser/browser-session.js";
 import { VIEWPORT } from "../browser/launch.js";
 import { parseHumanInput } from "../browser/page-scripts.js";
@@ -119,6 +122,7 @@ function attachViewer(ws: WebSocket, session: BrowserSession, userId: string): v
       title: session.title,
       reason: session.humanReason,
       controller: session.controllerUserId === userId,
+      options: session.handBackOptions,
       width: VIEWPORT.width,
       height: VIEWPORT.height,
     });
@@ -165,7 +169,24 @@ function attachViewer(ws: WebSocket, session: BrowserSession, userId: string): v
       return;
     }
     if (!msg || typeof msg !== "object") return;
+    session.noteHumanActivity();
     switch (msg.t) {
+      case "ping":
+        return;
+      case "handback": {
+        const result = session.handBack(userId, { choice: msg.choice, note: msg.note });
+        if (result.ok) {
+          tookControl = false;
+          sendJson({ t: "handback", ok: true, delivered: result.delivered });
+        } else {
+          sendJson({ t: "error", error: result.error });
+        }
+        return;
+      }
+      case "close":
+        count(P.browserClose);
+        void closeBrowser(session.id, `closed from the live view by ${userId}`);
+        return;
       case "take":
         if (session.takeControl(userId)) tookControl = true;
         return;

@@ -86,6 +86,7 @@ afterEach(async () => {
   pages = [];
   kills = 0;
   delete process.env.BROWSER_MAX;
+  delete process.env.BROWSER_HOLD_MS;
 });
 
 describe("nextBrowserState", () => {
@@ -139,15 +140,16 @@ describe("BrowserSession via the registry", () => {
     await expect(openBrowser("chan-2")).rejects.toThrow(/limit/i);
   });
 
-  it("rejects agent actions while a human has control, and accepts them after", async () => {
+  it("holds agent actions while a human has control, and accepts them after", async () => {
+    process.env.BROWSER_HOLD_MS = "20";
     setBrowserLauncher(fakeLauncher());
     const { session } = await openBrowser("chan-1");
     await session.navigate("example.com");
     expect(session.url).toBe("https://example.com/");
     expect(session.takeControl("u1")).toBe(true);
-    await expect(session.navigate("https://other.example/")).rejects.toThrow(/human has control/i);
-    await expect(session.click({ x: 10, y: 10 })).rejects.toThrow(/human has control/i);
-    await expect(session.type({ text: "hi" })).rejects.toThrow(/human has control/i);
+    await expect(session.navigate("https://other.example/")).rejects.toThrow(/still in control/i);
+    await expect(session.click({ x: 10, y: 10 })).rejects.toThrow(/still in control/i);
+    await expect(session.type({ text: "hi" })).rejects.toThrow(/still in control/i);
     // Observation is still allowed while the human drives.
     await expect(session.screenshot()).resolves.toMatchObject({ path: null });
     expect(session.humanDone("u1")).toBe(true);
@@ -185,14 +187,14 @@ describe("BrowserSession via the registry", () => {
     expect(session.state).toBe("needs-human");
     session.takeControl("u1");
     session.humanDone("u1");
-    await expect(wait).resolves.toBe("done");
+    await expect(wait).resolves.toMatchObject({ result: "done", userId: "u1" });
     expect(session.state).toBe("running");
   });
 
   it("requestHuman times out back to running", async () => {
     setBrowserLauncher(fakeLauncher());
     const { session } = await openBrowser("chan-1");
-    await expect(session.requestHuman("x", 10)).resolves.toBe("timeout");
+    await expect(session.requestHuman("x", 10)).resolves.toEqual({ result: "timeout" });
     expect(session.state).toBe("running");
   });
 
@@ -203,7 +205,7 @@ describe("BrowserSession via the registry", () => {
     const states: string[] = [];
     session.on("state", (s) => states.push(s));
     expect(await closeBrowserFor("chan-1", "test")).toBe(true);
-    await expect(wait).resolves.toBe("closed");
+    await expect(wait).resolves.toEqual({ result: "closed" });
     expect(states).toContain("closed");
     expect(kills).toBe(1);
     expect(getBrowser(session.id)).toBeNull();
@@ -290,6 +292,7 @@ describe("input parsing", () => {
   it("normalizes URLs and refuses non-http schemes", () => {
     expect(normalizeBrowserUrl("example.com")).toBe("https://example.com/");
     expect(normalizeBrowserUrl("about:blank")).toBe("about:blank");
+    expect(normalizeBrowserUrl("example.com:8443/x")).toBe("https://example.com:8443/x");
     expect(() => normalizeBrowserUrl("file:///etc/passwd")).toThrow(/http/);
     expect(() => normalizeBrowserUrl("javascript:alert(1)")).toThrow(/http/);
     expect(() => normalizeBrowserUrl("")).toThrow();

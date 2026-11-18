@@ -142,6 +142,24 @@ export const SELECT_FOCUSED_SCRIPT = `(() => {
   return false;
 })()`;
 
+/**
+ * True when the ref's element (or, without a ref, the focused element) is a
+ * password / one-time-code field, judged by its real type and autocomplete.
+ */
+export function sensitiveFieldScript(ref?: number): string {
+  const pick =
+    ref === undefined
+      ? "var el = document.activeElement; while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;"
+      : `var el = document.querySelector('[data-dc-ref="${ref}"]');`;
+  return `(() => {
+  ${pick}
+  if (!el || !el.getAttribute) return false;
+  if (el.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'password') return true;
+  var ac = String(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/);
+  return ac.indexOf('current-password') >= 0 || ac.indexOf('new-password') >= 0 || ac.indexOf('one-time-code') >= 0;
+})()`;
+}
+
 export const META_SCRIPT = "JSON.stringify([location.href, document.title])";
 
 /** Accept bare hosts ("example.com"); only http(s) and about:blank are allowed. */
@@ -149,7 +167,9 @@ export function normalizeBrowserUrl(raw: string): string {
   const input = String(raw ?? "").trim();
   if (!input) throw new Error("url is required");
   if (input === "about:blank") return input;
-  const withScheme = /^[a-z][a-z0-9+.-]*:/i.test(input) ? input : `https://${input}`;
+  // "localhost:3000" is a bare host:port, not a URL with scheme "localhost:".
+  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(input) && !/^[^/:]+:\d+(?:[/?#]|$)/.test(input);
+  const withScheme = hasScheme ? input : `https://${input}`;
   let url: URL;
   try {
     url = new URL(withScheme);
