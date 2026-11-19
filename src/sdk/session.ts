@@ -20,14 +20,7 @@
 //   permissionMode 'default' with a canUseTool gate or a PreToolUse hook.
 // ---------------------------------------------------------------------------
 
-import {
-  existsSync,
-  mkdirSync,
-  readlinkSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-} from "node:fs";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type {
@@ -49,10 +42,10 @@ import {
   SDK_SESSIONS_DIR,
   claudeProjectDir,
   ensureSdkSessionDir,
-  isInsideDir,
   migrateTranscript,
   sdkSessionDir,
 } from "./session-dirs.js";
+import { findOrphans, linuxProcSource } from "./orphan-sweep.js";
 import { createBridgeMcpServer } from "./bridge.js";
 import { closeBrowserFor } from "../browser/manager.js";
 import { SdkRelayQueue } from "./relay-queue.js";
@@ -1661,53 +1654,43 @@ function startIdleReaper(): void {
 // ---------------------------------------------------------------------------
 // Orphan sweep
 //
-// If we were SIGKILLed, SDK child processes can outlive us. We identify them
-// precisely — and safely — by looking for processes whose cwd is the SDK
-// workspace directory *or anything beneath it*: sessions each run in their own
-// folder under `sessions/`, so an exact match would miss every one of them and
-// let orphans survive a restart. The separator in the prefix is what keeps it
-// safe — a sibling directory like `<workspace>-old` must not match. Nothing
-// else on the machine works under that root, so no unrelated `claude` session
-// is at risk.
+// If we were SIGKILLed, SDK child processes can outlive us. We identify them by
+// looking for claude processes whose cwd is the SDK workspace directory *or
+// anything beneath it* (sessions each run in their own folder under
+// `sessions/`, so an exact match would miss every one of them), and — the part
+// that matters — that have no live bot instance among their ancestors. A claude
+// under a *running* bot is not an orphan: sweeping it is how a second instance
+// booting next to a live one killed the live one's sessions
+// (`exited with code 143`). The decision lives in orphan-sweep.ts so it can be
+// tested without /proc; this function only applies it.
 // ---------------------------------------------------------------------------
 
-/** Kill leftover SDK child processes from a previous run. */
+/**
+ * Kill leftover SDK child processes from a previous run. Processes that belong
+ * to another live bot instance are left alone.
+ */
 export function sweepOrphanSdkProcesses(): number {
   if (process.platform !== "linux" || !existsSync("/proc")) return 0;
 
-  let killed = 0;
-  let entries: string[];
-  try {
-    entries = readdirSync("/proc");
-  } catch {
-    return 0;
+  const plan = findOrphans(linuxProcSource, {
+    workspaceDir: SDK_WORKSPACE_DIR,
+    selfPid: process.pid,
+  });
+
+  if (plan.kept.length > 0) {
+    // Not an error, but never silent: it means two bot instances are running.
+    const owners = [...new Set(plan.kept.map((k) => k.ownerPid))].join(", ");
+    console.warn(
+      `[sdk] boot sweep left ${plan.kept.length} SDK process(es) alone — they belong to a live bot instance (pid ${owners}); another instance is already running`,
+    );
   }
 
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue;
-    const pid = Number(entry);
-    if (pid === process.pid) continue;
-
-    let cwd: string;
+  let killed = 0;
+  for (const target of plan.sweep) {
     try {
-      cwd = readlinkSync(`/proc/${entry}/cwd`);
-    } catch {
-      continue; // not ours / no permission
-    }
-    if (!isInsideDir(SDK_WORKSPACE_DIR, cwd)) continue;
-
-    let cmdline = "";
-    try {
-      cmdline = readFileSync(`/proc/${entry}/cmdline`, "utf8").replace(/\0/g, " ");
-    } catch {
-      continue;
-    }
-    if (!/claude|cli\.js/.test(cmdline)) continue;
-
-    try {
-      process.kill(pid, "SIGTERM");
+      process.kill(target.pid, "SIGTERM");
       killed += 1;
-      console.log(`[sdk] swept orphan SDK process ${pid}: ${cmdline.slice(0, 120)}`);
+      console.log(`[sdk] swept orphan SDK process ${target.pid}: ${target.cmdline.slice(0, 120)}`);
     } catch {
       // already gone
     }

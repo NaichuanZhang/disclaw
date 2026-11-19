@@ -234,11 +234,25 @@ describe("session wiring", () => {
   });
 
   it("sweeps orphans by prefix, so nested session cwds are still caught", () => {
-    // The exact compare this replaces would have matched none of them.
-    expect(sessionSrc).toContain("isInsideDir(SDK_WORKSPACE_DIR, cwd)");
-    expect(sessionSrc).not.toMatch(
-      /path\.resolve\(cwd\) !== path\.resolve\(SDK_WORKSPACE_DIR\)/,
+    // The exact compare this replaces would have matched none of them. The
+    // decision now lives in orphan-sweep.ts (so it can be tested without /proc);
+    // session.ts must hand it the workspace root, and nothing may compare exactly.
+    const sweepSrc = read(
+      new URL("../../src/sdk/orphan-sweep.ts", import.meta.url),
+      "utf8",
     );
+    expect(sessionSrc).toContain("workspaceDir: SDK_WORKSPACE_DIR");
+    expect(sweepSrc).toContain("isInsideDir(opts.workspaceDir, info.cwd)");
+    for (const src of [sessionSrc, sweepSrc]) {
+      expect(src).not.toMatch(/path\.resolve\(cwd\) !== path\.resolve\(SDK_WORKSPACE_DIR\)/);
+    }
+  });
+
+  it("only sweeps what has no live bot above it (the exit-143 regression)", () => {
+    // A boot sweep that SIGTERMs every workspace claude kills the live sessions
+    // of a bot that is still running. session.ts must go through findOrphans().
+    expect(sessionSrc).toContain("findOrphans(linuxProcSource");
+    expect(sessionSrc).not.toMatch(/readdirSync\("\/proc"\)/);
   });
 });
 

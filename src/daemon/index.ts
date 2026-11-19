@@ -6,7 +6,11 @@
 // recovery (with evolution rollback), and Discord crash notifications.
 //
 // ZERO imports from the main bot codebase — a broken evolution can't break
-// the daemon.
+// the daemon. (The helpers beside this file are the daemon's own.)
+//
+// The bot is spawned as `npx tsx src/index.ts`: a chain of processes, not one.
+// It runs in its own process group and every signal goes to the group — see
+// process-group.ts for why signalling only the pid we spawned orphans the bot.
 // ---------------------------------------------------------------------------
 
 import { spawn, execSync, type ChildProcess } from "node:child_process";
@@ -15,6 +19,11 @@ import { request as httpRequest } from "node:http";
 import { writeFileSync, unlinkSync, existsSync, readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  startHealthMonitor as createHealthMonitor,
+  type HealthMonitor,
+} from "./health-monitor.js";
+import { reapGroup, signalGroup, terminateGroup } from "./process-group.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -30,6 +39,7 @@ const HEALTH_GRACE_MS = 30_000; // Wait before first health check
 const HEALTH_INTERVAL_MS = 60_000; // Check every 60s
 const HEALTH_MAX_FAILURES = 3; // Kill after 3 consecutive failures
 const HEALTH_TIMEOUT_MS = 5_000; // Per-request timeout
+const SHUTDOWN_GRACE_MS = 10_000; // Time the bot gets to exit on SIGTERM before SIGKILL
 
 const LOG_BUFFER_SIZE = 100; // Rolling buffer line count
 const CRASH_WINDOW_MS = 5 * 60_000; // 5 min sliding window for backoff
@@ -82,8 +92,8 @@ const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 
 let botProcess: ChildProcess | null = null;
 let logBuffer: string[] = [];
-let healthTimer: ReturnType<typeof setInterval> | null = null;
-let healthFailures = 0;
+// One monitor per bot process; it owns its timers and its failure count.
+let healthMonitor: HealthMonitor | null = null;
 let botHealthy = false;
 let botStartedAt = 0;
 let stableTimer: ReturnType<typeof setTimeout> | null = null;
@@ -187,48 +197,45 @@ function checkHealth(): Promise<boolean> {
   });
 }
 
-function startHealthMonitor(): void {
+/**
+ * Watch `child` for health. The monitor is tied to this one process: stopping it
+ * removes every timer it owns, and `alive` makes a probe that outlives its bot
+ * stand down instead of judging whichever bot is running by then.
+ */
+function startHealthMonitor(child: ChildProcess): void {
   stopHealthMonitor();
 
-  // Grace period before first check
-  setTimeout(() => {
-    healthTimer = setInterval(async () => {
-      if (shuttingDown || !botProcess) return;
-
-      const healthy = await checkHealth();
-
-      if (healthy) {
-        if (healthFailures > 0) {
-          log(`Health restored (was failing for ${healthFailures} checks)`);
-        }
-        healthFailures = 0;
-        if (!botHealthy) {
-          botHealthy = true;
-          log("Bot is healthy");
-        }
-      } else {
-        healthFailures++;
-        log(`Health check failed (${healthFailures}/${HEALTH_MAX_FAILURES})`);
-
-        if (healthFailures >= HEALTH_MAX_FAILURES) {
-          logError(
-            "Health check failed too many times — killing bot for restart",
-          );
-          healthFailures = 0;
-          botHealthy = false;
-          killBot("SIGKILL");
-          // The exit handler will trigger restart
-        }
+  healthMonitor = createHealthMonitor({
+    graceMs: HEALTH_GRACE_MS,
+    intervalMs: HEALTH_INTERVAL_MS,
+    maxFailures: HEALTH_MAX_FAILURES,
+    check: checkHealth,
+    alive: () => !shuttingDown && botProcess === child,
+    onHealthy: (failuresBefore) => {
+      if (failuresBefore > 0) {
+        log(`Health restored (was failing for ${failuresBefore} checks)`);
       }
-    }, HEALTH_INTERVAL_MS);
-  }, HEALTH_GRACE_MS);
+      if (!botHealthy) {
+        botHealthy = true;
+        log("Bot is healthy");
+      }
+    },
+    onFailure: (failures, max) => {
+      log(`Health check failed (${failures}/${max})`);
+    },
+    onUnhealthy: () => {
+      logError("Health check failed too many times — killing bot for restart");
+      botHealthy = false;
+      killBot("SIGKILL");
+      // The exit handler will trigger restart
+    },
+    onError: (err) => logError(`Health monitor error: ${err}`),
+  });
 }
 
 function stopHealthMonitor(): void {
-  if (healthTimer) {
-    clearInterval(healthTimer);
-    healthTimer = null;
-  }
+  healthMonitor?.stop();
+  healthMonitor = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +425,6 @@ function spawnBot(): void {
 
   log("Spawning bot...");
   logBuffer = [];
-  healthFailures = 0;
   botHealthy = false;
   botStartedAt = Date.now();
 
@@ -426,6 +432,9 @@ function spawnBot(): void {
     cwd: ROOT,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env },
+    // Its own process group (pgid == child.pid), so signals reach the bot at the
+    // end of the npx -> sh -> tsx -> node chain and not just the wrapper we hold.
+    detached: true,
   });
 
   botProcess = child;
@@ -461,11 +470,29 @@ function spawnBot(): void {
       `Bot exited (code=${code}, signal=${signal}, uptime=${formatUptime(uptime)})`,
     );
 
+    // The wrapper is gone; nothing it started may outlive it. A bot left running
+    // here is invisible to us yet still holds the gateway port and the Discord
+    // session, so every replacement we spawn would die on EADDRINUSE.
+    reapBotGroup(child.pid);
+
     handleBotExit(code, signal, uptime);
   });
 
-  startHealthMonitor();
+  startHealthMonitor(child);
   startStableTimer();
+}
+
+function reapBotGroup(pgid: number | undefined): void {
+  if (!pgid) return;
+  try {
+    if (reapGroup(pgid)) {
+      logError(
+        `Bot wrapper exited but its process group (${pgid}) was still occupied — killed the leftovers`,
+      );
+    }
+  } catch (err) {
+    logError(`Could not reap bot process group ${pgid}: ${err}`);
+  }
 }
 
 async function handleBotExit(
@@ -572,9 +599,16 @@ async function handleBotExit(
 }
 
 function killBot(signal: NodeJS.Signals = "SIGTERM"): void {
-  if (botProcess && !botProcess.killed) {
-    log(`Sending ${signal} to bot (PID ${botProcess.pid})`);
-    botProcess.kill(signal);
+  const pgid = botProcess?.pid;
+  if (!pgid) return;
+
+  log(`Sending ${signal} to bot process group (PID ${pgid})`);
+  try {
+    signalGroup(pgid, signal);
+  } catch (err) {
+    // Better the wrapper alone than leaving a sick bot running.
+    logError(`Could not signal process group ${pgid}: ${err}`);
+    botProcess?.kill(signal);
   }
 }
 
@@ -624,27 +658,28 @@ function shutdown(signal: string): void {
 
   log(`Received ${signal} — shutting down`);
 
-  if (botProcess && !botProcess.killed) {
-    log("Forwarding SIGTERM to bot...");
-    botProcess.kill("SIGTERM");
-
-    // Give bot 10s to shut down gracefully, then force kill
-    const forceTimer = setTimeout(() => {
-      if (botProcess && !botProcess.killed) {
-        logError("Bot did not exit in 10s — force killing");
-        botProcess.kill("SIGKILL");
-      }
-    }, 10_000);
-
-    botProcess.on("exit", () => {
-      clearTimeout(forceTimer);
-      cleanup();
-      process.exit(0);
-    });
-  } else {
+  const pgid = botProcess?.pid;
+  if (!pgid) {
     cleanup();
     process.exit(0);
   }
+
+  log("Forwarding SIGTERM to bot...");
+  // SIGTERM the whole group, then wait for the whole group: the npx wrapper can
+  // exit while the bot behind it is still shutting down. (The old force-kill
+  // timer tested `botProcess.killed`, which becomes true the moment *any*
+  // signal is sent, so it never fired.)
+  terminateGroup(pgid, { graceMs: SHUTDOWN_GRACE_MS })
+    .then((outcome) => {
+      if (outcome === "killed") {
+        logError(`Bot did not exit in ${SHUTDOWN_GRACE_MS / 1000}s — force killed`);
+      }
+    })
+    .catch((err) => logError(`Bot shutdown failed: ${err}`))
+    .finally(() => {
+      cleanup();
+      process.exit(0);
+    });
 }
 
 // ---------------------------------------------------------------------------
