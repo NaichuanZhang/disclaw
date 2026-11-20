@@ -506,8 +506,7 @@ export function createBridgeMcpServer(options: SdkBridgeOptions) {
       ),
 
       // ---------------------------------------------------------------------
-      // Read-only context tools — same handlers the voice agent uses, so a
-      // session can look past its own SDK transcript (older scrollback, other
+      // Read-only context tools — so a session can look past its own SDK transcript (older scrollback, other
       // channels, cross-session history) instead of guessing.
       // ---------------------------------------------------------------------
 

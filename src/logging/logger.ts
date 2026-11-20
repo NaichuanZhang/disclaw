@@ -2,10 +2,9 @@
 // Structured Logging — lightweight, queryable log system
 // ---------------------------------------------------------------------------
 //
-// Three log streams:
+// Two log streams:
 //   1. application_log — general operational events (info, warn, debug)
 //   2. error_log       — errors & exceptions (error, fatal)
-//   3. tool_call_log   — every tool invocation with input, result, timing
 //
 // Storage: SQLite tables (queryable by reflection daemon, evolve, debug).
 // Console output: preserved for daemon log buffer & human readability.
@@ -30,11 +29,9 @@ export type LogCategory =
   | "memory"
   | "models"
   | "reflection"
-  | "registry"
   | "router"
   | "skills"
   | "soul"
-  | "voice"
   | "startup"
   | "shutdown";
 
@@ -47,27 +44,6 @@ export interface LogEntry {
   /** Associated session ID if available */
   sessionId?: string;
   /** Associated user ID if available */
-  userId?: string;
-}
-
-export interface ToolCallEntry {
-  /** Tool name */
-  tool: string;
-  /** Tool input arguments */
-  input: Record<string, unknown>;
-  /** Tool result string (truncated for storage) */
-  result?: string;
-  /** Whether the tool call succeeded */
-  success: boolean;
-  /** Error message if failed */
-  error?: string;
-  /** Duration in milliseconds */
-  durationMs: number;
-  /** Invoking context */
-  context?: "interactive" | "cron" | "voice";
-  /** Associated session ID */
-  sessionId?: string;
-  /** Associated user ID */
   userId?: string;
 }
 
@@ -193,42 +169,6 @@ export function errorLog(opts: {
         opts.metadata ? truncate(JSON.stringify(opts.metadata), MAX_STORED_LENGTH) : null,
         opts.sessionId ?? null,
         opts.userId ?? null,
-        Date.now(),
-      );
-  } catch {
-    // Never let logging crash the app
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Tool call log
-// ---------------------------------------------------------------------------
-
-/**
- * Record a tool call with timing and result.
- * Always persists (tool calls are high-value debug info).
- */
-export function toolCallLog(entry: ToolCallEntry): void {
-  // Console output (keep existing format)
-  const prefix = entry.context === "cron" ? "[agent] Cron tool call:" : "[agent] Tool call:";
-  console.log(prefix, entry.tool, JSON.stringify(entry.input));
-
-  try {
-    getDb()
-      .prepare(
-        `INSERT INTO tool_call_log (tool, input, result, success, error, duration_ms, context, session_id, user_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        entry.tool,
-        truncate(JSON.stringify(entry.input), MAX_STORED_LENGTH),
-        entry.result ? truncate(entry.result, MAX_STORED_LENGTH) : null,
-        entry.success ? 1 : 0,
-        entry.error ? truncate(entry.error, 1000) : null,
-        entry.durationMs,
-        entry.context ?? null,
-        entry.sessionId ?? null,
-        entry.userId ?? null,
         Date.now(),
       );
   } catch {

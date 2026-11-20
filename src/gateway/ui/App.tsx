@@ -7,7 +7,6 @@ import Cron from "./pages/Cron";
 import Skills from "./pages/Skills";
 import Logs from "./pages/Logs";
 import Evolution from "./pages/Evolution";
-import Artifacts from "./pages/Artifacts";
 
 // Re-export shared utilities so existing imports from "../App" still work
 export { apiFetch, relativeTime, formatDuration, C, S } from "./shared";
@@ -19,7 +18,6 @@ const pages: Record<string, { label: string; component: React.FC }> = {
   status: { label: "Status", component: Status },
   sessions: { label: "Sessions", component: Sessions },
   channels: { label: "Channels", component: Channels },
-  artifacts: { label: "Artifacts", component: Artifacts },
   config: { label: "Config", component: Config },
   cron: { label: "Cron", component: Cron },
   skills: { label: "Skills", component: Skills },

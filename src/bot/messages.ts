@@ -91,9 +91,7 @@ function hasAudioAttachments(message: DiscordMessage): boolean {
 
 /**
  * Attempt to transcribe audio attachments from a message.
- * Tries fully local transcription (NVIDIA Parakeet) first, falling back to
- * OpenAI's Whisper API only if local transcription is unavailable/fails and
- * OPENAI_API_KEY is set (see ../audio/transcribe.ts).
+ * Fully local (whisper.cpp, see ../audio/transcribe.ts).
  * Returns transcribed text or null if transcription isn't possible.
  *
  * @param onStatus - optional callback for surfacing progress (e.g. one-time

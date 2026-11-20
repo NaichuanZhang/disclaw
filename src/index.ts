@@ -35,21 +35,12 @@ import {
   setReflectionSendToDiscord,
   setReflectionChannelId,
 } from "./reflection/daemon.js";
-import { snapshotAllResources } from "./registry/index.js";
-import { initVoice, setVoiceDiscordClient, destroyVoice } from "./voice/index.js";
-import { enableAutoJoin, disableAutoJoin, excludeFromAutoJoin } from "./voice/autoJoin.js";
-import { initVoiceCoach, setVoiceCoachClient, destroyVoiceCoach } from "./voice-coach/index.js";
 import { registerBotThread } from "./bot/messages.js";
 import { ensureThread, sendChunked } from "./shared/discord-utils.js";
-import { SKILLS_DIR, DATA_DIR } from "./shared/paths.js";
 import { warmModelCache } from "./shared/models.js";
-import { join } from "node:path";
 
 // Admin user ID for DM fallback delivery
 const ADMIN_USER_ID = "152801068663832576";
-
-// Voice coach channel ID
-const VOICE_COACH_CHANNEL_ID = "1495515183463006431";
 
 // Set once the Discord client exists (step 5). The cron agent-turn router
 // needs it, and cron is started before the client connects.
@@ -187,13 +178,6 @@ async function main(): Promise<void> {
   declareAgentToolPaths();
   setCommandsSkillService(skillService);
 
-  // 3.6 Snapshot evolvable resources (resource registry)
-  console.log("[discordclaw] Snapshotting resource registry...");
-  snapshotAllResources({
-    skillsDir: SKILLS_DIR,
-    soulPath: join(DATA_DIR, "SOUL.md"),
-  });
-
   // 3.65 Initialize the Claude Agent SDK runtime (workspace dirs, orphan sweep)
   try {
     initSdk();
@@ -207,37 +191,6 @@ async function main(): Promise<void> {
   const ghAvailable = await checkGhCli();
   if (!ghAvailable) {
     console.warn("[discordclaw] WARNING: gh CLI not authenticated — evolution PRs will fail");
-  }
-
-  // 3.8 Initialize voice assistant
-  console.log("[discordclaw] Initializing voice assistant...");
-  let voiceReady = false;
-  try {
-    await initVoice();
-    voiceReady = true;
-  } catch (err) {
-    console.warn("[discordclaw] Voice assistant init failed (non-fatal):", err);
-  }
-
-  // 3.9 Initialize voice coach
-  console.log("[discordclaw] Initializing voice coach...");
-  let voiceCoachReady = false;
-  const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
-  const elevenLabsVoiceId = process.env.ELEVENLABS_VOICE_ID;
-  if (elevenLabsKey && elevenLabsVoiceId) {
-    try {
-      initVoiceCoach({
-        channelId: VOICE_COACH_CHANNEL_ID,
-        userId: ADMIN_USER_ID,
-        elevenLabsApiKey: elevenLabsKey,
-        elevenLabsVoiceId: elevenLabsVoiceId,
-      });
-      voiceCoachReady = true;
-    } catch (err) {
-      console.warn("[discordclaw] Voice coach init failed (non-fatal):", err);
-    }
-  } else {
-    console.warn("[discordclaw] Voice coach disabled — ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID not set");
   }
 
   // 4. Start cron service
@@ -257,24 +210,6 @@ async function main(): Promise<void> {
   // client exists but only ever called once jobs start firing.
   discordClient = client;
   await startBot(client);
-
-  // Wire voice → Discord client (for user display name resolution)
-  if (voiceReady) {
-    setVoiceDiscordClient(client);
-
-    // Enable auto-join/leave: bot follows the admin user in/out of voice channels
-    enableAutoJoin(client, ADMIN_USER_ID);
-
-    // Exclude the voice coach channel from the regular voice auto-join
-    if (voiceCoachReady) {
-      excludeFromAutoJoin(VOICE_COACH_CHANNEL_ID);
-    }
-  }
-
-  // Wire voice coach → Discord client
-  if (voiceCoachReady) {
-    setVoiceCoachClient(client);
-  }
 
   // Wire cron → Discord delivery now that the client is ready
   cronService.setSendToDiscord(async (channelId, text, mentionUser) => {
@@ -406,8 +341,6 @@ async function main(): Promise<void> {
   console.log(`[discordclaw] Cron jobs: ${cronJobs.length}`);
   console.log(`[discordclaw] Skills: ${skillService.list().length}`);
   console.log(`[discordclaw] gh CLI: ${ghAvailable ? "ready" : "NOT AVAILABLE"}`);
-  console.log(`[discordclaw] Voice: ${voiceReady ? "ready (auto-join enabled)" : "NOT AVAILABLE"}`);
-  console.log(`[discordclaw] Voice Coach: ${voiceCoachReady ? `ready (channel: ${VOICE_COACH_CHANNEL_ID})` : "NOT AVAILABLE"}`);
   console.log(`[discordclaw] mem9: ${mem9Ready ? "enabled (cloud memory)" : "disabled (local only)"}`);
   console.log(`[discordclaw] Reflection: ${reflectionChannelId ? `→ #${reflectionChannelId}` : "no channel (ideas only)"}`);
   console.log(`[discordclaw] Gateway: http://localhost:${port}`);
@@ -428,15 +361,6 @@ async function main(): Promise<void> {
 
     // Stop reflection daemon
     stopReflectionDaemon();
-
-    // Disable auto-join before destroying voice
-    disableAutoJoin();
-
-    // Stop voice coach
-    destroyVoiceCoach();
-
-    // Stop voice assistant
-    await destroyVoice();
 
     // Stop cron first (prevents new jobs from firing)
     cronService.stop();
@@ -468,9 +392,6 @@ async function main(): Promise<void> {
     (async () => {
       clearInterval(cleanupInterval);
       stopReflectionDaemon();
-      disableAutoJoin();
-      destroyVoiceCoach();
-      await destroyVoice();
       cronService.stop();
       stopSoulWatcher();
       stopMemoryWatcher();

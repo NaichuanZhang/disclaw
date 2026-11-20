@@ -4,14 +4,13 @@
 // Usage counters are only useful if a tool that is never invoked shows up as
 // unused rather than as absent, so every registered tool name is declared once
 // at boot. This is the one place that knows the full set — the tool handlers
-// themselves are wired up per runtime (see sdk/bridge.ts and voice/agent.ts).
+// themselves are wired up per runtime (see sdk/bridge.ts).
 // ---------------------------------------------------------------------------
 
 import { conversationHistoryTools } from "../shared/conversation-history.js";
 import { getMemoryTools } from "../memory/tools.js";
 import { discordTools } from "./tools.js";
 import { skillTools } from "../skills/tools.js";
-import { dangerousTools } from "./dangerous-tools.js";
 import { evolutionTools } from "../evolution/tools.js";
 import { browserTools } from "../browser/tools.js";
 import { declareToolPaths } from "../metrics/counters.js";
@@ -23,7 +22,6 @@ export function declareAgentToolPaths(): void {
     ...getMemoryTools(),
     ...discordTools,
     ...skillTools,
-    ...dangerousTools,
     ...evolutionTools,
     ...browserTools,
   ] as ReadonlyArray<{ name: string; description?: string }>);

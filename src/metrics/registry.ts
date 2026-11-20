@@ -50,12 +50,6 @@ export interface PathSpec {
 // never go stale. Everything below is instrumented by hand.
 
 export const P = {
-  // Agent pipeline
-  agentTurnInteractive: "agent.turn.interactive",
-  agentTurnCron: "agent.turn.cron",
-  agentLoopDuplicateBreak: "agent.loop.duplicate_break",
-  agentImagesExtracted: "agent.images.extracted",
-
   // SDK sessions
   sdkTurnSubmit: "sdk.turn.submit",
   sdkSessionInterrupt: "sdk.session.interrupt",
@@ -88,16 +82,6 @@ export const P = {
   // Audio transcription backends
   audioTranscribeDispatch: "audio.transcribe.dispatch",
   audioTranscribeWhisperCpp: "audio.transcribe.whispercpp",
-  audioTranscribeLocalNemo: "audio.transcribe.local_nemo",
-
-  // Voice assistant + coach
-  voiceSessionStart: "voice.session.start",
-  voiceSessionStop: "voice.session.stop",
-  voiceSttTranscribe: "voice.stt.transcribe",
-  voiceTtsSynthesize: "voice.tts.synthesize",
-  voiceTtsSynthesizeStream: "voice.tts.synthesize_stream",
-  voiceCoachInit: "voice.coach.init",
-  voiceCoachDestroy: "voice.coach.destroy",
 
   // Model selection
   modelsListFetch: "models.list.fetch",
@@ -120,29 +104,6 @@ export const P = {
 } as const;
 
 export const FEATURE_PATHS: PathSpec[] = [
-  // --- Agent pipeline ---
-  {
-    path: P.agentTurnInteractive,
-    kind: "feature",
-    description: "Interactive agent turn (Discord message → Claude)",
-  },
-  {
-    path: P.agentTurnCron,
-    kind: "feature",
-    description: "Agent turn triggered by a cron job",
-  },
-  {
-    path: P.agentLoopDuplicateBreak,
-    kind: "branch",
-    description: "Tool loop broken after repeated identical calls",
-    rare: true,
-  },
-  {
-    path: P.agentImagesExtracted,
-    kind: "branch",
-    description: "Agent reply contained markdown images that were rendered",
-  },
-
   // --- SDK sessions ---
   { path: P.sdkTurnSubmit, kind: "feature", description: "Message submitted to an SDK session" },
   {
@@ -187,24 +148,7 @@ export const FEATURE_PATHS: PathSpec[] = [
     kind: "branch",
     description: "Transcription served by whisper.cpp",
   },
-  {
-    path: P.audioTranscribeLocalNemo,
-    kind: "branch",
-    description: "Transcription served by the local NeMo/Parakeet backend",
-  },
 
-  // --- Voice ---
-  { path: P.voiceSessionStart, kind: "feature", description: "Voice assistant joined a channel" },
-  { path: P.voiceSessionStop, kind: "feature", description: "Voice assistant left / stopped" },
-  { path: P.voiceSttTranscribe, kind: "feature", description: "Voice STT on a captured utterance" },
-  { path: P.voiceTtsSynthesize, kind: "feature", description: "Voice TTS (buffered synthesis)" },
-  {
-    path: P.voiceTtsSynthesizeStream,
-    kind: "feature",
-    description: "Voice TTS (streaming synthesis)",
-  },
-  { path: P.voiceCoachInit, kind: "feature", description: "Voice coach subsystem initialised" },
-  { path: P.voiceCoachDestroy, kind: "feature", description: "Voice coach subsystem torn down" },
 
   // --- Models ---
   { path: P.modelsListFetch, kind: "feature", description: "Model list fetched from the proxy" },

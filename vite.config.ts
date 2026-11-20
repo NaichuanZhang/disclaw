@@ -9,13 +9,6 @@ export default defineConfig({
     outDir: "../../../dist/ui",
     emptyOutDir: true,
     chunkSizeWarningLimit: 1000,
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          "framer-motion": ["framer-motion"],
-        },
-      },
-    },
   },
   server: {
     proxy: {
