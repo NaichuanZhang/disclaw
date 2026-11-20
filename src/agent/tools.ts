@@ -31,12 +31,6 @@ import {
   MAX_WAIT_SECONDS,
   DEFAULT_WAIT_SECONDS,
 } from "./questions.js";
-import {
-  registerArtifactFromFile,
-  getArtifactDownloadUrl,
-  updateArtifactDiscordInfo,
-  formatFileSize,
-} from "../artifacts/index.js";
 import type { CronService } from "../cron/service.js";
 
 /** Followup scheduling delay bounds, in seconds (30s .. 24h). */
@@ -245,11 +239,8 @@ export function setCronService(service: CronService): void {
 }
 
 // ---------------------------------------------------------------------------
-// Session context for artifact tracking and thread routing
+// Session context for thread routing
 // ---------------------------------------------------------------------------
-
-/** Current session ID, set by the message handler before tool dispatch. */
-let currentSessionId: string | null = null;
 
 /**
  * Current thread ID, set by the message handler before tool dispatch.
@@ -263,11 +254,10 @@ let currentThreadId: string | null = null;
 let currentUserId: string | null = null;
 
 export function setToolSessionContext(
-  sessionId: string | null,
+  _sessionId: string | null,
   threadId?: string | null,
   userId?: string | null,
 ): void {
-  currentSessionId = sessionId;
   currentThreadId = threadId ?? null;
   currentUserId = userId ?? null;
 }
@@ -278,6 +268,12 @@ export function setToolSessionContext(
 
 /** Discord's max file upload size for bots (default tier: 25 MB). */
 const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 // ---------------------------------------------------------------------------
 // Helper: resolve send target for guild text channels
@@ -387,42 +383,9 @@ export async function handleDiscordTool(
         const stats = statSync(filePath);
         const filename = customFilename || basename(filePath);
 
-        // Register as output artifact (regardless of whether we can send via Discord)
-        let artifactId: string | undefined;
-        if (currentSessionId) {
-          try {
-            const artifact = registerArtifactFromFile(
-              {
-                sessionId: currentSessionId,
-                direction: "output",
-                filename,
-                sizeBytes: stats.size,
-              },
-              filePath,
-            );
-            artifactId = artifact.id;
-          } catch (err) {
-            console.error("[agent] Failed to register output artifact:", err);
-          }
-        }
-
-        // If file is too large for Discord, provide gateway download link instead
         if (stats.size > MAX_FILE_SIZE_BYTES) {
-          if (artifactId && currentSessionId) {
-            const downloadUrl = getArtifactDownloadUrl(currentSessionId, artifactId);
-            return JSON.stringify({
-              success: true,
-              too_large_for_discord: true,
-              download_url: downloadUrl,
-              filename,
-              size: formatFileSize(stats.size),
-              size_bytes: stats.size,
-              artifact_id: artifactId,
-              note: `File is ${formatFileSize(stats.size)} which exceeds Discord's 25 MB limit. Share the download_url with the user instead.`,
-            });
-          }
           return JSON.stringify({
-            error: `File too large (${formatFileSize(stats.size)}). Discord limit is 25 MB. No gateway URL available (no session context).`,
+            error: `File too large (${formatFileSize(stats.size)}). Discord limit is 25 MB.`,
           });
         }
 
@@ -435,7 +398,7 @@ export async function handleDiscordTool(
 
         // Enforce thread-only policy for files: if targeting a guild text
         // channel, route to existing thread or create a new one so
-        // files/artifacts stay organized and don't clutter the main channel.
+        // files stay organized and don't clutter the main channel.
         let sendTarget = channel;
         let threadId: string | undefined;
         if (isGuildTextChannel(channel)) {
@@ -467,15 +430,6 @@ export async function handleDiscordTool(
         const sent = await sendTarget.send(sendPayload);
         const sentAttachment = sent.attachments?.first();
 
-        // Update artifact with Discord info
-        if (artifactId && sentAttachment?.url) {
-          try {
-            updateArtifactDiscordInfo(artifactId, sentAttachment.url, sent.id);
-          } catch (err) {
-            console.error("[agent] Failed to update artifact Discord info:", err);
-          }
-        }
-
         return JSON.stringify({
           success: true,
           message_id: sent.id,
@@ -483,7 +437,6 @@ export async function handleDiscordTool(
           filename: sentAttachment?.name ?? filename,
           size: formatFileSize(stats.size),
           size_bytes: stats.size,
-          ...(artifactId ? { artifact_id: artifactId } : {}),
           ...(threadId ? { thread_id: threadId, parent_channel_id: channelId } : {}),
         });
       }

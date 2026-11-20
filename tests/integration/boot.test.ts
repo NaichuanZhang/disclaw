@@ -188,12 +188,6 @@ describe("Tool Registration", () => {
     expect(skillTools.length).toBeGreaterThan(0);
   });
 
-  it("dangerous tools export correctly", async () => {
-    const { dangerousTools } = await import("../../src/agent/dangerous-tools.js");
-    expect(Array.isArray(dangerousTools)).toBe(true);
-    expect(dangerousTools.length).toBeGreaterThan(0);
-  });
-
   it("evolution tools export correctly", async () => {
     const { evolutionTools } = await import("../../src/evolution/tools.js");
     expect(Array.isArray(evolutionTools)).toBe(true);
@@ -219,7 +213,6 @@ describe("Tool Registration", () => {
     const { memoryTools } = await import("../../src/memory/tools.js");
     const { discordTools } = await import("../../src/agent/tools.js");
     const { skillTools } = await import("../../src/skills/tools.js");
-    const { dangerousTools } = await import("../../src/agent/dangerous-tools.js");
     const { evolutionTools } = await import("../../src/evolution/tools.js");
     const { browserTools } = await import("../../src/browser/tools.js");
 
@@ -228,7 +221,6 @@ describe("Tool Registration", () => {
       ...memoryTools.map((t) => t.name),
       ...discordTools.map((t) => t.name),
       ...skillTools.map((t) => t.name),
-      ...dangerousTools.map((t) => t.name),
       ...evolutionTools.map((t) => t.name),
     ];
 

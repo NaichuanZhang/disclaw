@@ -174,20 +174,6 @@ export function initDb(): void {
       created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
     );
 
-    CREATE TABLE IF NOT EXISTS resource_registry (
-      id TEXT PRIMARY KEY,
-      resource_type TEXT NOT NULL,
-      resource_name TEXT NOT NULL,
-      version INTEGER NOT NULL,
-      content_hash TEXT NOT NULL,
-      parent_version_id TEXT,
-      status TEXT NOT NULL DEFAULT 'active',
-      change_description TEXT,
-      changed_by TEXT,
-      metadata TEXT,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
-    );
-
     CREATE TABLE IF NOT EXISTS agent_questions (
       id TEXT PRIMARY KEY,
       channel_id TEXT NOT NULL,
@@ -258,36 +244,6 @@ export function initDb(): void {
   }
 
   // ---------------------------------------------------------------------------
-  // Migrations — add artifacts table for persistent file tracking
-  // ---------------------------------------------------------------------------
-
-  const hasArtifacts = d.prepare(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='artifacts'"
-  ).get();
-
-  if (!hasArtifacts) {
-    d.exec(`
-      CREATE TABLE artifacts (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        direction TEXT NOT NULL,
-        filename TEXT NOT NULL,
-        mime_type TEXT,
-        disk_path TEXT NOT NULL,
-        discord_url TEXT,
-        discord_message_id TEXT,
-        size_bytes INTEGER,
-        metadata TEXT,
-        created_at INTEGER NOT NULL
-      );
-
-      CREATE INDEX idx_artifacts_session ON artifacts(session_id);
-      CREATE INDEX idx_artifacts_direction ON artifacts(direction);
-      CREATE INDEX idx_artifacts_created_at ON artifacts(created_at);
-    `);
-  }
-
-  // ---------------------------------------------------------------------------
   // Migrations — add worktree_dir column to evolutions for multi-worktree support
   // ---------------------------------------------------------------------------
 
@@ -312,9 +268,6 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(type);
     CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
-    CREATE INDEX IF NOT EXISTS idx_resource_registry_type_name ON resource_registry(resource_type, resource_name);
-    CREATE INDEX IF NOT EXISTS idx_resource_registry_status ON resource_registry(status);
-    CREATE INDEX IF NOT EXISTS idx_resource_registry_created_at ON resource_registry(created_at);
   `);
 
   // ---------------------------------------------------------------------------
@@ -345,20 +298,6 @@ export function initDb(): void {
       created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
     );
 
-    CREATE TABLE IF NOT EXISTS tool_call_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      tool TEXT NOT NULL,
-      input TEXT,
-      result TEXT,
-      success INTEGER NOT NULL DEFAULT 1,
-      error TEXT,
-      duration_ms INTEGER NOT NULL DEFAULT 0,
-      context TEXT,
-      session_id TEXT,
-      user_id TEXT,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
-    );
-
     CREATE INDEX IF NOT EXISTS idx_application_log_created_at ON application_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_application_log_level ON application_log(level);
     CREATE INDEX IF NOT EXISTS idx_application_log_category ON application_log(category);
@@ -366,9 +305,6 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_error_log_created_at ON error_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_error_log_category ON error_log(category);
 
-    CREATE INDEX IF NOT EXISTS idx_tool_call_log_created_at ON tool_call_log(created_at);
-    CREATE INDEX IF NOT EXISTS idx_tool_call_log_tool ON tool_call_log(tool);
-    CREATE INDEX IF NOT EXISTS idx_tool_call_log_success ON tool_call_log(success);
   `);
 }
 

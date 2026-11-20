@@ -25,7 +25,7 @@ export { isBrowserCustomId } from "../browser/board.js";
 const NOT_TRACKED =
   "That browser is no longer tracked — it was closed, its session ended or the bot restarted, so this board is read-only now.";
 
-/** Public base URL for viewer links (same rule as artifact downloads). */
+/** Public base URL for viewer links. */
 export function gatewayBaseUrl(): string {
   const base = process.env.GATEWAY_PUBLIC_URL || `http://localhost:${process.env.GATEWAY_PORT || "3000"}`;
   return base.replace(/\/+$/, "");

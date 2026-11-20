@@ -17,7 +17,7 @@ import {
 } from "./signals.js";
 import { listEvolutions, type Evolution } from "../evolution/log.js";
 import { recordSuggestion } from "../evolution/engine.js";
-import { getErrorLogs, getErrorCountsByCategory, getToolCallStats, getSlowestToolCalls, pruneLogs } from "../logging/queries.js";
+import { getErrorLogs, getErrorCountsByCategory, pruneLogs } from "../logging/queries.js";
 import { createLogger } from "../logging/logger.js";
 import { resolveModel } from "../shared/models.js";
 
@@ -94,8 +94,6 @@ interface ReflectionContext {
   totalSignals: number;
   // Structured log data
   errorCountsByCategory: Record<string, number>;
-  toolCallStats: { tool: string; totalCalls: number; failures: number; avgDurationMs: number; maxDurationMs: number }[];
-  slowestToolCalls: { tool: string; durationMs: number; error: string | null }[];
   recentErrors: { category: string; message: string; stack: string | null }[];
 }
 
@@ -124,9 +122,6 @@ function gatherContext(): ReflectionContext {
 
   // Structured log data
   const errorCountsByCategory = getErrorCountsByCategory(SIGNAL_LOOKBACK_MS);
-  const toolCallStats = getToolCallStats(SIGNAL_LOOKBACK_MS);
-  const slowestToolCalls = getSlowestToolCalls({ sinceMs: SIGNAL_LOOKBACK_MS, limit: 5 })
-    .map((r) => ({ tool: r.tool, durationMs: r.durationMs, error: r.error }));
   const recentErrors = getErrorLogs({ sinceMs: SIGNAL_LOOKBACK_MS, limit: 20 })
     .map((r) => ({ category: r.category, message: r.message, stack: r.stack }));
 
@@ -144,8 +139,6 @@ function gatherContext(): ReflectionContext {
     },
     totalSignals: allSignals.length,
     errorCountsByCategory,
-    toolCallStats,
-    slowestToolCalls,
     recentErrors,
   };
 }
@@ -210,22 +203,6 @@ Your job is to identify the SINGLE most impactful improvement you could make to 
     parts.push(`## Recent Errors (from error_log)\n${errorLines.join("\n")}`);
   }
 
-  if (ctx.toolCallStats.length > 0) {
-    const toolLines = ctx.toolCallStats.map((t) => {
-      const failRate = t.totalCalls > 0 ? ((t.failures / t.totalCalls) * 100).toFixed(1) : "0";
-      return `- **${t.tool}**: ${t.totalCalls} calls, ${t.failures} failures (${failRate}%), avg ${t.avgDurationMs}ms, max ${t.maxDurationMs}ms`;
-    });
-    parts.push(`## Tool Call Statistics\n${toolLines.join("\n")}`);
-  }
-
-  if (ctx.slowestToolCalls.length > 0) {
-    const slowLines = ctx.slowestToolCalls.map((t) => {
-      const errorNote = t.error ? ` (error: ${t.error.slice(0, 100)})` : "";
-      return `- **${t.tool}**: ${t.durationMs}ms${errorNote}`;
-    });
-    parts.push(`## Slowest Tool Calls\n${slowLines.join("\n")}`);
-  }
-
   // --- Existing ideas / deployed ---
 
   if (ctx.recentIdeas.length > 0) {
@@ -273,8 +250,7 @@ async function runReflection(): Promise<ReflectionResult> {
 
     // Count structured logs too for the "enough data" check
     const structuredLogCount =
-      Object.values(ctx.errorCountsByCategory).reduce((a, b) => a + b, 0) +
-      ctx.toolCallStats.reduce((a, t) => a + t.totalCalls, 0);
+      Object.values(ctx.errorCountsByCategory).reduce((a, b) => a + b, 0);
 
     const totalDataPoints = ctx.totalSignals + structuredLogCount;
 
@@ -452,9 +428,9 @@ export function startReflectionDaemon(): void {
 
       // Prune old structured logs too
       const logsPruned = pruneLogs();
-      const totalLogsPruned = logsPruned.appPruned + logsPruned.errorPruned + logsPruned.toolPruned;
+      const totalLogsPruned = logsPruned.appPruned + logsPruned.errorPruned;
       if (totalLogsPruned > 0) {
-        log.info(`Pruned ${totalLogsPruned} old log entries (app=${logsPruned.appPruned}, error=${logsPruned.errorPruned}, tool=${logsPruned.toolPruned})`);
+        log.info(`Pruned ${totalLogsPruned} old log entries (app=${logsPruned.appPruned}, error=${logsPruned.errorPruned})`);
       }
 
       await runReflection();

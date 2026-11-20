@@ -3,7 +3,7 @@
 // Discordclaw Watchdog Daemon
 //
 // Manages the bot process lifecycle: spawning, health monitoring, crash
-// recovery (with evolution rollback), and Discord crash notifications.
+// recovery (with backoff), and Discord crash notifications.
 //
 // ZERO imports from the main bot codebase — a broken evolution can't break
 // the daemon. (The helpers beside this file are the daemon's own.)
@@ -47,9 +47,6 @@ const BACKOFF_DELAYS = [0, 10_000, 30_000, 60_000]; // Escalating delays (ms)
 const MAX_RAPID_CRASHES = 5; // Enter cooldown after this many
 const COOLDOWN_MS = 5 * 60_000; // 5 min cooldown
 const STABLE_RESET_MS = 5 * 60_000; // Reset crash counter after 5 min stable
-
-const EVOLUTION_COMMIT_PATTERN = /^[a-f0-9]+ feat\(evolution\):/;
-const EVOLUTION_RECENCY_MS = 30 * 60_000; // 30 min
 
 const PID_FILE = resolve(ROOT, "data/daemon.pid");
 
@@ -236,101 +233,6 @@ function startHealthMonitor(child: ChildProcess): void {
 function stopHealthMonitor(): void {
   healthMonitor?.stop();
   healthMonitor = null;
-}
-
-// ---------------------------------------------------------------------------
-// Evolution Crash Detection
-// ---------------------------------------------------------------------------
-
-function isEvolutionRelatedCrash(): {
-  isEvolution: boolean;
-  commitMessage: string;
-} {
-  try {
-    // Get the most recent commit
-    const logOutput = execSync("git log -1 --format=%H%n%ct%n%s", {
-      cwd: ROOT,
-      encoding: "utf-8",
-      timeout: 5000,
-    }).trim();
-
-    const [_hash, timestampStr, subject] = logOutput.split("\n");
-    const commitTime = parseInt(timestampStr, 10) * 1000;
-    const age = Date.now() - commitTime;
-
-    const fullLine = `x ${subject}`; // Prefix to match the pattern
-    const isRecent = age < EVOLUTION_RECENCY_MS;
-    const isEvolutionCommit = EVOLUTION_COMMIT_PATTERN.test(fullLine);
-
-    return {
-      isEvolution: isRecent && isEvolutionCommit,
-      commitMessage: subject,
-    };
-  } catch {
-    return { isEvolution: false, commitMessage: "" };
-  }
-}
-
-function rollbackEvolution(commitMessage: string): boolean {
-  try {
-    log(`Rolling back evolution: ${commitMessage}`);
-
-    // Revert the HEAD commit (creates a revert commit for traceability)
-    execSync("git revert HEAD --no-edit", {
-      cwd: ROOT,
-      encoding: "utf-8",
-      timeout: 30_000,
-    });
-
-    // Push the revert to remote so future git pull stays in sync
-    log("Pushing revert to origin/main...");
-    execSync("git push origin main", {
-      cwd: ROOT,
-      encoding: "utf-8",
-      timeout: 30_000,
-    });
-
-    // Mark the evolution as rolled_back in SQLite (best-effort)
-    markEvolutionRolledBack(commitMessage);
-
-    // Rebuild
-    log("Rebuilding after rollback...");
-    execSync("npm run build", {
-      cwd: ROOT,
-      encoding: "utf-8",
-      timeout: 120_000,
-      stdio: "inherit",
-    });
-
-    log("Rollback and rebuild complete");
-    return true;
-  } catch (err) {
-    logError(`Rollback failed: ${err}`);
-    return false;
-  }
-}
-
-/**
- * Best-effort: find the most recently deployed evolution and mark it rolled_back.
- * Uses sqlite3 CLI to avoid importing better-sqlite3 (keeps daemon independent).
- */
-function markEvolutionRolledBack(commitMessage: string): void {
-  try {
-    const dbPath = resolve(ROOT, "data/discordclaw.db");
-    if (!existsSync(dbPath)) return;
-
-    // Match by commit message subject in changes_summary or by most recent deployed
-    const sql = `UPDATE evolutions SET status = 'rolled_back' WHERE status = 'deployed' AND deployed_at = (SELECT MAX(deployed_at) FROM evolutions WHERE status = 'deployed');`;
-
-    execSync(`sqlite3 "${dbPath}" "${sql}"`, {
-      cwd: ROOT,
-      encoding: "utf-8",
-      timeout: 5_000,
-    });
-    log("Marked evolution as rolled_back in database");
-  } catch (err) {
-    logError(`Failed to update evolution status (non-fatal): ${err}`);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -530,36 +432,6 @@ async function handleBotExit(
   // Crash — analyze and recover
   recordCrash();
   const backoff = getBackoffDelay();
-  const { isEvolution, commitMessage } = isEvolutionRelatedCrash();
-
-  if (isEvolution) {
-    // Evolution-related crash
-    const uptimeStr = formatUptime(uptime);
-    notifyDiscord(
-      [
-        `⚠️ **discordclaw: Evolution rollback triggered**`,
-        `Exit code: ${exitCode}`,
-        `Uptime: ${uptimeStr}`,
-        `Reverting: \`${commitMessage}\``,
-        "",
-        "```",
-        getBufferTail(30),
-        "```",
-      ].join("\n"),
-    );
-
-    const rolled = rollbackEvolution(commitMessage);
-    if (rolled) {
-      notifyDiscord(`✅ Rollback complete — restarting bot...`);
-    } else {
-      notifyDiscord(
-        `❌ Rollback failed! Attempting restart with current code...`,
-      );
-    }
-
-    spawnBot();
-    return;
-  }
 
   // Regular crash
   const uptimeStr = formatUptime(uptime);

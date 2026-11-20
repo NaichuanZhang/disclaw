@@ -340,7 +340,7 @@ function wavHeader(sampleCount: number, sampleRate: number): Buffer {
 /**
  * Transcribe raw 16kHz mono PCM16 samples via whisper.cpp.
  *
- * This is the entry point for the realtime voice pipelines, which already
+ * Raw-PCM entry point (kept for a future realtime voice pipeline), which
  * produce exactly the format whisper.cpp wants — so unlike the URL path there
  * is no download and no ffmpeg conversion, just a WAV header and the binary.
  *

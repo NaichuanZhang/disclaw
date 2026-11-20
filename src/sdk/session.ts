@@ -723,8 +723,8 @@ export class SdkSession {
   }
 
   /**
-   * SOUL.md and the memory-recall rules — the bot's identity and habits, shared
-   * verbatim with the voice agent. Without them a channel answered as a
+   * SOUL.md and the memory-recall rules — the bot's identity and habits.
+   * Without them a channel answered as a
    * generic Claude Code session and never searched memory unasked.
    */
   private buildIdentityPrompt(): string {
@@ -772,7 +772,7 @@ export class SdkSession {
   }
 
   /**
-   * The skill library: the same metadata listing the voice agent reads, loaded
+   * The skill library: the skill metadata listing, with full content loaded
    * on demand through the bridged read_skill / list_skill_files tools. The SDK
    * prefixes MCP tool names, so the prompt points at the prefixed forms.
    */

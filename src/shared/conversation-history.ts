@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Shared conversation history tools — used by main agent and voice agent
+// Shared conversation history tools — bridged into every SDK session
 // ---------------------------------------------------------------------------
 
 import type Anthropic from "@anthropic-ai/sdk";
