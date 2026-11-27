@@ -92,6 +92,25 @@ if [ ! -f "$SCRIPT_DIR/data/cron/jobs.json" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 3.6. Warn if the installed systemd unit has drifted from the repo copy
+#
+# The Aug 12 unit fix (e6394bf) sat in git for five weeks while /etc kept the
+# broken April copy, because nothing compared the two. The unit is only read
+# at boot, so the drift stayed invisible until a reboot needed it — then the
+# bot did not come back. This is a warning, not a failure: deploy.sh runs
+# unprivileged and cannot install to /etc itself.
+# ---------------------------------------------------------------------------
+INSTALLED_UNIT=/etc/systemd/system/discordclaw.service
+if [ -f "$INSTALLED_UNIT" ] && [ -f "$SCRIPT_DIR/discordclaw.service" ]; then
+  if ! cmp -s "$INSTALLED_UNIT" "$SCRIPT_DIR/discordclaw.service"; then
+    echo "[deploy] WARNING: $INSTALLED_UNIT differs from the repo copy."
+    echo "[deploy]          The installed unit is what runs at boot. Install with:"
+    echo "[deploy]          sudo bash scripts/fix-service-install.sh"
+    notify "⚠️ discordclaw: installed systemd unit has drifted from repo on $(hostname) — bot may not survive a reboot. Run scripts/fix-service-install.sh"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Build
 # ---------------------------------------------------------------------------
 echo "[deploy] Building..."
