@@ -46,7 +46,11 @@ fi
 # ---------------------------------------------------------------------------
 if git diff --name-only "$PREVIOUS_HEAD" HEAD 2>/dev/null | grep -q "package-lock.json"; then
   echo "[deploy] package-lock.json changed, running npm ci..."
-  npm ci
+  # --include=dev: the systemd unit sets NODE_ENV=production, which makes a
+  # plain `npm ci` drop devDependencies — and tsc/vite (needed by step 4) are
+  # devDependencies. PR #170 hit this: build failed with `tsc: not found` and
+  # the dashboard kept serving a stale dist/ui for a week.
+  npm ci --include=dev
 fi
 
 # ---------------------------------------------------------------------------
